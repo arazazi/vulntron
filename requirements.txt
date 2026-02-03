@@ -1,0 +1,24 @@
+# Vultron v2.0 - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Color terminal output
+colorama>=0.4.6
+
+# HTTP requests for NVD API
+requests>=2.31.0
+
+# System and process utilities (optional, fallback to wmic if not available)
+psutil>=5.9.0
+
+# Standard library packages (included with Python 3.12+)
+# - platform
+# - subprocess
+# - datetime
+# - json
+# - os
+# - winreg
+# - ctypes
+# - pathlib
+# - re
+# - concurrent.futures
+# - typing
