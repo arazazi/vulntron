@@ -1,13 +1,13 @@
 <div align="center">
 
-# 🛡️ Vultron v2.1
+# 🛡️ Vultron
 
 ### Enterprise-Grade Windows Security Auditor
 
 *Comprehensive vulnerability scanning, digital forensics, and network analysis in a single tool*
 
 [![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-green.svg)](https://www.microsoft.com/windows)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%26%20Server-green.svg)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-Production%20Ready-success.svg)]()
 [![Downloads](https://img.shields.io/badge/downloads-1K+-brightgreen.svg)]()
@@ -117,17 +117,11 @@ The biggest update! Vultron now scans your network attack surface.
 
 #### 🖥️ Command-Line Interface
 ```bash
-python vultron_v2.py --help          # Show help
-python vultron_v2.py --quick         # Fast scan (120 days)
-python vultron_v2.py --comprehensive # Full scan (2015-present)
+python vultron.py --help          # Show help
+python vultron.py --quick         # Fast scan (120 days)
+python vultron.py --comprehensive # Full scan (2015-present)
 ```
 
-#### 📚 Built-in Help System
-Complete documentation accessible via `--help` flag
-
-[See Full Changelog](VERSION_2.1_CHANGELOG.md)
-
----
 
 ## ⚡ Quick Start
 
@@ -149,7 +143,7 @@ Complete documentation accessible via `--help` flag
 pip install colorama requests psutil
 
 # Run scan
-python vultron_v2.py
+python vultron.py
 
 # View report
 start vultron_report.html
@@ -160,7 +154,7 @@ start vultron_report.html
 ## 📥 Installation
 
 ### Requirements
-- **OS**: Windows 10 or Windows 11
+- **OS**: Windows 10, Windows 11, or Windows Server 2008/2012/2016/2019/2022
 - **Python**: 3.12 or higher
 - **Privileges**: Administrator
 - **Internet**: Required for NVD API access
@@ -185,7 +179,7 @@ cd vultron
 pip install -r requirements.txt
 
 # Verify installation
-python vultron_v2.py --version
+python vultron.py --version
 ```
 
 ### Dependencies
@@ -203,7 +197,7 @@ psutil>=5.9.0      # System utilities (optional)
 ### Interactive Mode (Default)
 
 ```bash
-python vultron_v2.py
+python vultron.py
 ```
 
 You'll be prompted to select:
@@ -214,16 +208,16 @@ You'll be prompted to select:
 
 ```bash
 # Quick scan
-python vultron_v2.py --quick
+python vultron.py --quick
 
 # Comprehensive scan
-python vultron_v2.py --comprehensive
+python vultron.py --comprehensive
 
 # Show help
-python vultron_v2.py --help
+python vultron.py --help
 
 # Show version
-python vultron_v2.py --version
+python vultron.py --version
 ```
 
 ### Batch Files (Windows)
@@ -289,6 +283,7 @@ Time: 1-2 minutes
 
 <div align="center">
 
+![Dashboard](https://via.placeholder.com/800x400/667eea/ffffff?text=Interactive+Dashboard+Preview)
 
 *Professional, interactive dashboard with color-coded findings*
 
@@ -311,7 +306,7 @@ Machine-readable format for automation and integration.
 {
   "metadata": {
     "scan_date": "2026-02-03T10:30:00",
-    "scanner": "Vultron v2.1",
+    "scanner": "Vultron",
     "target_os": "Windows 11"
   },
   "inventory": { ... },
@@ -373,6 +368,14 @@ Scenario: Old Windows Server 2012 R2
 Action: Historical CVE scan (2015-present)
 Result: All accumulated vulnerabilities
 Output: Prioritized remediation plan
+```
+
+### 6. Server Infrastructure Audit
+```yaml
+Scenario: Windows Server 2008 R2 (End of Life)
+Action: Comprehensive scan + port analysis
+Result: Critical exposure identification
+Output: Migration urgency documentation
 ```
 
 ---
@@ -501,8 +504,6 @@ prefetch_files[:30]  # 30 instead of 50
 
 ---
 
----
-
 ## 🎓 Examples
 
 ### Example 1: Basic Scan
@@ -569,7 +570,7 @@ We welcome contributions! Here's how you can help:
 
 ```bash
 # Fork and clone
-git clone https://github.com/arazazi/vultron.git
+git clone https://github.com/yourusername/vultron.git
 cd vultron
 
 # Create branch
@@ -590,11 +591,6 @@ git push origin feature/your-feature
 - Comment complex logic
 - Test on Windows 10 and 11
 
-### Reporting Security Issues
-
-**DO NOT** open public issues for security vulnerabilities.
-
----
 
 ## 📄 License
 
@@ -603,7 +599,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 ```
 MIT License
 
-Copyright (c) 2025 Azazi
+Copyright (c) 2025 Vultron Security Team
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files...
@@ -618,7 +614,6 @@ of this software and associated documentation files...
 - **NIST NVD**: For providing comprehensive CVE data
 - **CISA**: For maintaining the KEV catalog
 - **Microsoft**: For security bulletins and documentation
-- **Security Community**: For feedback and testing
 
 ### Built With
 
@@ -674,7 +669,27 @@ A: Yes, using PowerShell remoting (see examples).
 
 <div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=arazazi/vultron&type=Date)](https://star-history.com/#arazazi/vultron&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/vultron&type=Date)](https://star-history.com/#yourusername/vultron&Date)
+
+</div>
+
+---
+
+## 📸 Screenshots
+
+<div align="center">
+
+### Dashboard Overview
+![Dashboard](https://via.placeholder.com/800x400/667eea/ffffff?text=Dashboard+Overview)
+
+### Critical Findings
+![Critical](https://via.placeholder.com/800x400/dc3545/ffffff?text=Critical+Findings)
+
+### Open Ports Analysis
+![Ports](https://via.placeholder.com/800x400/fd7e14/ffffff?text=Open+Ports+Analysis)
+
+### Forensic Results
+![Forensics](https://via.placeholder.com/800x400/e83e8c/ffffff?text=Forensic+Results)
 
 </div>
 
@@ -686,7 +701,7 @@ A: Yes, using PowerShell remoting (see examples).
 
 ### [Download Now](https://github.com/arazazi/vultron/releases) • [View Docs](README.md) • [Report Issue](https://github.com/arazazi/vultron/issues)
 
-**Made with ❤️ by the A. k Azazi**
+**Made with ❤️ by the Vultron Security Team**
 
 ---
 
@@ -698,6 +713,6 @@ A: Yes, using PowerShell remoting (see examples).
 
 ---
 
-**Vultron v2.1** - *Enterprise Security Made Simple*
+**Vultron** - *Enterprise Security Made Simple*
 
 </div>
