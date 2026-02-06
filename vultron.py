@@ -7,7 +7,7 @@
 Vultron v2.1 - Windows Security Auditor
 Multi-Module: E-Inventory | Digital Forensics | NVD Intelligence | Port Scanning
 Author: Cybersecurity Engineering Team
-Target: Windows 10/11 | Python 3.12+
+Target: Windows 10/11 & Server 2008/2012/2016/2019/2022 | Python 3.12+
 """
 
 import os
@@ -1175,17 +1175,42 @@ class NVDIntelligence:
         os_name = os_info.get('os_name', 'windows').lower()
         os_release = os_info.get('os_release', '10').lower()
         build = os_info.get('build', '')
+        os_version = os_info.get('os_version', '').lower()
         
-        # Map Windows releases to CPE format
-        if 'windows' in os_name:
-            if os_release == '10':
-                cpe = f"cpe:2.3:o:microsoft:windows_10:-:*:*:*:*:*:*:*"
-            elif os_release == '11':
-                cpe = f"cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*"
+        # Detect Windows Server versions
+        if 'server' in os_version or 'server' in os_name:
+            # Map server versions to CPE
+            if '2022' in os_version or '20348' in build:
+                cpe = f"cpe:2.3:o:microsoft:windows_server_2022:-:*:*:*:*:*:*:*"
+            elif '2019' in os_version or '17763' in build:
+                cpe = f"cpe:2.3:o:microsoft:windows_server_2019:-:*:*:*:*:*:*:*"
+            elif '2016' in os_version or '14393' in build:
+                cpe = f"cpe:2.3:o:microsoft:windows_server_2016:-:*:*:*:*:*:*:*"
+            elif '2012' in os_version:
+                if 'r2' in os_version:
+                    cpe = f"cpe:2.3:o:microsoft:windows_server_2012:r2:*:*:*:*:*:*:*"
+                else:
+                    cpe = f"cpe:2.3:o:microsoft:windows_server_2012:-:*:*:*:*:*:*:*"
+            elif '2008' in os_version:
+                if 'r2' in os_version:
+                    cpe = f"cpe:2.3:o:microsoft:windows_server_2008:r2:*:*:*:*:*:*:*"
+                else:
+                    cpe = f"cpe:2.3:o:microsoft:windows_server_2008:-:*:*:*:*:*:*:*"
             else:
-                cpe = f"cpe:2.3:o:microsoft:windows_{os_release}:-:*:*:*:*:*:*:*"
+                cpe = f"cpe:2.3:o:microsoft:windows_server:-:*:*:*:*:*:*:*"
+            
+            print(Colors.success(f"    Detected: Windows Server"))
         else:
-            cpe = f"cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"
+            # Map Windows desktop releases to CPE format
+            if 'windows' in os_name:
+                if os_release == '10':
+                    cpe = f"cpe:2.3:o:microsoft:windows_10:-:*:*:*:*:*:*:*"
+                elif os_release == '11':
+                    cpe = f"cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*"
+                else:
+                    cpe = f"cpe:2.3:o:microsoft:windows_{os_release}:-:*:*:*:*:*:*:*"
+            else:
+                cpe = f"cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"
         
         self.data['cpe'] = cpe
         print(Colors.success(f"    CPE: {cpe}"))
@@ -2361,6 +2386,15 @@ DESCRIPTION:
   Comprehensive Windows security scanner combining vulnerability 
   assessment, digital forensics, and network analysis.
 
+SUPPORTED SYSTEMS:
+  ✓ Windows 10 (All builds from 1507 to current)
+  ✓ Windows 11 (All builds)
+  ✓ Windows Server 2008 (Standard, R2, Enterprise, Datacenter)
+  ✓ Windows Server 2012 (Standard, R2, Datacenter)
+  ✓ Windows Server 2016 (Standard, Datacenter)
+  ✓ Windows Server 2019 (Standard, Datacenter)
+  ✓ Windows Server 2022 (Standard, Datacenter)
+
 FEATURES:
   ✓ CVE Scanning (2015-present or last 120 days)
   ✓ 15+ Digital Forensic Artifacts
@@ -2380,15 +2414,16 @@ OPTIONS:
 
 SCAN MODES:
 
-  1. COMPREHENSIVE (Recommended for old systems)
+  1. COMPREHENSIVE (Recommended for legacy systems)
      - Scans ALL CVEs from 2015 to present
      - Complete historical vulnerability coverage
-     - Perfect for Windows 10 legacy builds
+     - Perfect for Windows Server 2008/2012 and older Win10 builds
      - Time: 3-5 minutes
   
   2. QUICK (Recommended for updated systems)
      - Scans last 120 days of CVEs only
      - Fast security check for current systems
+     - Perfect for Windows 11 and Server 2022
      - Time: 1-2 minutes
 
 MODULES:
@@ -2414,7 +2449,7 @@ MODULES:
   
   Module 3: NVD Intelligence
     - NVD API 2.0 integration
-    - CPE string generation
+    - CPE string generation (Desktop & Server)
     - CISA KEV detection
     - CVSS scoring
   
@@ -2429,7 +2464,7 @@ OUTPUT:
   vultron_report.json - Machine-readable data
 
 REQUIREMENTS:
-  - Windows 10/11
+  - Windows 10/11 or Server 2008/2012/2016/2019/2022
   - Python 3.12+
   - Administrator privileges
   - colorama, requests, psutil
@@ -2450,6 +2485,7 @@ NOTES:
   - Internet required for NVD API
   - First scan takes longer (downloads CVE data)
   - Reports saved in current directory
+  - Server 2008/2012 systems should use COMPREHENSIVE mode
 
 DOCUMENTATION:
   README.md - Full documentation
@@ -2482,6 +2518,8 @@ def main():
     
     Windows Security Auditor v2.1 - ENHANCED EDITION
     E-Inventory | Advanced Forensics | Full CVE History | Port Scanning
+    
+    Supported: Windows 10/11 & Server 2008/2012/2016/2019/2022
     ═══════════════════════════════════════════════════════════
     """
     
