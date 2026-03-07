@@ -1263,6 +1263,31 @@ class NVDIntelligence:
         all_vulnerabilities = []
         kev_vulns = []
         
+        # TEST: Can we even reach NVD API?
+        print(Colors.info("[*] Testing NVD API connectivity..."))
+        try:
+            test_response = requests.get(
+                self.base_url,
+                params={'resultsPerPage': 1},
+                timeout=10
+            )
+            if test_response.status_code == 200:
+                print(Colors.success("    ✓ NVD API is reachable!"))
+            else:
+                print(Colors.critical(f"    ✗ NVD API returned: {test_response.status_code}"))
+                print(Colors.critical(f"    Response: {test_response.text[:200]}"))
+        except requests.exceptions.ConnectionError:
+            print(Colors.critical("    ✗ CONNECTION ERROR - Cannot reach nvd.nist.gov!"))
+            print(Colors.critical("    Your firewall/proxy is blocking NVD API!"))
+            print(Colors.critical("    SOLUTION: Configure internet access or use offline mode"))
+            return []
+        except requests.exceptions.Timeout:
+            print(Colors.critical("    ✗ TIMEOUT - NVD API not responding"))
+            return []
+        except Exception as e:
+            print(Colors.critical(f"    ✗ Error: {str(e)}"))
+            return []
+        
         # Determine search keyword based on CPE
         search_keyword = self._get_search_keyword_from_cpe()
         
@@ -1293,6 +1318,10 @@ class NVDIntelligence:
                     headers = {}
                     if self.api_key:
                         headers['apiKey'] = self.api_key
+                    
+                    # DEBUG: Show the actual URL being called
+                    full_url = f"{self.base_url}?{'&'.join([f'{k}={v}' for k,v in params.items()])}"
+                    print(Colors.info(f"    URL: {full_url[:100]}..."))
                     
                     # Make API request with retry logic
                     max_retries = 3
