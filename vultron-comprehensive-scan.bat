@@ -66,11 +66,11 @@ if %errorLevel% neq 0 (
     exit /b 1
 )
 
-REM Check if vultron_v2.py exists
-if not exist "vultron_v2.py" (
+REM Check if vultron.py exists
+if not exist "vultron.py" (
     color 0E
     echo.
-    echo    [!] ERROR: vultron_v2.py not found!
+    echo    [!] ERROR: vultron.py not found!
     echo.
     echo    Please ensure vultron_v2.py is in the same directory as this script
     echo.
@@ -107,7 +107,7 @@ echo [*] Starting Vultron v2.0...
 echo.
 
 REM Auto-select comprehensive mode (option 1 or just Enter)
-echo. | python vultron_v2.py
+echo. | python vultron.py
 
 REM Check if scan completed successfully
 if %errorLevel% neq 0 (
