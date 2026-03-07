@@ -1283,10 +1283,13 @@ class NVDIntelligence:
                     
                     print(Colors.info(f"    Scanning {year}..."))
                     
+                    # Use the actual CPE for this system
+                    system_cpe = self.data.get('cpe', 'cpe:2.3:o:microsoft:windows_server_2016')
+                    
                     params = {
                         'pubStartDate': year_start,
                         'pubEndDate': year_end,
-                        'keywordSearch': search_keyword,
+                        'virtualMatchString': system_cpe,
                         'resultsPerPage': 2000  # Max results per page
                     }
                     
@@ -1366,10 +1369,13 @@ class NVDIntelligence:
                 pub_start = start_date.strftime("%Y-%m-%dT00:00:00.000")
                 pub_end = end_date.strftime("%Y-%m-%dT23:59:59.999")
                 
+                # Use the actual CPE for this system
+                system_cpe = self.data.get('cpe', 'cpe:2.3:o:microsoft:windows')
+                
                 params = {
                     'pubStartDate': pub_start,
                     'pubEndDate': pub_end,
-                    'keywordSearch': search_keyword,
+                    'virtualMatchString': system_cpe,
                     'resultsPerPage': 2000
                 }
                 
