@@ -1278,19 +1278,16 @@ class NVDIntelligence:
             
             try:
                 for year in range(start_year, current_year + 1):
-                    year_start = f"{year}-01-01T00:00:00.000"
-                    year_end = f"{year}-12-31T23:59:59.999"
+                    year_start = f"{year}-01-01T00:00:00Z"
+                    year_end = f"{year}-12-31T23:59:59Z"
                     
                     print(Colors.info(f"    Scanning {year}..."))
-                    
-                    # Use the actual CPE for this system
-                    system_cpe = self.data.get('cpe', 'cpe:2.3:o:microsoft:windows_server_2016')
                     
                     params = {
                         'pubStartDate': year_start,
                         'pubEndDate': year_end,
-                        'virtualMatchString': system_cpe,
-                        'resultsPerPage': 2000  # Max results per page
+                        'keywordSearch': 'Microsoft',
+                        'resultsPerPage': 2000
                     }
                     
                     headers = {}
@@ -1366,16 +1363,13 @@ class NVDIntelligence:
                 end_date = datetime.now()
                 start_date = end_date - timedelta(days=days)
                 
-                pub_start = start_date.strftime("%Y-%m-%dT00:00:00.000")
-                pub_end = end_date.strftime("%Y-%m-%dT23:59:59.999")
-                
-                # Use the actual CPE for this system
-                system_cpe = self.data.get('cpe', 'cpe:2.3:o:microsoft:windows')
+                pub_start = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                pub_end = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
                 
                 params = {
                     'pubStartDate': pub_start,
                     'pubEndDate': pub_end,
-                    'virtualMatchString': system_cpe,
+                    'keywordSearch': 'Microsoft',
                     'resultsPerPage': 2000
                 }
                 
