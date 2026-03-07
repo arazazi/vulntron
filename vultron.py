@@ -1303,82 +1303,93 @@ class NVDIntelligence:
             
             try:
                 for year in range(start_year, current_year + 1):
-                    year_start = f"{year}-01-01T00:00:00Z"
-                    year_end = f"{year}-12-31T23:59:59Z"
-                    
                     print(Colors.info(f"    Scanning {year}..."))
                     
-                    params = {
-                        'pubStartDate': year_start,
-                        'pubEndDate': year_end,
-                        'keywordSearch': 'Microsoft',
-                        'resultsPerPage': 2000
-                    }
+                    # NVD API limit: 120 consecutive days max
+                    # Split year into 3 chunks of ~120 days each
+                    chunks = [
+                        (f"{year}-01-01T00:00:00.000", f"{year}-04-30T23:59:59.999"),  # Jan-Apr
+                        (f"{year}-05-01T00:00:00.000", f"{year}-08-31T23:59:59.999"),  # May-Aug
+                        (f"{year}-09-01T00:00:00.000", f"{year}-12-31T23:59:59.999"),  # Sep-Dec
+                    ]
                     
-                    headers = {}
-                    if self.api_key:
-                        headers['apiKey'] = self.api_key
+                    year_total = 0
                     
-                    # DEBUG: Show the actual URL being called
-                    full_url = f"{self.base_url}?{'&'.join([f'{k}={v}' for k,v in params.items()])}"
-                    print(Colors.info(f"    URL: {full_url[:100]}..."))
-                    
-                    # Make API request with retry logic
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            response = requests.get(
-                                self.base_url,
-                                params=params,
-                                headers=headers,
-                                timeout=45
-                            )
-                            
-                            if response.status_code == 200:
-                                data = response.json()
-                                year_vulns = data.get('vulnerabilities', [])
+                    for chunk_start, chunk_end in chunks:
+                        params = {
+                            'pubStartDate': chunk_start,
+                            'pubEndDate': chunk_end,
+                            'resultsPerPage': 2000
+                        }
+                        
+                        headers = {}
+                        if self.api_key:
+                            headers['apiKey'] = self.api_key
+                        
+                        # Make API request with retry logic
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                response = requests.get(
+                                    self.base_url,
+                                    params=params,
+                                    headers=headers,
+                                    timeout=45
+                                )
                                 
-                                for vuln in year_vulns:
-                                    processed_vuln = self._process_vulnerability(vuln)
-                                    if processed_vuln:
-                                        all_vulnerabilities.append(processed_vuln)
-                                        
-                                        if processed_vuln['is_kev']:
-                                            kev_vulns.append(processed_vuln)
-                                            print(Colors.critical(f"    [!] CISA KEV: {processed_vuln['cve_id']} ({year})"))
+                                if response.status_code == 200:
+                                    data = response.json()
+                                    chunk_vulns = data.get('vulnerabilities', [])
+                                    
+                                    for vuln in chunk_vulns:
+                                        processed_vuln = self._process_vulnerability(vuln)
+                                        if processed_vuln:
+                                            # Filter for Windows/Microsoft CVEs
+                                            desc = processed_vuln.get('description', '').lower()
+                                            if 'windows' in desc or 'microsoft' in desc:
+                                                all_vulnerabilities.append(processed_vuln)
+                                                
+                                                if processed_vuln['is_kev']:
+                                                    kev_vulns.append(processed_vuln)
+                                                    print(Colors.critical(f"    [!] CISA KEV: {processed_vuln['cve_id']}"))
+                                    
+                                    year_total += len(chunk_vulns)
+                                    break  # Success
                                 
-                                print(Colors.success(f"    {year}: API returned {response.status_code} - Found {len(year_vulns)} CVEs"))
-                                break  # Success, exit retry loop
-                            
-                            elif response.status_code == 404:
-                                print(Colors.warning(f"    {year}: No CVEs found (404) - This is normal for some years"))
-                                break  # Not an error, just no results
-                                
-                            elif response.status_code == 429:
-                                wait_time = 6 * (attempt + 1)
-                                print(Colors.warning(f"    Rate limited, waiting {wait_time}s..."))
-                                import time
-                                time.sleep(wait_time)
-                            else:
-                                print(Colors.warning(f"    {year}: API returned {response.status_code}"))
+                                elif response.status_code == 404:
+                                    break  # No results for this chunk
+                                    
+                                elif response.status_code == 429:
+                                    wait_time = 6 * (attempt + 1)
+                                    print(Colors.warning(f"    Rate limited, waiting {wait_time}s..."))
+                                    import time
+                                    time.sleep(wait_time)
+                                else:
+                                    break
+                                    
+                            except requests.exceptions.Timeout:
+                                if attempt < max_retries - 1:
+                                    import time
+                                    time.sleep(3)
+                                else:
+                                    break
+                            except Exception as e:
                                 break
-                                
-                        except requests.exceptions.Timeout:
-                            if attempt < max_retries - 1:
-                                print(Colors.warning(f"    Timeout, retrying ({attempt + 1}/{max_retries})..."))
-                                import time
-                                time.sleep(3)
-                            else:
-                                print(Colors.warning(f"    {year}: Timeout after {max_retries} attempts"))
-                                break
-                        except Exception as e:
-                            print(Colors.warning(f"    {year}: Error - {str(e)}"))
-                            break
+                        
+                        # Rate limiting between chunks
+                        if not self.api_key:
+                            import time
+                            time.sleep(6)
                     
-                    # Rate limiting: wait between years if no API key
+                    # Show year total
+                    if year_total > 0:
+                        windows_count = len([v for v in all_vulnerabilities if str(year) in v.get('cve_id', '')])
+                        print(Colors.success(f"    {year}: Found {year_total} total CVEs ({windows_count} Windows)"))
+                    
+                    # Rate limiting between years
                     if not self.api_key and year < current_year:
                         import time
-                        time.sleep(6)  # NVD rate limit: 5 requests per 30 seconds
+                        time.sleep(6)
                 
             except Exception as e:
                 print(Colors.warning(f"[!] Error in historical scan: {str(e)}"))
@@ -1398,7 +1409,6 @@ class NVDIntelligence:
                 params = {
                     'pubStartDate': pub_start,
                     'pubEndDate': pub_end,
-                    'keywordSearch': 'Microsoft',
                     'resultsPerPage': 2000
                 }
                 
