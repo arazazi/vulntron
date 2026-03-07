@@ -1185,26 +1185,19 @@ class NVDIntelligence:
     
     def _get_search_keyword_from_cpe(self) -> str:
         """Determine the best search keyword based on CPE string"""
-        cpe = self.data.get('cpe', '')
+        cpe = self.data.get('cpe', '').lower()
         
-        # Use specific version keywords for better results
-        if 'windows_server_2022' in cpe:
-            return 'Windows Server 2022'
-        elif 'windows_server_2019' in cpe:
-            return 'Windows Server 2019'
-        elif 'windows_server_2016' in cpe:
-            return 'Windows Server 2016'
-        elif 'windows_server_2012' in cpe:
-            return 'Windows Server 2012'
-        elif 'windows_server_2008' in cpe:
-            return 'Windows Server 2008'
-        elif 'windows_11' in cpe:
+        # Just check if it's a server or not - don't try to be too specific
+        if 'server' in cpe:
+            # Use generic "Windows Server" - works for ALL server versions!
+            return 'Windows Server'
+        elif 'windows_11' in cpe or 'windows 11' in cpe:
             return 'Windows 11'
-        elif 'windows_10' in cpe:
+        elif 'windows_10' in cpe or 'windows 10' in cpe:
             return 'Windows 10'
         else:
-            # Fallback to generic
-            return 'Microsoft Windows'
+            # Fallback - but at least it's something!
+            return 'Windows'
     
     def build_cpe(self, os_info: Dict[str, str]) -> str:
         """Generate CPE 2.3 string for the operating system"""
