@@ -10,6 +10,20 @@ Author: Cybersecurity Engineering Team
 Target: Windows 10/11 & Server 2008/2012/2016/2019/2022 | Python 3.12+
 """
 
+# ==================== CONFIGURATION ====================
+# NVD API Key (Optional but HIGHLY recommended for faster scans)
+# Get your FREE key: https://nvd.nist.gov/developers/request-an-api-key
+# 
+# WITHOUT KEY: 5 requests/30sec  (scans take 5-10 minutes)
+# WITH KEY:    50 requests/30sec (scans take 2-4 minutes) - 10x FASTER!
+#
+# TO USE: Replace None with your API key in quotes
+# Example: NVD_API_KEY = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+NVD_API_KEY = None  # ← PUT YOUR API KEY HERE (or leave as None)
+
+# ======================================================
+
 import os
 import sys
 import json
@@ -1168,6 +1182,30 @@ class NVDIntelligence:
             'kev_vulns': []
         }
     
+    
+    def _get_search_keyword_from_cpe(self) -> str:
+        """Determine the best search keyword based on CPE string"""
+        cpe = self.data.get('cpe', '')
+        
+        # Use specific version keywords for better results
+        if 'windows_server_2022' in cpe:
+            return 'Windows Server 2022'
+        elif 'windows_server_2019' in cpe:
+            return 'Windows Server 2019'
+        elif 'windows_server_2016' in cpe:
+            return 'Windows Server 2016'
+        elif 'windows_server_2012' in cpe:
+            return 'Windows Server 2012'
+        elif 'windows_server_2008' in cpe:
+            return 'Windows Server 2008'
+        elif 'windows_11' in cpe:
+            return 'Windows 11'
+        elif 'windows_10' in cpe:
+            return 'Windows 10'
+        else:
+            # Fallback to generic
+            return 'Microsoft Windows'
+    
     def build_cpe(self, os_info: Dict[str, str]) -> str:
         """Generate CPE 2.3 string for the operating system"""
         print(Colors.info("[+] Building CPE String..."))
@@ -1232,9 +1270,13 @@ class NVDIntelligence:
         all_vulnerabilities = []
         kev_vulns = []
         
+        # Determine search keyword based on CPE
+        search_keyword = self._get_search_keyword_from_cpe()
+        
         # For comprehensive coverage, query in chunks
         if include_historical:
             print(Colors.info(f"[+] Querying NVD API (Comprehensive Historical Scan)..."))
+            print(Colors.info(f"    Searching for: {search_keyword}"))
             print(Colors.info("    This may take 2-3 minutes for complete coverage..."))
             
             # Query in yearly chunks from 2015 to present for better coverage
@@ -1251,7 +1293,7 @@ class NVDIntelligence:
                     params = {
                         'pubStartDate': year_start,
                         'pubEndDate': year_end,
-                        'keywordSearch': 'Microsoft Windows',
+                        'keywordSearch': search_keyword,
                         'resultsPerPage': 2000  # Max results per page
                     }
                     
@@ -1283,8 +1325,12 @@ class NVDIntelligence:
                                             kev_vulns.append(processed_vuln)
                                             print(Colors.critical(f"    [!] CISA KEV: {processed_vuln['cve_id']} ({year})"))
                                 
-                                print(Colors.success(f"    {year}: Found {len(year_vulns)} CVEs"))
+                                print(Colors.success(f"    {year}: API returned {response.status_code} - Found {len(year_vulns)} CVEs"))
                                 break  # Success, exit retry loop
+                            
+                            elif response.status_code == 404:
+                                print(Colors.warning(f"    {year}: No CVEs found (404) - This is normal for some years"))
+                                break  # Not an error, just no results
                                 
                             elif response.status_code == 429:
                                 wait_time = 6 * (attempt + 1)
@@ -1318,6 +1364,7 @@ class NVDIntelligence:
         else:
             # Quick scan - last N days only
             print(Colors.info(f"[+] Querying NVD API (Last {days} days)..."))
+            print(Colors.info(f"    Searching for: {search_keyword}"))
             
             try:
                 end_date = datetime.now()
@@ -1329,7 +1376,7 @@ class NVDIntelligence:
                 params = {
                     'pubStartDate': pub_start,
                     'pubEndDate': pub_end,
-                    'keywordSearch': 'Microsoft Windows',
+                    'keywordSearch': search_keyword,
                     'resultsPerPage': 2000
                 }
                 
@@ -1356,6 +1403,13 @@ class NVDIntelligence:
                             if processed_vuln['is_kev']:
                                 kev_vulns.append(processed_vuln)
                                 print(Colors.critical(f"    [!] CISA KEV: {processed_vuln['cve_id']}"))
+                    
+                    print(Colors.success(f"    Found {len(vulnerabilities)} CVEs"))
+                
+                elif response.status_code == 404:
+                    print(Colors.warning(f"    No CVEs found in last {days} days (404) - This is normal"))
+                else:
+                    print(Colors.warning(f"    API returned {response.status_code}"))
                 
             except Exception as e:
                 print(Colors.warning(f"[!] Error querying NVD: {str(e)}"))
@@ -2591,9 +2645,16 @@ def main():
     # Module 3: NVD Intelligence (run in parallel)
     print(Colors.info("\n[*] Starting NVD vulnerability scan in background..."))
     
+    # Show API key status
+    if NVD_API_KEY:
+        print(Colors.success("[+] Using NVD API key - Fast mode enabled (50 req/30sec)"))
+    else:
+        print(Colors.warning("[!] No API key - Using public rate limits (5 req/30sec)"))
+        print(Colors.info("[?] Get FREE API key: https://nvd.nist.gov/developers/request-an-api-key"))
+    
     with ThreadPoolExecutor(max_workers=1) as executor:
         nvd_future = executor.submit(
-            lambda: NVDIntelligence().run(inventory_data.get('os_specs', {}), quick_scan=quick_scan)
+            lambda: NVDIntelligence(api_key=NVD_API_KEY).run(inventory_data.get('os_specs', {}), quick_scan=quick_scan)
         )
         
         # Wait for NVD results
