@@ -24,8 +24,8 @@ import socket
 import argparse
 import json
 import struct
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Union
 
 # Optional dependencies
 try:
@@ -81,8 +81,8 @@ class Colors:
 
 
 class PortScanner:
-    """Advanced port scanner with service detection"""
-    
+    """Advanced port scanner with service detection and configurable scan modes"""
+
     COMMON_PORTS = {
         20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP',
         53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'MS-RPC', 139: 'NetBIOS',
@@ -90,34 +90,172 @@ class PortScanner:
         3389: 'RDP', 5432: 'PostgreSQL', 5900: 'VNC', 6379: 'Redis',
         8080: 'HTTP-Proxy', 8443: 'HTTPS-Alt', 27017: 'MongoDB'
     }
-    
-    def __init__(self, target: str, timeout: float = 1.0):
+
+    # Representative nmap top-1000 port list (includes high dynamic/RPC ports, WSD, etc.)
+    TOP1000_PORTS = sorted(set([
+        1, 3, 4, 6, 7, 9, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 30, 32, 33, 37, 42,
+        43, 49, 53, 70, 79, 80, 81, 82, 83, 84, 85, 88, 89, 90, 99, 100, 106, 109, 110,
+        111, 113, 119, 125, 135, 139, 143, 144, 146, 161, 163, 179, 199, 211, 212, 222,
+        254, 255, 256, 259, 264, 280, 301, 306, 311, 340, 366, 389, 406, 407, 416, 417,
+        425, 427, 443, 444, 445, 458, 464, 465, 481, 497, 500, 512, 513, 514, 515, 524,
+        541, 543, 544, 545, 548, 554, 555, 563, 587, 593, 616, 617, 625, 631, 636, 646,
+        648, 666, 667, 668, 683, 687, 691, 700, 705, 711, 714, 720, 722, 726, 749, 765,
+        777, 783, 787, 800, 801, 808, 843, 873, 880, 888, 898, 900, 901, 902, 903, 911,
+        912, 981, 987, 990, 992, 993, 995, 999, 1000, 1001, 1002, 1007, 1009, 1010, 1011,
+        1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033,
+        1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1044, 1048, 1049, 1050, 1053,
+        1054, 1056, 1058, 1059, 1064, 1065, 1066, 1069, 1071, 1074, 1080, 1083, 1084,
+        1085, 1088, 1090, 1092, 1095, 1099, 1100, 1102, 1104, 1105, 1106, 1107, 1108,
+        1110, 1111, 1112, 1113, 1114, 1117, 1119, 1121, 1122, 1123, 1124, 1126, 1130,
+        1131, 1132, 1137, 1138, 1141, 1145, 1147, 1148, 1149, 1151, 1152, 1154, 1163,
+        1164, 1165, 1166, 1169, 1174, 1175, 1183, 1185, 1186, 1187, 1192, 1198, 1199,
+        1201, 1213, 1216, 1217, 1218, 1233, 1234, 1236, 1244, 1247, 1248, 1259, 1271,
+        1272, 1277, 1287, 1296, 1300, 1301, 1309, 1310, 1311, 1322, 1328, 1334, 1352,
+        1417, 1433, 1434, 1443, 1455, 1461, 1494, 1500, 1501, 1503, 1521, 1524, 1533,
+        1556, 1580, 1583, 1594, 1600, 1641, 1658, 1666, 1687, 1688, 1700, 1717, 1718,
+        1719, 1720, 1721, 1723, 1755, 1761, 1782, 1783, 1801, 1805, 1812, 1839, 1840,
+        1862, 1863, 1864, 1875, 1900, 1914, 1935, 1947, 1971, 1972, 1974, 1984, 1998,
+        1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2013,
+        2020, 2021, 2022, 2030, 2033, 2034, 2035, 2038, 2040, 2041, 2042, 2043, 2045,
+        2046, 2047, 2048, 2049, 2065, 2068, 2099, 2100, 2103, 2105, 2106, 2107, 2111,
+        2119, 2121, 2126, 2135, 2144, 2160, 2161, 2170, 2179, 2190, 2191, 2196, 2200,
+        2222, 2251, 2260, 2288, 2301, 2323, 2366, 2381, 2382, 2383, 2393, 2394, 2399,
+        2401, 2492, 2500, 2522, 2525, 2557, 2601, 2602, 2604, 2605, 2607, 2608, 2638,
+        2701, 2702, 2710, 2717, 2718, 2725, 2800, 2809, 2811, 2869, 2875, 2909, 2910,
+        2920, 2967, 2968, 2998, 3000, 3001, 3003, 3005, 3006, 3007, 3011, 3013, 3017,
+        3030, 3031, 3052, 3071, 3077, 3128, 3168, 3211, 3221, 3260, 3261, 3268, 3269,
+        3283, 3300, 3301, 3306, 3322, 3323, 3324, 3325, 3333, 3351, 3367, 3369, 3370,
+        3371, 3372, 3389, 3390, 3404, 3476, 3493, 3517, 3527, 3546, 3551, 3580, 3659,
+        3689, 3690, 3703, 3737, 3766, 3784, 3800, 3801, 3809, 3814, 3826, 3827, 3828,
+        3851, 3869, 3871, 3878, 3880, 3889, 3905, 3914, 3918, 3920, 3945, 3971, 3986,
+        3995, 3998, 4000, 4001, 4002, 4003, 4004, 4005, 4006, 4045, 4111, 4125, 4126,
+        4129, 4224, 4242, 4279, 4321, 4343, 4443, 4444, 4445, 4446, 4449, 4550, 4567,
+        4662, 4848, 4899, 4900, 4998, 5000, 5001, 5002, 5003, 5004, 5009, 5030, 5033,
+        5050, 5051, 5054, 5060, 5061, 5080, 5087, 5100, 5101, 5102, 5120, 5190, 5200,
+        5214, 5221, 5222, 5225, 5226, 5269, 5280, 5298, 5357, 5405, 5414, 5431, 5432,
+        5440, 5500, 5510, 5544, 5550, 5555, 5560, 5566, 5631, 5633, 5666, 5678, 5679,
+        5718, 5730, 5800, 5801, 5802, 5810, 5811, 5815, 5822, 5825, 5850, 5859, 5862,
+        5877, 5900, 5901, 5902, 5903, 5904, 5906, 5907, 5910, 5911, 5915, 5922, 5925,
+        5950, 5952, 5959, 5960, 5961, 5962, 5963, 5987, 5988, 5989, 5998, 5999, 6000,
+        6001, 6002, 6003, 6004, 6005, 6006, 6007, 6009, 6025, 6059, 6100, 6101, 6106,
+        6112, 6123, 6129, 6156, 6346, 6389, 6502, 6510, 6543, 6547, 6565, 6566, 6567,
+        6580, 6646, 6666, 6667, 6668, 6669, 6689, 6692, 6699, 6779, 6788, 6789, 6792,
+        6839, 6881, 6901, 6969, 7000, 7001, 7002, 7004, 7007, 7019, 7025, 7070, 7100,
+        7103, 7106, 7200, 7201, 7402, 7435, 7443, 7496, 7512, 7625, 7627, 7676, 7741,
+        7777, 7778, 7800, 7911, 7920, 7921, 7937, 7938, 7999, 8000, 8001, 8002, 8007,
+        8008, 8009, 8010, 8011, 8021, 8022, 8031, 8042, 8045, 8080, 8081, 8082, 8083,
+        8084, 8085, 8086, 8087, 8088, 8089, 8090, 8093, 8099, 8100, 8180, 8181, 8192,
+        8193, 8194, 8200, 8222, 8254, 8290, 8291, 8292, 8300, 8333, 8383, 8400, 8402,
+        8443, 8500, 8600, 8649, 8651, 8652, 8654, 8701, 8800, 8873, 8888, 8899, 8994,
+        9000, 9001, 9002, 9003, 9009, 9010, 9011, 9040, 9050, 9071, 9080, 9081, 9090,
+        9091, 9099, 9100, 9101, 9102, 9103, 9110, 9111, 9200, 9207, 9220, 9290, 9415,
+        9418, 9485, 9500, 9502, 9503, 9535, 9575, 9593, 9594, 9595, 9618, 9666, 9876,
+        9877, 9878, 9898, 9900, 9917, 9929, 9943, 9944, 9968, 9998, 9999, 10000, 10001,
+        10002, 10003, 10004, 10009, 10010, 10012, 10024, 10025, 10082, 10180, 10215,
+        10243, 10566, 10616, 10617, 10621, 10626, 10628, 10629, 10778, 11110, 11111,
+        11967, 12000, 12174, 12265, 12345, 13456, 13722, 13782, 13783, 14000, 14238,
+        14441, 14442, 15000, 15002, 15003, 15004, 15660, 15742, 16000, 16001, 16012,
+        16016, 16018, 16080, 16113, 16992, 16993, 17877, 17988, 18040, 18101, 18988,
+        19101, 19283, 19315, 19350, 19780, 19801, 19842, 20000, 20005, 20031, 20221,
+        20222, 20828, 21571, 22939, 23502, 24444, 24800, 25734, 25735, 26214, 27000,
+        27352, 27353, 27355, 27356, 27715, 28201, 30000, 30718, 30951, 31038, 31337,
+        32768, 32769, 32770, 32771, 32772, 32773, 32774, 32775, 32776, 32777, 32778,
+        32779, 32780, 32781, 32782, 32783, 32784, 32785, 33354, 33899, 34571, 34572,
+        34573, 35500, 38292, 40193, 40911, 41511, 42510, 44176, 44442, 44443, 44501,
+        45100, 48080, 49152, 49153, 49154, 49155, 49156, 49157, 49158, 49159, 49160,
+        49161, 49163, 49165, 49167, 49175, 49176, 49400, 49999, 50000, 50001, 50002,
+        50003, 50006, 50300, 50389, 50500, 50636, 50800, 51103, 51493, 52673, 52822,
+        52848, 52869, 54045, 54328, 55055, 55056, 55555, 55600, 56737, 56738, 57294,
+        57797, 58080, 60020, 60443, 61532, 61900, 62078, 63331, 64623, 64680, 65000,
+        65129, 65389,
+    ]))
+
+    # Service name lookup covering all known ports
+    SERVICE_NAMES = {
+        **{p: s for p, s in {
+            20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP',
+            53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'MS-RPC', 139: 'NetBIOS',
+            143: 'IMAP', 161: 'SNMP', 179: 'BGP', 389: 'LDAP', 443: 'HTTPS',
+            444: 'SNPP', 445: 'SMB', 465: 'SMTPS', 500: 'IKE', 512: 'RSH',
+            513: 'RLOGIN', 514: 'SYSLOG', 515: 'LPD', 554: 'RTSP', 587: 'SMTP-TLS',
+            636: 'LDAPS', 993: 'IMAPS', 995: 'POP3S', 1025: 'MS-RPC-DYN',
+            1026: 'MS-RPC-DYN', 1027: 'MS-RPC-DYN', 1028: 'MS-RPC-DYN',
+            1029: 'MS-RPC-DYN', 1030: 'MS-RPC-DYN', 1080: 'SOCKS',
+            1433: 'MS-SQL', 1521: 'Oracle', 1723: 'PPTP', 1900: 'SSDP',
+            2049: 'NFS', 3128: 'Squid-Proxy', 3306: 'MySQL', 3389: 'RDP',
+            3690: 'SVN', 4444: 'Metasploit', 5357: 'WSD', 5432: 'PostgreSQL',
+            5900: 'VNC', 5985: 'WinRM-HTTP', 5986: 'WinRM-HTTPS', 6379: 'Redis',
+            6443: 'K8s-API', 7080: 'HTTP-Alt', 8080: 'HTTP-Proxy',
+            8443: 'HTTPS-Alt', 8888: 'HTTP-Alt2', 9090: 'HTTP-Alt3',
+            9200: 'Elasticsearch', 11211: 'Memcached', 27017: 'MongoDB',
+            50000: 'SAP', 50070: 'Hadoop',
+        }.items()},
+    }
+
+    def __init__(self, target: str, scan_mode: str = 'common',
+                 custom_ports: Optional[List[int]] = None,
+                 timeout: float = 1.0, retries: int = 1,
+                 concurrency: int = 50):
         self.target = target
+        self.scan_mode = scan_mode
+        self.custom_ports = custom_ports or []
         self.timeout = timeout
-    
+        self.retries = retries
+        self.concurrency = concurrency
+
+    @staticmethod
+    def parse_port_spec(spec: str) -> List[int]:
+        """Parse a port specification string like '21,80,443,1025-1030' into a sorted list."""
+        ports: List[int] = []
+        for part in spec.split(','):
+            part = part.strip()
+            if '-' in part:
+                lo, hi = part.split('-', 1)
+                ports.extend(range(int(lo.strip()), int(hi.strip()) + 1))
+            elif part.isdigit():
+                ports.append(int(part))
+        return sorted(set(p for p in ports if 1 <= p <= 65535))
+
+    def get_ports_to_scan(self) -> List[int]:
+        """Return the list of ports to scan based on the configured mode."""
+        if self.scan_mode == 'full':
+            return list(range(1, 65536))
+        if self.scan_mode == 'top1000':
+            return list(self.TOP1000_PORTS)
+        if self.scan_mode == 'custom':
+            return list(self.custom_ports) if self.custom_ports else list(self.COMMON_PORTS.keys())
+        # default: 'common'
+        return list(self.COMMON_PORTS.keys())
+
     def scan_port(self, port: int) -> Optional[Dict]:
-        """Scan single port with banner grabbing"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            result = sock.connect_ex((self.target, port))
-            
-            if result == 0:
-                service = self.COMMON_PORTS.get(port, f'Unknown-{port}')
-                banner = self.grab_banner(sock, port)
-                
-                return {
-                    'port': port,
-                    'state': 'open',
-                    'service': service,
-                    'banner': banner[:100] if banner else '',
-                    'protocol': 'tcp'
-                }
-            sock.close()
-        except:
-            pass
+        """Scan single port with banner grabbing and optional retries.
+
+        ``self.retries`` is the total number of connection attempts (minimum 1).
+        """
+        for _attempt in range(max(1, self.retries)):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                result = sock.connect_ex((self.target, port))
+
+                if result == 0:
+                    service = self.SERVICE_NAMES.get(port, f'Unknown-{port}')
+                    banner = self.grab_banner(sock, port)
+
+                    return {
+                        'port': port,
+                        'state': 'open',
+                        'service': service,
+                        'banner': banner[:100] if banner else '',
+                        'protocol': 'tcp'
+                    }
+                sock.close()
+                return None  # closed/filtered — no need to retry
+            except Exception:
+                if attempt < self.retries - 1:
+                    continue
         return None
-    
+
     def grab_banner(self, sock: socket.socket, port: int) -> str:
         """Grab service banner"""
         try:
@@ -127,229 +265,499 @@ class PortScanner:
                 pass  # FTP sends banner automatically
             else:
                 sock.send(b'\r\n')
-            
+
             banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
             return banner
-        except:
+        except Exception:
             return ''
-    
-    def scan_common_ports(self) -> List[Dict]:
-        """Scan common ports"""
-        print(Colors.info(f"Scanning {len(self.COMMON_PORTS)} common ports on {self.target}..."))
-        
+
+    def scan(self) -> List[Dict]:
+        """Scan ports according to the configured mode and return open port results."""
+        ports = self.get_ports_to_scan()
+        mode_label = {
+            'common': f"{len(ports)} common",
+            'top1000': f"{len(ports)} top-1000",
+            'full': "all 65535",
+            'custom': f"{len(ports)} custom",
+        }.get(self.scan_mode, str(len(ports)))
+        print(Colors.info(f"Scanning {mode_label} ports on {self.target} "
+                          f"(timeout={self.timeout}s, concurrency={self.concurrency})..."))
+
         results = []
         if HAS_THREADING:
-            with ThreadPoolExecutor(max_workers=50) as executor:
-                futures = {executor.submit(self.scan_port, port): port 
-                          for port in self.COMMON_PORTS.keys()}
-                
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                futures = {executor.submit(self.scan_port, port): port for port in ports}
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         results.append(result)
                         print(Colors.success(f"  {result['port']}/tcp - {result['service']}"))
         else:
-            for port in self.COMMON_PORTS.keys():
+            for port in ports:
                 result = self.scan_port(port)
                 if result:
                     results.append(result)
                     print(Colors.success(f"  {result['port']}/tcp - {result['service']}"))
-        
+
+        results.sort(key=lambda r: r['port'])
         print(Colors.success(f"Found {len(results)} open ports\n"))
         return results
 
+    def scan_common_ports(self) -> List[Dict]:
+        """Backward-compatible alias: scan using the configured mode."""
+        return self.scan()
+
 
 class VulnerabilityChecker:
-    """REAL vulnerability checking with active tests"""
-    
+    """Vulnerability checking with defensive, evidence-based assessment
+
+    Every finding includes a ``status`` field:
+      CONFIRMED   – active probe returned definitive evidence.
+      POTENTIAL   – port/service indicates possible exposure; version not verified.
+      INCONCLUSIVE – check attempted but failed (timeout, network error, etc.).
+
+    Only CONFIRMED findings are counted toward CRITICAL/HIGH severity totals.
+    POTENTIAL and INCONCLUSIVE findings are surfaced separately so operators
+    can investigate further without inflating the severity summary.
+    """
+
     def __init__(self, target: str, ports: List[Dict]):
         self.target = target
         self.ports = ports
-        self.vulnerabilities = []
-    
+        self.vulnerabilities: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+
+    def _add(self, finding: Dict):
+        """Append a finding and echo a summary line to stdout."""
+        self.vulnerabilities.append(finding)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
     def check_all(self) -> List[Dict]:
-        """Run all vulnerability checks"""
+        """Run all vulnerability checks and return the findings list."""
         print(Colors.header("[PHASE 2] ACTIVE VULNERABILITY CHECKS"))
         print(Colors.info("Running exploitation tests...\n"))
-        
+
         for port_info in self.ports:
             port = port_info['port']
             service = port_info['service']
-            
-            # SMB vulnerabilities
+
             if port == 445:
                 self.check_eternalblue(port)
                 self.check_smbghost(port)
-            
-            # RDP vulnerabilities
             elif port == 3389:
                 self.check_bluekeep(port)
-            
-            # Web vulnerabilities
             elif port in [80, 443, 8080, 8443]:
                 self.check_web_vulns(port)
-            
-            # Database vulnerabilities
             elif port in [3306, 5432, 1433, 27017, 6379]:
                 self.check_database_vulns(port, service)
-        
-        print(Colors.success(f"\nFound {len(self.vulnerabilities)} vulnerabilities\n"))
+
+        confirmed = sum(1 for v in self.vulnerabilities if v.get('status') == 'CONFIRMED')
+        potential = sum(1 for v in self.vulnerabilities if v.get('status') == 'POTENTIAL')
+        inconclusive = sum(1 for v in self.vulnerabilities if v.get('status') == 'INCONCLUSIVE')
+        print(Colors.success(
+            f"\nChecks complete — {confirmed} confirmed, "
+            f"{potential} potential, {inconclusive} inconclusive\n"
+        ))
         return self.vulnerabilities
-    
+
+    # ------------------------------------------------------------------
+    # Individual checks
+    # ------------------------------------------------------------------
+
     def check_eternalblue(self, port: int):
-        """Check for MS17-010 (EternalBlue)"""
+        """Check for MS17-010 (EternalBlue) via SMBv1 negotiation probe."""
         print(Colors.info("  [SMB] Checking for EternalBlue (MS17-010)..."))
-        
+        evidence: List[str] = []
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
+            sock.settimeout(5)
             sock.connect((self.target, port))
-            
-            # Send SMBv1 negotiation packet
-            pkt = b'\x00\x00\x00\x85\xff\x53\x4d\x42\x72\x00\x00\x00\x00\x18\x53\xc8'
+
+            # Minimal SMBv1 negotiate request
+            pkt = (
+                b'\x00\x00\x00\x85'          # NetBIOS session
+                b'\xff\x53\x4d\x42'          # SMB1 header magic
+                b'\x72'                       # SMB_COM_NEGOTIATE
+                b'\x00\x00\x00\x00\x00\x18\x53\xc8'
+                b'\x00\x00\x00\x00\x00\x00\x00\x00'
+                b'\x00\x00\x00\x00\x00\x00\xff\xfe'
+                b'\x00\x00\x00\x00'
+                b'\x00\x62'                   # ByteCount
+                b'\x00\x02'
+                b'\x4e\x54\x20\x4c\x4d\x20\x30\x2e\x31\x32\x00'  # NT LM 0.12
+                b'\x02\x53\x4d\x42\x20\x32\x2e\x30\x30\x32\x00'  # SMB 2.002
+                b'\x02\x53\x4d\x42\x20\x32\x2e\x3f\x3f\x3f\x00'  # SMB 2.???
+            )
             sock.send(pkt)
             response = sock.recv(1024)
             sock.close()
-            
-            # Check if SMBv1 is enabled
-            if b'\xff\x53\x4d\x42' in response or b'\xfeSMB' in response:
-                self.vulnerabilities.append({
+
+            if b'\xff\x53\x4d\x42' in response:
+                evidence.append("SMBv1 negotiate response received")
+                evidence.append(f"Response bytes (hex): {response[:32].hex()}")
+                self._add({
+                    'id': 'MS17-010',
                     'cve': 'CVE-2017-0144',
                     'name': 'MS17-010 (EternalBlue)',
+                    'title': 'EternalBlue SMBv1 Remote Code Execution',
                     'severity': 'CRITICAL',
+                    'status': 'CONFIRMED',
                     'port': port,
-                    'description': 'SMBv1 is enabled and vulnerable to remote code execution (EternalBlue/WannaCry)',
+                    'affected_service': 'SMB',
+                    'description': ('SMBv1 is enabled and responded to a negotiate request. '
+                                    'This version is susceptible to the EternalBlue exploit '
+                                    '(MS17-010 / WannaCry / NotPetya).'),
+                    'evidence': evidence,
                     'cisa_kev': True,
                     'exploit_available': True,
                     'cvss': 9.8,
-                    'remediation': 'Disable SMBv1, apply MS17-010 patch'
+                    'remediation': 'Disable SMBv1, apply MS17-010 patch',
                 })
-                print(Colors.critical("    VULNERABLE: EternalBlue risk detected!"))
+                print(Colors.critical("    CONFIRMED: SMBv1 negotiate accepted — EternalBlue risk!"))
             else:
-                print(Colors.success("    Not vulnerable"))
-        except Exception as e:
-            print(Colors.warning(f"    Check failed: {e}"))
-    
+                evidence.append("SMBv1 negotiate not accepted by server")
+                print(Colors.success("    Not vulnerable (SMBv1 disabled or not negotiated)"))
+        except socket.timeout:
+            evidence.append("Connection timed out during SMB negotiate probe")
+            self._add({
+                'id': 'MS17-010',
+                'cve': 'CVE-2017-0144',
+                'name': 'MS17-010 (EternalBlue)',
+                'title': 'EternalBlue SMBv1 — check inconclusive (timeout)',
+                'severity': 'HIGH',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'SMB',
+                'description': ('EternalBlue check timed out. The port is open but the SMBv1 '
+                                'probe did not receive a response. Manual verification required.'),
+                'evidence': evidence,
+                'cisa_kev': False,
+                'exploit_available': False,
+                'cvss': 9.8,
+                'remediation': 'Disable SMBv1, apply MS17-010 patch; verify manually',
+            })
+            print(Colors.warning("    INCONCLUSIVE: check timed out — manual verification required"))
+        except Exception as exc:
+            evidence.append(f"Check failed: {exc}")
+            self._add({
+                'id': 'MS17-010',
+                'cve': 'CVE-2017-0144',
+                'name': 'MS17-010 (EternalBlue)',
+                'title': 'EternalBlue SMBv1 — check inconclusive (error)',
+                'severity': 'HIGH',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'SMB',
+                'description': f'EternalBlue check could not complete: {exc}',
+                'evidence': evidence,
+                'cisa_kev': False,
+                'exploit_available': False,
+                'cvss': 9.8,
+                'remediation': 'Disable SMBv1, apply MS17-010 patch; verify manually',
+            })
+            print(Colors.warning(f"    INCONCLUSIVE: check error — {exc}"))
+
     def check_smbghost(self, port: int):
-        """Check for SMBGhost (CVE-2020-0796)"""
+        """Check for SMBGhost (CVE-2020-0796) via SMBv3 compression capabilities probe."""
         print(Colors.info("  [SMB] Checking for SMBGhost (CVE-2020-0796)..."))
-        
-        # SMBv3 compression vulnerability (simplified check)
-        self.vulnerabilities.append({
-            'cve': 'CVE-2020-0796',
-            'name': 'SMBGhost',
-            'severity': 'CRITICAL',
-            'port': port,
-            'description': 'SMBv3 compression vulnerability allows remote code execution',
-            'cisa_kev': True,
-            'exploit_available': True,
-            'cvss': 10.0,
-            'remediation': 'Apply KB4551762, disable SMBv3 compression'
-        })
-        print(Colors.high("    Potential vulnerability (requires version check)"))
-    
+        evidence: List[str] = []
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((self.target, port))
+
+            # Minimal SMBv3.1.1 negotiate request with compression capabilities context
+            # (checks whether the server advertises SMB 3.1.1 + compression)
+            pkt = (
+                b'\x00\x00\x00\xc0'          # NetBIOS
+                b'\xfeSMB'                   # SMB2 magic
+                b'\x40\x00'                  # StructureSize
+                b'\x00\x00'                  # CreditCharge
+                b'\x00\x00\x00\x00'          # Status
+                b'\x00\x00'                  # Command: Negotiate
+                b'\x1f\x00'                  # CreditRequest
+                b'\x00\x00\x00\x00'          # Flags
+                b'\x00\x00\x00\x00'          # NextCommand
+                b'\x00\x00\x00\x00\x00\x00\x00\x00'  # MessageId
+                b'\x00\x00\x00\x00'          # Reserved
+                b'\xff\xff\xff\xff'          # TreeId
+                b'\x00\x00\x00\x00\x00\x00\x00\x00'  # SessionId
+                b'\x00\x00\x00\x00\x00\x00\x00\x00'  # Signature (part 1)
+                b'\x00\x00\x00\x00\x00\x00\x00\x00'  # Signature (part 2)
+                # Negotiate body
+                b'\x24\x00'                  # StructureSize
+                b'\x08\x00'                  # DialectCount = 8
+                b'\x02\x00'                  # SecurityMode
+                b'\x00\x00'                  # Reserved
+                b'\x7f\x00\x00\x00'          # Capabilities
+                b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # ClientGuid
+                b'\x78\x00'                  # NegotiateContextOffset (placeholder)
+                b'\x02\x00'                  # NegotiateContextCount
+                b'\x00\x00'                  # Reserved
+                # Dialects
+                b'\x02\x02'                  # SMB 2.0.2
+                b'\x10\x02'                  # SMB 2.1
+                b'\x00\x03'                  # SMB 3.0
+                b'\x02\x03'                  # SMB 3.0.2
+                b'\x10\x03'                  # SMB 3.1.1  ← key
+                b'\x00\x03'
+                b'\x02\x03'
+                b'\x10\x03'
+            )
+            sock.send(pkt)
+            response = sock.recv(1024)
+            sock.close()
+
+            smb2_magic = b'\xfeSMB'
+            if smb2_magic in response:
+                # Check for dialect 0x0311 in the response (SMB 3.1.1)
+                smb311_confirmed = b'\x11\x03' in response
+                evidence.append(f"SMBv2/3 negotiate response received (len={len(response)})")
+                if smb311_confirmed:
+                    evidence.append("Server advertised SMB dialect 3.1.1")
+                    self._add({
+                        'id': 'CVE-2020-0796',
+                        'cve': 'CVE-2020-0796',
+                        'name': 'SMBGhost (CVE-2020-0796)',
+                        'title': 'SMBGhost — SMB 3.1.1 compression potential vulnerability',
+                        'severity': 'HIGH',
+                        'status': 'POTENTIAL',
+                        'port': port,
+                        'affected_service': 'SMB',
+                        'description': ('Server negotiated SMB 3.1.1. CVE-2020-0796 (SMBGhost) '
+                                        'affects Windows 10/Server 2019 without KB4551762. '
+                                        'Confirm Windows build number to determine exposure.'),
+                        'evidence': evidence,
+                        'cisa_kev': False,
+                        'exploit_available': True,
+                        'cvss': 10.0,
+                        'remediation': 'Apply KB4551762; disable SMBv3 compression if patch unavailable',
+                    })
+                    print(Colors.high("    POTENTIAL: SMB 3.1.1 detected — verify Windows build for CVE-2020-0796"))
+                else:
+                    evidence.append("SMB 3.1.1 not negotiated; SMBGhost unlikely")
+                    print(Colors.success("    SMB 3.1.1 not negotiated; SMBGhost unlikely"))
+            else:
+                evidence.append("No SMB2/3 response received")
+                print(Colors.success("    No SMBv2/3 response; SMBGhost not applicable"))
+        except socket.timeout:
+            evidence.append("Connection timed out during SMBGhost probe")
+            self._add({
+                'id': 'CVE-2020-0796',
+                'cve': 'CVE-2020-0796',
+                'name': 'SMBGhost (CVE-2020-0796)',
+                'title': 'SMBGhost — check inconclusive (timeout)',
+                'severity': 'HIGH',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'SMB',
+                'description': 'SMBGhost probe timed out. Manual version check required.',
+                'evidence': evidence,
+                'cisa_kev': False,
+                'exploit_available': False,
+                'cvss': 10.0,
+                'remediation': 'Apply KB4551762; verify Windows build manually',
+            })
+            print(Colors.warning("    INCONCLUSIVE: SMBGhost check timed out"))
+        except Exception as exc:
+            evidence.append(f"Check error: {exc}")
+            self._add({
+                'id': 'CVE-2020-0796',
+                'cve': 'CVE-2020-0796',
+                'name': 'SMBGhost (CVE-2020-0796)',
+                'title': 'SMBGhost — check inconclusive (error)',
+                'severity': 'HIGH',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'SMB',
+                'description': f'SMBGhost check could not complete: {exc}',
+                'evidence': evidence,
+                'cisa_kev': False,
+                'exploit_available': False,
+                'cvss': 10.0,
+                'remediation': 'Apply KB4551762; verify Windows build manually',
+            })
+            print(Colors.warning(f"    INCONCLUSIVE: SMBGhost check error — {exc}"))
+
     def check_bluekeep(self, port: int):
-        """Check for BlueKeep (CVE-2019-0708)"""
+        """Check for BlueKeep (CVE-2019-0708) — RDP exposure assessment."""
         print(Colors.info("  [RDP] Checking for BlueKeep (CVE-2019-0708)..."))
-        
-        self.vulnerabilities.append({
+        evidence: List[str] = [f"RDP port {port}/tcp is open"]
+        # We can only confirm RDP is exposed; version/patch status needs OS-level data.
+        self._add({
+            'id': 'CVE-2019-0708',
             'cve': 'CVE-2019-0708',
-            'name': 'BlueKeep',
-            'severity': 'CRITICAL',
+            'name': 'BlueKeep (CVE-2019-0708)',
+            'title': 'BlueKeep — RDP exposed, patch status unverified',
+            'severity': 'HIGH',
+            'status': 'POTENTIAL',
             'port': port,
-            'description': 'RDP pre-authentication remote code execution vulnerability',
+            'affected_service': 'RDP',
+            'description': ('RDP is exposed on this host. CVE-2019-0708 (BlueKeep) affects '
+                            'unpatched Windows XP/2003/Vista/7/2008. Confirm Windows build '
+                            'number to determine actual exposure.'),
+            'evidence': evidence,
             'cisa_kev': True,
             'exploit_available': True,
             'cvss': 9.8,
-            'remediation': 'Apply Windows updates, enable Network Level Authentication'
+            'remediation': 'Apply Windows security updates; enable Network Level Authentication',
         })
-        print(Colors.critical("    RDP exposed - BlueKeep risk!"))
+        print(Colors.high("    POTENTIAL: RDP exposed — verify patch level for BlueKeep"))
     
     def check_web_vulns(self, port: int):
         """Check web server vulnerabilities"""
         print(Colors.info(f"  [WEB] Checking port {port}..."))
-        
+
         if not HAS_REQUESTS:
             print(Colors.warning("    Skipped (requests module not available)"))
             return
-        
+
         try:
             protocol = 'https' if port in [443, 8443] else 'http'
             url = f"{protocol}://{self.target}:{port}"
             response = requests.get(url, verify=False, timeout=5)
             headers = response.headers
-            
-            # Check for missing security headers
-            if 'X-Frame-Options' not in headers:
-                self.vulnerabilities.append({
+            evidence = [f"HTTP {response.status_code} from {url}"]
+
+            missing = [h for h in ['X-Frame-Options', 'X-Content-Type-Options',
+                                    'Strict-Transport-Security', 'Content-Security-Policy']
+                       if h not in headers]
+            if missing:
+                evidence.extend(f"Missing header: {h}" for h in missing)
+                self._add({
+                    'id': f'WEB-HEADERS-{port}',
                     'cve': 'N/A',
-                    'name': 'Missing X-Frame-Options Header',
+                    'name': 'Missing Security Headers',
+                    'title': f'Missing HTTP security headers on port {port}',
                     'severity': 'MEDIUM',
+                    'status': 'CONFIRMED',
                     'port': port,
-                    'description': 'Clickjacking protection missing',
-                    'remediation': 'Add X-Frame-Options: DENY header'
+                    'affected_service': 'HTTP',
+                    'description': f'One or more security response headers are absent: {", ".join(missing)}',
+                    'evidence': evidence,
+                    'remediation': 'Set X-Frame-Options, X-Content-Type-Options, HSTS, and CSP headers',
                 })
-            
-            print(Colors.medium("    Security headers missing"))
-        except:
+                print(Colors.medium(f"    CONFIRMED: Security headers missing — {', '.join(missing)}"))
+            else:
+                print(Colors.success("    Security headers present"))
+        except Exception:
             print(Colors.warning("    Unable to connect"))
-    
+
     def check_database_vulns(self, port: int, service: str):
         """Check database vulnerabilities"""
         print(Colors.info(f"  [DATABASE] Checking {service}..."))
-        
-        self.vulnerabilities.append({
+        self._add({
+            'id': f'DB-EXPOSURE-{port}',
             'cve': 'N/A',
             'name': f'{service} Remote Access',
+            'title': f'{service} database port {port} externally accessible',
             'severity': 'HIGH',
+            'status': 'CONFIRMED',
             'port': port,
-            'description': f'{service} accessible from external network',
-            'remediation': 'Bind to localhost only, use firewall rules'
+            'affected_service': service,
+            'description': f'{service} is accessible from an external network on port {port}/tcp.',
+            'evidence': [f'Port {port}/tcp ({service}) accepted TCP connection'],
+            'remediation': 'Bind database to localhost only; restrict with firewall rules',
         })
-        print(Colors.high("    Database exposed externally!"))
+        print(Colors.high(f"    CONFIRMED: {service} exposed externally!"))
 
 
 class NVDIntelligence:
-    """NVD CVE intelligence gathering"""
-    
+    """NVD CVE intelligence gathering with retry/backoff and graceful degradation"""
+
+    # NVD 2.0 API requires ISO 8601 timestamps with explicit UTC offset
+    _DATE_FMT = '%Y-%m-%dT%H:%M:%S.000 UTC+00:00'
+    _MAX_RETRIES = 3
+    _BACKOFF_BASE = 2  # seconds
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
         self.base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-    
+        self._cache: Dict[str, Union[List[Dict], Optional[Dict]]] = {}
+
+    def _get(self, params: Dict, attempt: int = 0) -> Optional[Dict]:
+        """Perform a GET with retry/backoff; return parsed JSON or None."""
+        if not HAS_REQUESTS:
+            return None
+        headers: Dict[str, str] = {}
+        if self.api_key:
+            headers['apiKey'] = self.api_key
+        try:
+            resp = requests.get(self.base_url, params=params, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (403, 429, 503) and attempt < self._MAX_RETRIES:
+                import time
+                wait = self._BACKOFF_BASE ** attempt
+                print(Colors.warning(f"  NVD API returned {resp.status_code}; retrying in {wait}s..."))
+                time.sleep(wait)
+                return self._get(params, attempt + 1)
+            print(Colors.warning(f"NVD API returned status {resp.status_code} — enrichment skipped"))
+            print(Colors.info(f"  Debug: URL={resp.url}"))
+            return None
+        except Exception as exc:
+            if attempt < self._MAX_RETRIES:
+                import time
+                wait = self._BACKOFF_BASE ** attempt
+                print(Colors.warning(f"  NVD request failed ({exc}); retrying in {wait}s..."))
+                time.sleep(wait)
+                return self._get(params, attempt + 1)
+            print(Colors.warning(f"NVD query failed after {self._MAX_RETRIES} attempts: {exc}"))
+            return None
+
     def query_recent_cves(self, days: int = 120) -> List[Dict]:
-        """Query recent CVEs"""
+        """Query recent CVEs from NVD with correct date format and retries."""
         if not HAS_REQUESTS:
             print(Colors.warning("Skipping NVD query (requests not available)"))
             return []
-        
+
         print(Colors.info(f"Querying NVD for CVEs from last {days} days..."))
-        
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            params = {
-                'pubStartDate': start_date.strftime('%Y-%m-%dT00:00:00.000'),
-                'pubEndDate': end_date.strftime('%Y-%m-%dT23:59:59.999')
-            }
-            
-            headers = {}
-            if self.api_key:
-                headers['apiKey'] = self.api_key
-            
-            response = requests.get(self.base_url, params=params, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                cve_count = data.get('totalResults', 0)
-                print(Colors.success(f"Retrieved {cve_count} CVEs from NVD"))
-                return data.get('vulnerabilities', [])
-            else:
-                print(Colors.warning(f"NVD API returned status {response.status_code}"))
-                return []
-        except Exception as e:
-            print(Colors.warning(f"NVD query failed: {e}"))
+
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days)
+
+        cache_key = f"recent_{days}_{start_date.date()}"
+        if cache_key in self._cache:
+            cached: List[Dict] = self._cache[cache_key]  # type: ignore[assignment]
+            print(Colors.success(f"NVD: using cached result ({len(cached)} CVEs)"))
+            return cached
+
+        params = {
+            'pubStartDate': start_date.strftime(self._DATE_FMT),
+            'pubEndDate': end_date.strftime(self._DATE_FMT),
+        }
+
+        data = self._get(params)
+        if data is None:
             return []
+
+        cve_count = data.get('totalResults', 0)
+        print(Colors.success(f"Retrieved {cve_count} CVEs from NVD"))
+        result = data.get('vulnerabilities', [])
+        self._cache[cache_key] = result
+        return result
+
+    def enrich_cve(self, cve_id: str) -> Optional[Dict]:
+        """Look up a single CVE by ID; returns NVD data dict or None."""
+        if not HAS_REQUESTS or not cve_id or cve_id == 'N/A':
+            return None
+        if cve_id in self._cache:
+            cached_cve: Optional[Dict] = self._cache[cve_id]  # type: ignore[assignment]
+            return cached_cve
+        params = {'cveId': cve_id}
+        data = self._get(params)
+        if data:
+            vulns = data.get('vulnerabilities', [])
+            result: Optional[Dict] = vulns[0] if vulns else None
+            self._cache[cve_id] = result
+            return result
+        return None
 
 
 class ComplianceChecker:
@@ -362,26 +770,26 @@ class ComplianceChecker:
         """Check PCI DSS compliance"""
         print(Colors.header("[PHASE 3] COMPLIANCE ASSESSMENT"))
         print(Colors.info("Checking PCI DSS 3.2.1...\n"))
-        
+
         issues = []
-        
+
         # Check for insecure protocols
         if any(p['port'] == 23 for p in self.results.get('open_ports', [])):
             issues.append("Telnet (insecure protocol) detected")
-        
-        # Check for critical vulnerabilities
-        critical_vulns = [v for v in self.results.get('vulnerabilities', []) 
-                         if v.get('severity') == 'CRITICAL']
-        if critical_vulns:
-            issues.append(f"{len(critical_vulns)} critical vulnerabilities present")
-        
+
+        # Count only CONFIRMED critical findings to avoid false compliance failures
+        critical_confirmed = [v for v in self.results.get('vulnerabilities', [])
+                               if v.get('severity') == 'CRITICAL' and v.get('status') == 'CONFIRMED']
+        if critical_confirmed:
+            issues.append(f"{len(critical_confirmed)} confirmed critical vulnerabilities present")
+
         status = 'PASS' if not issues else 'FAIL'
         score = max(0, 100 - (len(issues) * 15))
-        
+
         print(Colors.info(f"PCI DSS Status: {status}"))
         print(Colors.info(f"Compliance Score: {score}%"))
         print(Colors.info(f"Issues: {len(issues)}\n"))
-        
+
         return {
             'standard': 'PCI DSS 3.2.1',
             'status': status,
@@ -392,28 +800,51 @@ class ComplianceChecker:
 
 class ReportGenerator:
     """Generate professional reports"""
-    
+
     def __init__(self, scan_results: Dict):
         self.results = scan_results
-    
+
+    @staticmethod
+    def _count_by_status_severity(vulns: List[Dict]) -> Dict:
+        """Return a dict of counters derived solely from the findings list."""
+        return {
+            'critical_confirmed': sum(1 for v in vulns
+                                      if v.get('severity') == 'CRITICAL' and v.get('status') == 'CONFIRMED'),
+            'high_confirmed':     sum(1 for v in vulns
+                                      if v.get('severity') == 'HIGH' and v.get('status') == 'CONFIRMED'),
+            'medium_confirmed':   sum(1 for v in vulns
+                                      if v.get('severity') == 'MEDIUM' and v.get('status') == 'CONFIRMED'),
+            'potential':          sum(1 for v in vulns if v.get('status') == 'POTENTIAL'),
+            'inconclusive':       sum(1 for v in vulns if v.get('status') == 'INCONCLUSIVE'),
+            'kev_confirmed':      sum(1 for v in vulns if v.get('cisa_kev') and v.get('status') == 'CONFIRMED'),
+        }
+
     def generate_html(self, filename: str):
         """Generate professional GitHub-style HTML dashboard"""
         print(Colors.info(f"Generating professional HTML report: {filename}"))
-        
+
         target = self.results.get('target', 'Unknown')
         timestamp = self.results.get('timestamp', datetime.now().isoformat())
         open_ports = self.results.get('open_ports', [])
         vulns = self.results.get('vulnerabilities', [])
         compliance = self.results.get('compliance', {})
-        
-        critical = len([v for v in vulns if v.get('severity') == 'CRITICAL'])
-        high = len([v for v in vulns if v.get('severity') == 'HIGH'])
-        medium = len([v for v in vulns if v.get('severity') == 'MEDIUM'])
-        kev = len([v for v in vulns if v.get('cisa_kev')])
-        
-        # Calculate risk score
+        scan_mode = self.results.get('scan_mode', 'common')
+
+        counts = self._count_by_status_severity(vulns)
+        critical = counts['critical_confirmed']
+        high = counts['high_confirmed']
+        medium = counts['medium_confirmed']
+        kev = counts['kev_confirmed']
+        potential = counts['potential']
+        inconclusive = counts['inconclusive']
+
+        # Risk score based on confirmed findings only
         risk_score = min(10.0, (critical * 2.0) + (high * 1.0) + (medium * 0.3))
-        
+
+        confirmed_vulns = [v for v in vulns if v.get('status') == 'CONFIRMED']
+        potential_vulns = [v for v in vulns if v.get('status') == 'POTENTIAL']
+        inconclusive_vulns = [v for v in vulns if v.get('status') == 'INCONCLUSIVE']
+
         html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -578,78 +1009,167 @@ class ReportGenerator:
     <div class="container">
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-label">Critical</div>
+                <div class="stat-label">Critical (confirmed)</div>
                 <div class="stat-value critical">{critical}</div>
                 <div style="font-size: 13px; color: var(--text-secondary);">Immediate action required</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">High</div>
+                <div class="stat-label">High (confirmed)</div>
                 <div class="stat-value warning">{high}</div>
                 <div style="font-size: 13px; color: var(--text-secondary);">Patch within 7 days</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Medium</div>
+                <div class="stat-label">Medium (confirmed)</div>
                 <div class="stat-value info">{medium}</div>
                 <div style="font-size: 13px; color: var(--text-secondary);">Patch within 30 days</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">CISA KEV</div>
+                <div class="stat-label">Potential</div>
+                <div class="stat-value warning">{potential}</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">Needs verification</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Inconclusive</div>
+                <div class="stat-value info">{inconclusive}</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">Manual review required</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">CISA KEV (confirmed)</div>
                 <div class="stat-value critical">{kev}</div>
                 <div style="font-size: 13px; color: var(--text-secondary);">Actively exploited</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Open Ports</div>
                 <div class="stat-value info">{len(open_ports)}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Attack surface</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">Scan mode: {scan_mode}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Risk Score</div>
                 <div class="stat-value critical">{risk_score:.1f}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Out of 10</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">Out of 10 (confirmed only)</div>
             </div>
         </div>
+'''
 
+        # --- Confirmed findings section ---
+        html += '''
         <div class="card">
             <div class="card-header">
-                <h3 class="card-title">🚨 Critical Vulnerabilities</h3>
+                <h3 class="card-title">🚨 Confirmed Findings</h3>
             </div>
             <div class="card-body">
 '''
-        
-        # Add critical vulnerabilities
-        critical_vulns = [v for v in vulns if v.get('severity') == 'CRITICAL']
-        if critical_vulns:
-            for vuln in critical_vulns:
+        if confirmed_vulns:
+            for vuln in confirmed_vulns:
+                sev = vuln.get('severity', 'MEDIUM').lower()
                 kev_badge = '<span class="badge badge-kev">KEV</span>' if vuln.get('cisa_kev') else ''
+                evidence_html = ''.join(
+                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                    for e in vuln.get('evidence', [])
+                )
                 html += f'''
                 <div class="vuln-item">
                     <div class="vuln-header">
                         <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
                         <div>
                             {kev_badge}
-                            <span class="badge badge-critical">CRITICAL</span>
+                            <span class="badge badge-{sev}">{vuln.get('severity', 'UNKNOWN')}</span>
+                            <span class="badge" style="background:rgba(63,185,80,0.2);color:#3fb950;border:1px solid rgba(63,185,80,0.3);">CONFIRMED</span>
                         </div>
                     </div>
-                    <div style="font-weight: 500; margin-bottom: 8px;">{vuln['name']}</div>
-                    <div style="color: var(--text-secondary); font-size: 13px; margin-bottom: 12px;">
-                        {vuln.get('description', '')}
-                    </div>
-                    <div style="font-size: 12px; color: var(--text-secondary);">
-                        🎯 CVSS {vuln.get('cvss', 'N/A')} | 🔌 Port {vuln.get('port', 'N/A')}/TCP | 
-                        ⚡ {'Exploit Available' if vuln.get('exploit_available') else 'No known exploit'}
+                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
+                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
+                    <div style="font-size:12px;color:var(--text-secondary);">
+                        🎯 CVSS {vuln.get('cvss','N/A')} | 🔌 Port {vuln.get('port','N/A')}/TCP |
+                        ⚡ {'Exploit Available' if vuln.get('exploit_available') else 'No known exploit'} |
+                        🛡 {vuln.get('affected_service','N/A')}
                     </div>
                 </div>
 '''
         else:
-            html += '<div style="color: var(--text-secondary);">No critical vulnerabilities found</div>'
-        
+            html += '<div style="color:var(--text-secondary);">No confirmed findings</div>'
+
         html += '''
             </div>
         </div>
 
         <div class="card">
             <div class="card-header">
-                <h3 class="card-title">🔓 Open Ports & Services</h3>
+                <h3 class="card-title">⚠️ Potential Findings (verification required)</h3>
+            </div>
+            <div class="card-body">
+'''
+        if potential_vulns:
+            for vuln in potential_vulns:
+                sev = vuln.get('severity', 'HIGH').lower()
+                evidence_html = ''.join(
+                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                    for e in vuln.get('evidence', [])
+                )
+                html += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
+                        <div>
+                            <span class="badge badge-{sev}">{vuln.get('severity', 'UNKNOWN')}</span>
+                            <span class="badge" style="background:rgba(210,153,34,0.2);color:#d29922;border:1px solid rgba(210,153,34,0.3);">POTENTIAL</span>
+                        </div>
+                    </div>
+                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
+                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
+                    <div style="font-size:12px;color:var(--text-secondary);">
+                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')}
+                    </div>
+                </div>
+'''
+        else:
+            html += '<div style="color:var(--text-secondary);">No potential findings</div>'
+
+        html += '''
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">❓ Inconclusive Checks (manual review required)</h3>
+            </div>
+            <div class="card-body">
+'''
+        if inconclusive_vulns:
+            for vuln in inconclusive_vulns:
+                evidence_html = ''.join(
+                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                    for e in vuln.get('evidence', [])
+                )
+                html += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
+                        <span class="badge" style="background:rgba(139,148,158,0.2);color:#8b949e;border:1px solid rgba(139,148,158,0.3);">INCONCLUSIVE</span>
+                    </div>
+                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
+                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
+                    <div style="font-size:12px;color:var(--text-secondary);">
+                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')}
+                    </div>
+                </div>
+'''
+        else:
+            html += '<div style="color:var(--text-secondary);">No inconclusive checks</div>'
+
+        html += '''
+            </div>
+        </div>
+'''
+
+        # --- Open ports table ---
+        html += '''
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">🔓 Open Ports &amp; Services</h3>
             </div>
             <div class="card-body">
                 <table>
@@ -663,8 +1183,6 @@ class ReportGenerator:
                     </thead>
                     <tbody>
 '''
-        
-        # Add open ports
         for port in open_ports:
             html += f'''
                         <tr>
@@ -674,51 +1192,14 @@ class ReportGenerator:
                             <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
                         </tr>
 '''
-        
         html += '''
                     </tbody>
                 </table>
             </div>
         </div>
 '''
-        
-        # Add all vulnerabilities table
-        if vulns:
-            html += '''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">📋 All Vulnerabilities</h3>
-            </div>
-            <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>CVE</th>
-                            <th>Name</th>
-                            <th>Severity</th>
-                            <th>Port</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-'''
-            for vuln in vulns:
-                severity = vuln.get('severity', 'UNKNOWN').lower()
-                html += f'''
-                        <tr>
-                            <td><strong>{vuln.get('cve', 'N/A')}</strong></td>
-                            <td>{vuln['name']}</td>
-                            <td><span class="badge badge-{severity}">{vuln.get('severity', 'UNKNOWN')}</span></td>
-                            <td>{vuln.get('port', 'N/A')}</td>
-                        </tr>
-'''
-            html += '''
-                    </tbody>
-                </table>
-            </div>
-        </div>
-'''
-        
-        # Add compliance section
+
+        # --- Compliance section ---
         if compliance:
             html += f'''
         <div class="card">
@@ -747,7 +1228,7 @@ class ReportGenerator:
             </div>
         </div>
 '''
-        
+
         html += f'''
         <div class="footer">
             <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.0 HYBRID - Professional Security Assessment</div>
@@ -757,14 +1238,14 @@ class ReportGenerator:
     </div>
 </body>
 </html>'''
-        
+
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html)
-        
+
         print(Colors.success(f"Professional HTML report saved: {filename}\n"))
-    
+
     def generate_json(self, filename: str):
-        """Generate JSON report"""
+        """Generate JSON report with full structured findings."""
         with open(filename, 'w') as f:
             json.dump(self.results, f, indent=2)
         print(Colors.success(f"JSON report saved: {filename}"))
@@ -772,78 +1253,91 @@ class ReportGenerator:
 
 class HybridScanner:
     """Main hybrid scanner combining all features"""
-    
+
     def __init__(self, target: str, args):
         self.target = target
         self.args = args
+        scan_mode = getattr(args, 'scan_mode', 'common')
         self.results = {
             'target': target,
             'timestamp': datetime.now().isoformat(),
             'scanner_version': VERSION,
+            'scan_mode': scan_mode,
             'open_ports': [],
             'vulnerabilities': [],
             'nvd_intelligence': {},
             'compliance': {}
         }
-    
+
     def run(self):
         """Execute full scan"""
         print(BANNER)
         print(Colors.header(f"[TARGET] {self.target}\n"))
-        
+
         # Phase 1: Port Scanning
         print(Colors.header("[PHASE 1] PORT SCANNING"))
-        scanner = PortScanner(self.target)
-        self.results['open_ports'] = scanner.scan_common_ports()
-        
+        args = self.args
+        scan_mode = getattr(args, 'scan_mode', 'common')
+        custom_ports: List[int] = []
+        if scan_mode == 'custom' and getattr(args, 'ports', None):
+            custom_ports = PortScanner.parse_port_spec(args.ports)
+
+        scanner = PortScanner(
+            self.target,
+            scan_mode=scan_mode,
+            custom_ports=custom_ports,
+            timeout=getattr(args, 'timeout', 1.0),
+            retries=getattr(args, 'retries', 1),
+            concurrency=getattr(args, 'concurrency', 50),
+        )
+        self.results['open_ports'] = scanner.scan()
+
         if not self.results['open_ports']:
             print(Colors.warning("No open ports found!"))
             return
-        
+
         # Phase 2: Vulnerability Checks
         vuln_checker = VulnerabilityChecker(self.target, self.results['open_ports'])
         self.results['vulnerabilities'] = vuln_checker.check_all()
-        
+
         # Phase 3: NVD Intelligence (optional)
-        if not self.args.skip_nvd:
+        if not getattr(args, 'skip_nvd', False):
             nvd = NVDIntelligence(NVD_API_KEY)
             nvd_data = nvd.query_recent_cves(120)
             self.results['nvd_intelligence'] = {
                 'cve_count': len(nvd_data),
-                'query_date': datetime.now().isoformat()
+                'query_date': datetime.now(timezone.utc).isoformat()
             }
-        
+
         # Phase 4: Compliance
-        if not self.args.skip_compliance:
+        if not getattr(args, 'skip_compliance', False):
             compliance_checker = ComplianceChecker(self.results)
             self.results['compliance'] = compliance_checker.check_pci_dss()
-        
+
         # Phase 5: Generate Reports
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         target_safe = self.target.replace('.', '_')
-        
+
         html_file = f"vultron_hybrid_{target_safe}_{timestamp}.html"
         json_file = f"vultron_hybrid_{target_safe}_{timestamp}.json"
-        
+
         reporter = ReportGenerator(self.results)
         reporter.generate_html(html_file)
         reporter.generate_json(json_file)
-        
-        # Summary
+
+        # Summary — counts derived from the single source of truth
+        counts = ReportGenerator._count_by_status_severity(self.results['vulnerabilities'])
+
         print(Colors.header("[SCAN COMPLETE]"))
         print(Colors.success(f"Target: {self.target}"))
-        print(Colors.success(f"Open Ports: {len(self.results['open_ports'])}"))
-        
-        critical = len([v for v in self.results['vulnerabilities'] if v.get('severity') == 'CRITICAL'])
-        high = len([v for v in self.results['vulnerabilities'] if v.get('severity') == 'HIGH'])
-        medium = len([v for v in self.results['vulnerabilities'] if v.get('severity') == 'MEDIUM'])
-        kev = len([v for v in self.results['vulnerabilities'] if v.get('cisa_kev')])
-        
-        print(Colors.critical(f"Critical Vulnerabilities: {critical}"))
-        print(Colors.high(f"High Vulnerabilities: {high}"))
-        print(Colors.medium(f"Medium Vulnerabilities: {medium}"))
-        print(Colors.warning(f"CISA KEV: {kev}"))
+        print(Colors.success(f"Open Ports: {len(self.results['open_ports'])} (scan mode: {scan_mode})"))
+        print(Colors.critical(f"Critical Vulnerabilities (confirmed): {counts['critical_confirmed']}"))
+        print(Colors.high(f"High Vulnerabilities (confirmed): {counts['high_confirmed']}"))
+        print(Colors.medium(f"Medium Vulnerabilities (confirmed): {counts['medium_confirmed']}"))
+        print(Colors.warning(f"Potential (unverified): {counts['potential']}"))
+        print(Colors.warning(f"Inconclusive (manual review): {counts['inconclusive']}"))
+        print(Colors.warning(f"CISA KEV (confirmed): {counts['kev_confirmed']}"))
         print(Colors.success(f"\nReports: {html_file}, {json_file}\n"))
 
 
@@ -853,27 +1347,55 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python vultron_v4_hybrid.py -t 192.168.1.100
-  python vultron_v4_hybrid.py -t server.local --skip-nvd
-  python vultron_v4_hybrid.py -t 10.0.0.50 --skip-compliance
+  python vultron.py -t 192.168.1.100
+  python vultron.py -t 192.168.1.100 --scan-mode top1000
+  python vultron.py -t 192.168.1.100 --scan-mode full --timeout 2 --concurrency 100
+  python vultron.py -t 192.168.1.100 --scan-mode custom --ports 21,80,443,1025-1030,5357
+  python vultron.py -t server.local --skip-nvd
+  python vultron.py -t 10.0.0.50 --skip-compliance
+
+Scan modes:
+  common   Scan 22 well-known ports (fast, default)
+  top1000  Scan ~1000 most frequently open ports (includes RPC/high-dyn ports)
+  full     Scan all 65535 TCP ports (slow — use with --concurrency 200+)
+  custom   Scan ports specified via --ports
 
 Features:
   ✓ REAL port scanning (actual TCP connections)
   ✓ REAL vulnerability detection (active checks)
-  ✓ NVD CVE intelligence
+  ✓ Status-aware findings: CONFIRMED / POTENTIAL / INCONCLUSIVE
+  ✓ NVD CVE intelligence (with retry/backoff)
   ✓ CISA KEV detection
   ✓ Compliance assessment (PCI DSS)
   ✓ Professional GitHub-style dashboard
         """
     )
-    
-    parser.add_argument('-t', '--target', required=True, help='Target IP or hostname')
-    parser.add_argument('--skip-nvd', action='store_true', help='Skip NVD CVE queries')
-    parser.add_argument('--skip-compliance', action='store_true', help='Skip compliance checks')
+
+    parser.add_argument('-t', '--target', required=True,
+                        help='Target IP address or hostname')
+    parser.add_argument('--scan-mode', choices=['common', 'top1000', 'full', 'custom'],
+                        default='common',
+                        help='Port scan coverage mode (default: common)')
+    parser.add_argument('--ports',
+                        help="Custom port list/ranges, e.g. '21,80,443,1025-1030'. "
+                             "Required when --scan-mode=custom")
+    parser.add_argument('--timeout', type=float, default=1.0, metavar='SECONDS',
+                        help='Per-port TCP connection timeout in seconds (default: 1.0)')
+    parser.add_argument('--retries', type=int, default=1, metavar='N',
+                        help='Retry count per port on failure (default: 1)')
+    parser.add_argument('--concurrency', type=int, default=50, metavar='N',
+                        help='Maximum concurrent port scan threads (default: 50)')
+    parser.add_argument('--skip-nvd', action='store_true',
+                        help='Skip NVD CVE enrichment queries')
+    parser.add_argument('--skip-compliance', action='store_true',
+                        help='Skip compliance assessment')
     parser.add_argument('--version', action='version', version=f'Vultron {VERSION}')
-    
+
     args = parser.parse_args()
-    
+
+    if args.scan_mode == 'custom' and not args.ports:
+        parser.error("--ports is required when --scan-mode=custom")
+
     scanner = HybridScanner(args.target, args)
     scanner.run()
 
