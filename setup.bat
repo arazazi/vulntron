@@ -1,275 +1,90 @@
 @echo off
-REM ============================================================================
-REM Vultron v2.0 - Automated Setup Script
-REM This script will:
-REM   1. Check if Python 3.12+ is installed
-REM   2. Install Python if needed
-REM   3. Install required dependencies
-REM   4. Verify installation
-REM ============================================================================
+title VULTRON v4.0 - Installation Setup
+color 0A
+cls
 
 echo.
-echo ========================================
-echo    VULTRON v2.0 - Setup Wizard
-echo ========================================
+echo ===============================================================================
+echo.
+echo      ╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0 - ULTIMATE SETUP
+echo      ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
+echo       ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝   ╚╝
+echo.
+echo                   INSTALLATION WIZARD
+echo.
+echo ===============================================================================
 echo.
 
-REM Check for Administrator privileges
-net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [!] ERROR: This script must be run as Administrator!
-    echo [!] Right-click this file and select "Run as Administrator"
-    echo.
-    pause
-    exit /b 1
-)
-
-echo [+] Running with Administrator privileges
-echo.
-
-REM ============================================================================
-REM Step 1: Check if Python is installed
-REM ============================================================================
-
-echo [*] Checking for Python installation...
+echo [*] Checking Python installation...
 python --version >nul 2>&1
-
-if %errorLevel% equ 0 (
-    echo [+] Python is already installed
-    python --version
-    goto :check_version
-) else (
-    echo [!] Python is not installed
-    goto :install_python
-)
-
-:check_version
-REM Extract Python version
-for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
-
-REM Check if version is 3.12 or higher
-echo [*] Checking Python version: %PYTHON_VERSION%
-
-REM Simple version check (assumes format 3.x.y)
-for /f "tokens=1,2 delims=." %%a in ("%PYTHON_VERSION%") do (
-    set MAJOR=%%a
-    set MINOR=%%b
-)
-
-if %MAJOR% LSS 3 (
-    echo [!] Python version is too old (need 3.12+)
-    goto :install_python
-)
-
-if %MAJOR% EQU 3 (
-    if %MINOR% LSS 12 (
-        echo [!] Python version is too old (need 3.12+, found %PYTHON_VERSION%)
-        echo [*] Upgrading Python...
-        goto :install_python
-    )
-)
-
-echo [+] Python version is compatible: %PYTHON_VERSION%
-goto :install_requirements
-
-REM ============================================================================
-REM Step 2: Install Python
-REM ============================================================================
-
-:install_python
-echo.
-echo ========================================
-echo    Installing Python 3.12
-echo ========================================
-echo.
-
-echo [*] Downloading Python 3.12 installer...
-
-REM Create temp directory
-if not exist "%TEMP%\vultron_setup" mkdir "%TEMP%\vultron_setup"
-
-REM Download Python installer using PowerShell
-powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe' -OutFile '%TEMP%\vultron_setup\python_installer.exe'}"
-
-if %errorLevel% neq 0 (
-    echo [!] ERROR: Failed to download Python installer
-    echo [!] Please download and install Python 3.12+ manually from:
-    echo [!] https://www.python.org/downloads/
+if %errorlevel% neq 0 (
+    echo [!] Python is not installed!
     echo.
+    echo [+] Downloading Python 3.12...
+    echo [+] Opening Python download page...
+    start https://www.python.org/downloads/
+    echo.
+    echo Please install Python 3.12+ and run this setup again.
     pause
     exit /b 1
 )
 
-echo [+] Download complete
-echo [*] Installing Python (this may take a few minutes)...
-
-REM Install Python silently with pip and add to PATH
-"%TEMP%\vultron_setup\python_installer.exe" /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_pip=1
-
-if %errorLevel% neq 0 (
-    echo [!] ERROR: Python installation failed
-    echo [!] Please install Python 3.12+ manually from:
-    echo [!] https://www.python.org/downloads/
-    echo.
-    pause
-    exit /b 1
-)
-
-echo [+] Python installation complete
-echo [*] Refreshing environment variables...
-
-REM Refresh PATH
-call refreshenv >nul 2>&1
-
-REM Verify installation
-python --version >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [!] Python installed but not found in PATH
-    echo [!] Please restart your computer and run this script again
-    echo.
-    pause
-    exit /b 1
-)
-
-echo [+] Python is now available
+echo [+] Python found!
 python --version
-
-REM Clean up installer
-del "%TEMP%\vultron_setup\python_installer.exe" >nul 2>&1
-
-REM ============================================================================
-REM Step 3: Install Requirements
-REM ============================================================================
-
-:install_requirements
-echo.
-echo ========================================
-echo    Installing Dependencies
-echo ========================================
 echo.
 
 echo [*] Upgrading pip...
-python -m pip install --upgrade pip --quiet
-
-if %errorLevel% neq 0 (
-    echo [!] WARNING: Failed to upgrade pip, continuing anyway...
-)
-
-echo [+] Pip upgraded
-
-echo [*] Installing colorama...
-python -m pip install colorama --quiet
-
-if %errorLevel% neq 0 (
-    echo [!] ERROR: Failed to install colorama
-    pause
-    exit /b 1
-)
-echo [+] colorama installed
-
-echo [*] Installing requests...
-python -m pip install requests --quiet
-
-if %errorLevel% neq 0 (
-    echo [!] ERROR: Failed to install requests
-    pause
-    exit /b 1
-)
-echo [+] requests installed
-
-echo [*] Installing psutil...
-python -m pip install psutil --quiet
-
-if %errorLevel% neq 0 (
-    echo [!] WARNING: Failed to install psutil (optional)
-    echo [*] Continuing without psutil...
-) else (
-    echo [+] psutil installed
-)
-
-REM ============================================================================
-REM Step 4: Verify Installation
-REM ============================================================================
-
-echo.
-echo ========================================
-echo    Verifying Installation
-echo ========================================
+python -m pip install --upgrade pip
 echo.
 
-echo [*] Checking installed packages...
+echo [*] Installing required dependencies...
+echo.
+echo [1/6] Installing colorama (terminal colors)...
+pip install colorama --quiet
 
-python -c "import colorama; print('[+] colorama: OK')" 2>nul
-if %errorLevel% neq 0 (
-    echo [!] colorama: FAILED
-    set INSTALL_FAILED=1
-)
+echo [2/6] Installing requests (HTTP library)...
+pip install requests --quiet
 
-python -c "import requests; print('[+] requests: OK')" 2>nul
-if %errorLevel% neq 0 (
-    echo [!] requests: FAILED
-    set INSTALL_FAILED=1
-)
+echo [3/6] Installing psutil (system info)...
+pip install psutil --quiet
 
-python -c "import psutil; print('[+] psutil: OK')" 2>nul
-if %errorLevel% neq 0 (
-    echo [*] psutil: Not installed (optional)
-)
+echo [4/6] Installing pywinrm (optional - remote scanning)...
+pip install pywinrm --quiet
 
-if defined INSTALL_FAILED (
-    echo.
-    echo [!] Some packages failed to install
-    echo [!] Please check the errors above
-    pause
-    exit /b 1
-)
+echo [5/6] Installing impacket (optional - SMB tools)...
+pip install impacket --quiet
 
-REM ============================================================================
-REM Step 5: Create Launcher Scripts
-REM ============================================================================
+echo [6/6] Installing beautifulsoup4 (optional - web parsing)...
+pip install beautifulsoup4 --quiet
 
 echo.
-echo [*] Creating launcher scripts...
-
-REM Create comprehensive scan launcher
-(
-echo @echo off
-echo echo Starting Vultron v2.0 - COMPREHENSIVE SCAN
-echo echo.
-echo python vultron_v2.py
-echo pause
-) > "vultron_comprehensive.bat"
-
-echo [+] Created: vultron_comprehensive.bat
-
-REM Create quick scan launcher
-(
-echo @echo off
-echo echo Starting Vultron v2.0 - QUICK SCAN
-echo echo.
-echo echo 2 ^| python vultron_v2.py
-echo pause
-) > "vultron_quick.bat"
-
-echo [+] Created: vultron_quick.bat
-
-REM ============================================================================
-REM Completion
-REM ============================================================================
-
+echo ===============================================================================
 echo.
-echo ========================================
-echo    Setup Complete!
-echo ========================================
+echo [+] INSTALLATION COMPLETE!
 echo.
-echo [+] Vultron v2.0 is ready to use
+echo Dependencies installed:
+echo   - colorama (terminal colors)
+echo   - requests (HTTP/API calls)
+echo   - psutil (system information)
+echo   - pywinrm (remote Windows management)
+echo   - impacket (network protocols)
+echo   - beautifulsoup4 (web scraping)
+echo.
+echo ===============================================================================
 echo.
 echo NEXT STEPS:
-echo   1. Run vultron_comprehensive.bat for full scan (recommended)
-echo   2. Run vultron_quick.bat for quick scan
-echo   3. Or run: python vultron_v2.py
 echo.
-echo NOTE: All scripts must be run as Administrator
+echo 1. Get NVD API key (FREE):
+echo    https://nvd.nist.gov/developers/request-an-api-key
 echo.
-
+echo 2. Add API key to vultron_v4_ultimate.py (line 38):
+echo    NVD_API_KEY = "your-api-key-here"
+echo.
+echo 3. Run a scan:
+echo    - vultron_local.bat       (Deep local forensics)
+echo    - vultron_network.bat     (Network vulnerability scan)
+echo    - vultron_ultimate.bat    (Complete assessment)
+echo.
+echo ===============================================================================
+echo.
 pause

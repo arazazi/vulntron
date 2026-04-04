@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vultron Security Platform - Vulnerability Assessment</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0f1419;
+            --bg-secondary: #1a1f28;
+            --bg-tertiary: #252b36;
+            --bg-card: #1e2430;
+            
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-tertiary: #6e7681;
+            
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-orange: #f85149;
+            --accent-yellow: #d29922;
+            
+            --border: #30363d;
+            --border-hover: #484f58;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, system-ui, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* Top Bar */
+        .top-bar {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-logo {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-green));
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 18px;
+        }
+
+        .brand-name {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .scan-info {
+            display: flex;
+            gap: 24px;
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        .scan-info span {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }
+
+        .stat-card:hover {
+            border-color: var(--border-hover);
+        }
+
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 12px;
+        }
+
+        .stat-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-trend {
+            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+
+        .trend-up {
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--accent-orange);
+        }
+
+        .trend-neutral {
+            background: rgba(139, 148, 158, 0.15);
+            color: var(--text-secondary);
+        }
+
+        .stat-value {
+            font-size: 36px;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 4px;
+        }
+
+        .stat-value.critical { color: var(--accent-orange); }
+        .stat-value.warning { color: var(--accent-yellow); }
+        .stat-value.info { color: var(--accent-blue); }
+
+        .stat-subtitle {
+            font-size: 13px;
+            color: var(--text-tertiary);
+        }
+
+        /* Main Grid */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        /* Card */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-title {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .card-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+
+        .btn:hover {
+            background: var(--bg-secondary);
+            border-color: var(--border-hover);
+        }
+
+        .card-body {
+            padding: 20px;
+        }
+
+        /* Vulnerability List */
+        .vuln-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .vuln-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 16px;
+            transition: border-color 0.2s;
+        }
+
+        .vuln-item:hover {
+            border-color: var(--border-hover);
+        }
+
+        .vuln-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+
+        .vuln-cve {
+            font-family: 'SF Mono', 'Monaco', monospace;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--accent-blue);
+        }
+
+        .vuln-badges {
+            display: flex;
+            gap: 6px;
+        }
+
+        .badge {
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-critical {
+            background: rgba(248, 81, 73, 0.2);
+            color: var(--accent-orange);
+            border: 1px solid rgba(248, 81, 73, 0.3);
+        }
+
+        .badge-kev {
+            background: linear-gradient(135deg, #f85149, #d73a49);
+            color: white;
+            border: none;
+        }
+
+        .vuln-title {
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: var(--text-primary);
+        }
+
+        .vuln-meta {
+            display: flex;
+            gap: 16px;
+            font-size: 12px;
+            color: var(--text-tertiary);
+        }
+
+        .vuln-meta span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        /* Timeline */
+        .timeline {
+            position: relative;
+        }
+
+        .timeline-item {
+            position: relative;
+            padding-left: 28px;
+            padding-bottom: 24px;
+        }
+
+        .timeline-item:last-child {
+            padding-bottom: 0;
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: 6px;
+            top: 6px;
+            bottom: -24px;
+            width: 2px;
+            background: var(--border);
+        }
+
+        .timeline-item:last-child::before {
+            display: none;
+        }
+
+        .timeline-dot {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid var(--border);
+            background: var(--bg-card);
+        }
+
+        .timeline-dot.critical {
+            border-color: var(--accent-orange);
+            background: var(--accent-orange);
+        }
+
+        .timeline-dot.warning {
+            border-color: var(--accent-yellow);
+            background: var(--accent-yellow);
+        }
+
+        .timeline-content {
+            font-size: 13px;
+        }
+
+        .timeline-time {
+            color: var(--text-tertiary);
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+
+        .timeline-text {
+            color: var(--text-secondary);
+        }
+
+        /* Table */
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 14px 16px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover {
+            background: rgba(88, 166, 255, 0.05);
+        }
+
+        /* Chart Container */
+        .chart-container {
+            position: relative;
+            height: 280px;
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 24px;
+            color: var(--text-tertiary);
+            font-size: 13px;
+            border-top: 1px solid var(--border);
+            margin-top: 24px;
+        }
+
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            margin-top: 12px;
+        }
+
+        .footer-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+        }
+
+        .footer-links a:hover {
+            color: var(--accent-blue);
+        }
+
+        @media (max-width: 1024px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .scan-info {
+                flex-direction: column;
+                gap: 8px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Top Bar -->
+    <div class="top-bar">
+        <div class="brand">
+            <div class="brand-logo">V</div>
+            <span class="brand-name">Vultron Security Platform</span>
+        </div>
+        <div class="scan-info">
+            <span><span class="status-dot"></span> Scan Complete</span>
+            <span>Target: 192.168.1.100</span>
+            <span>March 8, 2026 14:30</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Stats Grid -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">Critical</span>
+                    <span class="stat-trend trend-up">↑ 2 new</span>
+                </div>
+                <div class="stat-value critical">5</div>
+                <div class="stat-subtitle">Immediate action required</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">High</span>
+                    <span class="stat-trend trend-up">↑ 3 new</span>
+                </div>
+                <div class="stat-value warning">10</div>
+                <div class="stat-subtitle">Patch within 7 days</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">Medium</span>
+                    <span class="stat-trend trend-neutral">→ No change</span>
+                </div>
+                <div class="stat-value info">8</div>
+                <div class="stat-subtitle">Patch within 30 days</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">CISA KEV</span>
+                    <span class="stat-trend trend-up">⚡ Active</span>
+                </div>
+                <div class="stat-value critical">5</div>
+                <div class="stat-subtitle">Actively exploited in wild</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">Open Ports</span>
+                    <span class="stat-trend trend-neutral">15 total</span>
+                </div>
+                <div class="stat-value info">15</div>
+                <div class="stat-subtitle">Attack surface</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-label">Risk Score</span>
+                    <span class="stat-trend trend-up">↑ 1.2</span>
+                </div>
+                <div class="stat-value critical">8.7</div>
+                <div class="stat-subtitle">Out of 10</div>
+            </div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="main-grid">
+            <!-- Left Column -->
+            <div>
+                <!-- Critical Vulnerabilities -->
+                <div class="card" style="margin-bottom: 24px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Critical Vulnerabilities</h3>
+                        <div class="card-actions">
+                            <button class="btn">Export CSV</button>
+                            <button class="btn">View All</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="vuln-list">
+                            <div class="vuln-item">
+                                <div class="vuln-header">
+                                    <span class="vuln-cve">CVE-2017-0144</span>
+                                    <div class="vuln-badges">
+                                        <span class="badge badge-kev">KEV</span>
+                                        <span class="badge badge-critical">CRITICAL</span>
+                                    </div>
+                                </div>
+                                <div class="vuln-title">MS17-010 (EternalBlue) - SMBv1 Remote Code Execution</div>
+                                <div class="vuln-meta">
+                                    <span>🎯 CVSS 9.8</span>
+                                    <span>🔌 Port 445/TCP</span>
+                                    <span>⚡ Exploit Public</span>
+                                </div>
+                            </div>
+
+                            <div class="vuln-item">
+                                <div class="vuln-header">
+                                    <span class="vuln-cve">CVE-2020-0796</span>
+                                    <div class="vuln-badges">
+                                        <span class="badge badge-kev">KEV</span>
+                                        <span class="badge badge-critical">CRITICAL</span>
+                                    </div>
+                                </div>
+                                <div class="vuln-title">SMBGhost - SMBv3 Compression RCE</div>
+                                <div class="vuln-meta">
+                                    <span>🎯 CVSS 10.0</span>
+                                    <span>🔌 Port 445/TCP</span>
+                                    <span>⚡ PoC Available</span>
+                                </div>
+                            </div>
+
+                            <div class="vuln-item">
+                                <div class="vuln-header">
+                                    <span class="vuln-cve">CVE-2019-0708</span>
+                                    <div class="vuln-badges">
+                                        <span class="badge badge-kev">KEV</span>
+                                        <span class="badge badge-critical">CRITICAL</span>
+                                    </div>
+                                </div>
+                                <div class="vuln-title">BlueKeep - RDP Pre-Auth RCE</div>
+                                <div class="vuln-meta">
+                                    <span>🎯 CVSS 9.8</span>
+                                    <span>🔌 Port 3389/TCP</span>
+                                    <span>⚡ Metasploit</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Open Ports -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">Open Ports & Services</h3>
+                        <div class="card-actions">
+                            <button class="btn">Filter</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Port</th>
+                                        <th>Service</th>
+                                        <th>Version</th>
+                                        <th>Risk</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><strong>445</strong></td>
+                                        <td>SMB</td>
+                                        <td>Windows Server 2016</td>
+                                        <td><span class="badge badge-critical">CRITICAL</span></td>
+                                        <td>🌐 External</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>3389</strong></td>
+                                        <td>RDP</td>
+                                        <td>Microsoft Terminal Services</td>
+                                        <td><span class="badge badge-critical">CRITICAL</span></td>
+                                        <td>⚠️ High Risk</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>135</strong></td>
+                                        <td>MS-RPC</td>
+                                        <td>Microsoft RPC Endpoint</td>
+                                        <td><span style="color: var(--accent-yellow);">MEDIUM</span></td>
+                                        <td>✓ Internal</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>80</strong></td>
+                                        <td>HTTP</td>
+                                        <td>IIS 10.0</td>
+                                        <td><span class="badge badge-critical">HIGH</span></td>
+                                        <td>🌐 Public</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>443</strong></td>
+                                        <td>HTTPS</td>
+                                        <td>IIS 10.0 / TLS 1.2</td>
+                                        <td><span style="color: var(--accent-yellow);">MEDIUM</span></td>
+                                        <td>✓ Encrypted</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column -->
+            <div>
+                <!-- Activity Timeline -->
+                <div class="card" style="margin-bottom: 24px;">
+                    <div class="card-header">
+                        <h3 class="card-title">Scan Activity</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="timeline">
+                            <div class="timeline-item">
+                                <div class="timeline-dot critical"></div>
+                                <div class="timeline-content">
+                                    <div class="timeline-time">14:30:22</div>
+                                    <div class="timeline-text">Scan completed - 23 vulnerabilities found</div>
+                                </div>
+                            </div>
+                            <div class="timeline-item">
+                                <div class="timeline-dot warning"></div>
+                                <div class="timeline-content">
+                                    <div class="timeline-time">14:28:15</div>
+                                    <div class="timeline-text">EternalBlue detected on port 445</div>
+                                </div>
+                            </div>
+                            <div class="timeline-item">
+                                <div class="timeline-dot critical"></div>
+                                <div class="timeline-content">
+                                    <div class="timeline-time">14:25:43</div>
+                                    <div class="timeline-text">BlueKeep vulnerability confirmed</div>
+                                </div>
+                            </div>
+                            <div class="timeline-item">
+                                <div class="timeline-dot"></div>
+                                <div class="timeline-content">
+                                    <div class="timeline-time">14:20:10</div>
+                                    <div class="timeline-text">Port scanning started</div>
+                                </div>
+                            </div>
+                            <div class="timeline-item">
+                                <div class="timeline-dot"></div>
+                                <div class="timeline-content">
+                                    <div class="timeline-time">14:19:55</div>
+                                    <div class="timeline-text">Target validated: 192.168.1.100</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Severity Chart -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">Severity Distribution</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container">
+                            <canvas id="severityChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <div>Vultron v4.0 Ultimate - Enterprise Security Assessment Platform</div>
+            <div style="margin-top: 8px;">Abdul Raza | Asia Pacific University | MSc Cybersecurity</div>
+            <div class="footer-links">
+                <a href="#">Documentation</a>
+                <a href="#">API Reference</a>
+                <a href="#">Support</a>
+                <a href="#">GitHub</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Severity Chart
+        const ctx = document.getElementById('severityChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Critical', 'High', 'Medium'],
+                datasets: [{
+                    data: [5, 10, 8],
+                    backgroundColor: [
+                        '#f85149',
+                        '#d29922',
+                        '#58a6ff'
+                    ],
+                    borderWidth: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            color: '#8b949e',
+                            padding: 16,
+                            font: {
+                                size: 13
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
