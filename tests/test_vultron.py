@@ -310,10 +310,7 @@ class TestNVDClientResponseHandling(unittest.TestCase):
         mock_get.return_value = self._mock_response(200, {'totalResults': 0, 'vulnerabilities': []})
         self.nvd.query_recent_cves(days=7)
         self.assertTrue(mock_get.called)
-        call_kwargs = mock_get.call_args
-        params = call_kwargs[1].get('params') or call_kwargs[0][1] if len(call_kwargs[0]) > 1 else {}
-        if not params and call_kwargs[1]:
-            params = call_kwargs[1].get('params', {})
+        params = mock_get.call_args.kwargs.get('params', {})
         pub_start = params.get('pubStartDate', '')
         self.assertIn('UTC', pub_start,
                       f"pubStartDate '{pub_start}' must contain UTC offset for NVD 2.0 API")

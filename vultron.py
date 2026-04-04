@@ -25,7 +25,7 @@ import argparse
 import json
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 # Optional dependencies
 try:
@@ -228,15 +228,18 @@ class PortScanner:
         return list(self.COMMON_PORTS.keys())
 
     def scan_port(self, port: int) -> Optional[Dict]:
-        """Scan single port with banner grabbing and optional retries"""
-        for attempt in range(max(1, self.retries)):
+        """Scan single port with banner grabbing and optional retries.
+
+        ``self.retries`` is the total number of connection attempts (minimum 1).
+        """
+        for _attempt in range(max(1, self.retries)):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(self.timeout)
                 result = sock.connect_ex((self.target, port))
 
                 if result == 0:
-                    service = self.SERVICE_NAMES.get(port, self.COMMON_PORTS.get(port, f'Unknown-{port}'))
+                    service = self.SERVICE_NAMES.get(port, f'Unknown-{port}')
                     banner = self.grab_banner(sock, port)
 
                     return {
@@ -676,7 +679,7 @@ class NVDIntelligence:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
         self.base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        self._cache: Dict[str, object] = {}
+        self._cache: Dict[str, Union[List[Dict], Optional[Dict]]] = {}
 
     def _get(self, params: Dict, attempt: int = 0) -> Optional[Dict]:
         """Perform a GET with retry/backoff; return parsed JSON or None."""
@@ -721,9 +724,9 @@ class NVDIntelligence:
 
         cache_key = f"recent_{days}_{start_date.date()}"
         if cache_key in self._cache:
-            cached = self._cache[cache_key]
-            print(Colors.success(f"NVD: using cached result ({len(cached)} CVEs)"))  # type: ignore[arg-type]
-            return cached  # type: ignore[return-value]
+            cached: List[Dict] = self._cache[cache_key]  # type: ignore[assignment]
+            print(Colors.success(f"NVD: using cached result ({len(cached)} CVEs)"))
+            return cached
 
         params = {
             'pubStartDate': start_date.strftime(self._DATE_FMT),
@@ -745,12 +748,13 @@ class NVDIntelligence:
         if not HAS_REQUESTS or not cve_id or cve_id == 'N/A':
             return None
         if cve_id in self._cache:
-            return self._cache[cve_id]  # type: ignore[return-value]
+            cached_cve: Optional[Dict] = self._cache[cve_id]  # type: ignore[assignment]
+            return cached_cve
         params = {'cveId': cve_id}
         data = self._get(params)
         if data:
             vulns = data.get('vulnerabilities', [])
-            result = vulns[0] if vulns else None
+            result: Optional[Dict] = vulns[0] if vulns else None
             self._cache[cve_id] = result
             return result
         return None
