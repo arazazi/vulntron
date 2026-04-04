@@ -356,6 +356,12 @@ class VulnerabilityChecker:
                 self.check_web_vulns(port)
             elif port in [3306, 5432, 1433, 27017, 6379]:
                 self.check_database_vulns(port, service)
+            elif port == 21 or service.upper() == 'FTP':
+                self.check_ftp_anonymous(port)
+            elif port == 23 or service.upper() == 'TELNET':
+                self.check_telnet_banner(port)
+            elif port == 161 or service.upper() == 'SNMP':
+                self.check_snmp_community(port)
 
         confirmed = sum(1 for v in self.vulnerabilities if v.get('status') == 'CONFIRMED')
         potential = sum(1 for v in self.vulnerabilities if v.get('status') == 'POTENTIAL')
@@ -667,6 +673,295 @@ class VulnerabilityChecker:
         })
         print(Colors.high(f"    CONFIRMED: {service} exposed externally!"))
 
+    # ------------------------------------------------------------------
+    # Protocol-specific checks
+    # ------------------------------------------------------------------
+
+    def check_ftp_anonymous(self, port: int):
+        """Check whether the FTP server permits anonymous login."""
+        print(Colors.info(f"  [FTP] Checking for anonymous login on port {port}..."))
+        evidence: List[str] = [f"FTP port {port}/tcp is open"]
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((self.target, port))
+
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+            if banner:
+                evidence.append(f"FTP banner: {banner[:100]}")
+
+            sock.send(b'USER anonymous\r\n')
+            user_resp = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+            if user_resp:
+                evidence.append(f"USER response: {user_resp[:80]}")
+
+            # Some servers grant login on USER alone (230) or reject outright (530)
+            if user_resp.startswith('230'):
+                sock.close()
+                self._add({
+                    'id': f'FTP-ANON-{port}',
+                    'cve': 'N/A',
+                    'name': 'FTP Anonymous Login Enabled',
+                    'title': f'FTP anonymous login accepted on port {port}',
+                    'severity': 'HIGH',
+                    'status': 'CONFIRMED',
+                    'port': port,
+                    'affected_service': 'FTP',
+                    'description': ('The FTP server accepted anonymous login. '
+                                    'Unauthenticated users may read or write files.'),
+                    'evidence': evidence,
+                    'remediation': 'Disable anonymous FTP access unless explicitly required.',
+                })
+                print(Colors.high("    CONFIRMED: FTP anonymous login accepted!"))
+                return
+            elif user_resp.startswith(('4', '5')):
+                sock.close()
+                evidence.append("Anonymous login rejected at USER stage")
+                print(Colors.success("    NOT_AFFECTED: FTP anonymous login rejected"))
+                return
+
+            sock.send(b'PASS anonymous@example.com\r\n')
+            pass_resp = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+            if pass_resp:
+                evidence.append(f"PASS response: {pass_resp[:80]}")
+            sock.close()
+
+            if pass_resp.startswith('230'):
+                self._add({
+                    'id': f'FTP-ANON-{port}',
+                    'cve': 'N/A',
+                    'name': 'FTP Anonymous Login Enabled',
+                    'title': f'FTP anonymous login accepted on port {port}',
+                    'severity': 'HIGH',
+                    'status': 'CONFIRMED',
+                    'port': port,
+                    'affected_service': 'FTP',
+                    'description': ('The FTP server accepted anonymous login. '
+                                    'Unauthenticated users may read or write files.'),
+                    'evidence': evidence,
+                    'remediation': 'Disable anonymous FTP access unless explicitly required.',
+                })
+                print(Colors.high("    CONFIRMED: FTP anonymous login accepted!"))
+            elif pass_resp.startswith(('3', '4', '5')):
+                evidence.append("Anonymous login denied by server")
+                print(Colors.success("    NOT_AFFECTED: FTP anonymous login denied"))
+            else:
+                self._add({
+                    'id': f'FTP-ANON-{port}',
+                    'cve': 'N/A',
+                    'name': 'FTP Anonymous Login',
+                    'title': f'FTP anonymous login result ambiguous on port {port}',
+                    'severity': 'MEDIUM',
+                    'status': 'POTENTIAL',
+                    'port': port,
+                    'affected_service': 'FTP',
+                    'description': (f'FTP anonymous login result was ambiguous. '
+                                    f'Response: {pass_resp[:50]}'),
+                    'evidence': evidence,
+                    'remediation': 'Review FTP server configuration for anonymous access settings.',
+                })
+                print(Colors.warning("    POTENTIAL: FTP anonymous login response ambiguous"))
+        except socket.timeout:
+            evidence.append("Connection timed out during FTP anonymous login check")
+            self._add({
+                'id': f'FTP-ANON-{port}',
+                'cve': 'N/A',
+                'name': 'FTP Anonymous Login',
+                'title': f'FTP anonymous login check inconclusive (timeout) on port {port}',
+                'severity': 'MEDIUM',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'FTP',
+                'description': 'FTP anonymous login check timed out. Manual verification required.',
+                'evidence': evidence,
+                'remediation': 'Verify FTP server anonymous access configuration manually.',
+            })
+            print(Colors.warning("    INCONCLUSIVE: FTP anonymous login check timed out"))
+        except Exception as exc:
+            evidence.append(f"Check error: {exc}")
+            self._add({
+                'id': f'FTP-ANON-{port}',
+                'cve': 'N/A',
+                'name': 'FTP Anonymous Login',
+                'title': f'FTP anonymous login check inconclusive (error) on port {port}',
+                'severity': 'MEDIUM',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'FTP',
+                'description': f'FTP anonymous login check could not complete: {exc}',
+                'evidence': evidence,
+                'remediation': 'Verify FTP server anonymous access configuration manually.',
+            })
+            print(Colors.warning(f"    INCONCLUSIVE: FTP check error — {exc}"))
+
+    def check_telnet_banner(self, port: int):
+        """Collect the Telnet banner and assess cleartext protocol exposure."""
+        print(Colors.info(f"  [Telnet] Checking banner on port {port}..."))
+        evidence: List[str] = [f"Telnet port {port}/tcp is open"]
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((self.target, port))
+
+            raw = sock.recv(1024)
+            sock.close()
+
+            banner = raw.decode('utf-8', errors='ignore').strip()
+            if banner:
+                evidence.append(f"Telnet banner: {banner[:100]}")
+            else:
+                evidence.append("Connected but no banner text received")
+            evidence.append("Telnet transmits all data (including credentials) in plaintext")
+
+            self._add({
+                'id': f'TELNET-EXPOSURE-{port}',
+                'cve': 'N/A',
+                'name': 'Telnet Service Exposed',
+                'title': f'Telnet cleartext protocol exposed on port {port}',
+                'severity': 'HIGH',
+                'status': 'POTENTIAL',
+                'port': port,
+                'affected_service': 'Telnet',
+                'description': ('Telnet is a legacy protocol that transmits all data, '
+                                'including credentials, in cleartext. '
+                                'Any network observer can intercept sessions.'),
+                'evidence': evidence,
+                'remediation': 'Disable Telnet; replace with SSH for encrypted remote access.',
+            })
+            print(Colors.high("    POTENTIAL: Telnet service exposed — unencrypted protocol"))
+        except socket.timeout:
+            evidence.append("Connection timed out during Telnet banner collection")
+            self._add({
+                'id': f'TELNET-EXPOSURE-{port}',
+                'cve': 'N/A',
+                'name': 'Telnet Service Exposed',
+                'title': f'Telnet banner check inconclusive (timeout) on port {port}',
+                'severity': 'MEDIUM',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'Telnet',
+                'description': ('Telnet banner collection timed out. '
+                                'The service may be running but unresponsive.'),
+                'evidence': evidence,
+                'remediation': 'Disable Telnet; replace with SSH.',
+            })
+            print(Colors.warning("    INCONCLUSIVE: Telnet banner check timed out"))
+        except Exception as exc:
+            evidence.append(f"Check error: {exc}")
+            self._add({
+                'id': f'TELNET-EXPOSURE-{port}',
+                'cve': 'N/A',
+                'name': 'Telnet Service Exposed',
+                'title': f'Telnet banner check inconclusive (error) on port {port}',
+                'severity': 'MEDIUM',
+                'status': 'INCONCLUSIVE',
+                'port': port,
+                'affected_service': 'Telnet',
+                'description': f'Telnet banner check could not complete: {exc}',
+                'evidence': evidence,
+                'remediation': 'Disable Telnet; replace with SSH.',
+            })
+            print(Colors.warning(f"    INCONCLUSIVE: Telnet check error — {exc}"))
+
+    @staticmethod
+    def _build_snmp_getrequest(community: str, request_id: int = 0x1234) -> bytes:
+        """Build a minimal SNMP v1 GetRequest PDU for sysDescr.0 (read-only probe)."""
+        # OID 1.3.6.1.2.1.1.1.0 (sysDescr.0) encoded in BER
+        oid_val = bytes([0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00])
+        oid_tlv = bytes([0x06, len(oid_val)]) + oid_val
+        null_tlv = bytes([0x05, 0x00])
+
+        # varbind = SEQUENCE { oid, null }
+        varbind_content = oid_tlv + null_tlv
+        varbind = bytes([0x30, len(varbind_content)]) + varbind_content
+
+        # varBindList = SEQUENCE { varbind }
+        vbl = bytes([0x30, len(varbind)]) + varbind
+
+        # GetRequest PDU (type 0xA0)
+        req_id_val = struct.pack('>I', request_id)
+        req_id_tlv = bytes([0x02, len(req_id_val)]) + req_id_val
+        err_status = bytes([0x02, 0x01, 0x00])
+        err_index = bytes([0x02, 0x01, 0x00])
+        pdu_content = req_id_tlv + err_status + err_index + vbl
+        pdu = bytes([0xA0, len(pdu_content)]) + pdu_content
+
+        # Full SNMP message: SEQUENCE { version, community, pdu }
+        version_tlv = bytes([0x02, 0x01, 0x00])
+        comm_bytes = community.encode('ascii')
+        comm_tlv = bytes([0x04, len(comm_bytes)]) + comm_bytes
+        msg_content = version_tlv + comm_tlv + pdu
+        return bytes([0x30, len(msg_content)]) + msg_content
+
+    def check_snmp_community(self, port: int):
+        """Check for default SNMP community strings via safe read-only UDP probe."""
+        print(Colors.info(f"  [SNMP] Checking default community strings on port {port}/udp..."))
+        evidence: List[str] = [f"SNMP port {port} detected"]
+        communities = ['public', 'private']
+
+        for community in communities:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(3)
+                pkt = self._build_snmp_getrequest(community)
+                sock.sendto(pkt, (self.target, port))
+                response, _ = sock.recvfrom(1024)
+                sock.close()
+
+                evidence.append(
+                    f"SNMP community '{community}' accepted "
+                    f"({len(response)} bytes received)"
+                )
+                self._add({
+                    'id': f'SNMP-DEFAULT-COMMUNITY-{port}',
+                    'cve': 'N/A',
+                    'name': 'SNMP Default Community String',
+                    'title': f"SNMP default community '{community}' accepted on port {port}/udp",
+                    'severity': 'HIGH',
+                    'status': 'CONFIRMED',
+                    'port': port,
+                    'affected_service': 'SNMP',
+                    'description': (
+                        f"The SNMP agent accepted the default community string '{community}'. "
+                        "This allows unauthenticated read access to device configuration "
+                        "and network topology information."
+                    ),
+                    'evidence': evidence,
+                    'remediation': (
+                        'Change SNMP community strings from defaults; '
+                        'upgrade to SNMPv3 with authentication and encryption; '
+                        'restrict SNMP access via firewall rules.'
+                    ),
+                })
+                print(Colors.high(f"    CONFIRMED: SNMP community '{community}' accepted!"))
+                return
+            except socket.timeout:
+                evidence.append(f"SNMP community '{community}': no response (timeout)")
+            except Exception as exc:
+                evidence.append(f"SNMP community '{community}' check error: {exc}")
+
+        # All communities timed out or errored — no definitive response
+        self._add({
+            'id': f'SNMP-DEFAULT-COMMUNITY-{port}',
+            'cve': 'N/A',
+            'name': 'SNMP Default Community String',
+            'title': f'SNMP default community check inconclusive on port {port}/udp',
+            'severity': 'MEDIUM',
+            'status': 'INCONCLUSIVE',
+            'port': port,
+            'affected_service': 'SNMP',
+            'description': (
+                'SNMP default community probe received no response. '
+                'The service may use non-default community strings or be filtered.'
+            ),
+            'evidence': evidence,
+            'remediation': (
+                'Use SNMPv3 with authentication and encryption; '
+                'restrict SNMP access via firewall rules.'
+            ),
+        })
+        print(Colors.warning("    INCONCLUSIVE: SNMP default community check received no response"))
+
 
 class NVDIntelligence:
     """NVD CVE intelligence gathering with retry/backoff and graceful degradation"""
@@ -829,6 +1124,7 @@ class ReportGenerator:
         vulns = self.results.get('vulnerabilities', [])
         compliance = self.results.get('compliance', {})
         scan_mode = self.results.get('scan_mode', 'common')
+        cve_lookback_days = self.results.get('cve_lookback_days', 120)
 
         counts = self._count_by_status_severity(vulns)
         critical = counts['critical_confirmed']
@@ -1003,6 +1299,7 @@ class ReportGenerator:
             <span><span class="status-dot"></span> Scan Complete</span>
             <span>Target: {target}</span>
             <span>{timestamp[:19]}</span>
+            <span>CVE Lookback: {cve_lookback_days}d</span>
         </div>
     </div>
 
@@ -1258,11 +1555,13 @@ class HybridScanner:
         self.target = target
         self.args = args
         scan_mode = getattr(args, 'scan_mode', 'common')
+        cve_lookback_days = getattr(args, 'cve_lookback_days', 120)
         self.results = {
             'target': target,
             'timestamp': datetime.now().isoformat(),
             'scanner_version': VERSION,
             'scan_mode': scan_mode,
+            'cve_lookback_days': cve_lookback_days,
             'open_ports': [],
             'vulnerabilities': [],
             'nvd_intelligence': {},
@@ -1303,10 +1602,12 @@ class HybridScanner:
         # Phase 3: NVD Intelligence (optional)
         if not getattr(args, 'skip_nvd', False):
             nvd = NVDIntelligence(NVD_API_KEY)
-            nvd_data = nvd.query_recent_cves(120)
+            lookback_days = self.results['cve_lookback_days']
+            nvd_data = nvd.query_recent_cves(lookback_days)
             self.results['nvd_intelligence'] = {
                 'cve_count': len(nvd_data),
-                'query_date': datetime.now(timezone.utc).isoformat()
+                'query_date': datetime.now(timezone.utc).isoformat(),
+                'lookback_days': lookback_days,
             }
 
         # Phase 4: Compliance
@@ -1353,6 +1654,7 @@ Examples:
   python vultron.py -t 192.168.1.100 --scan-mode custom --ports 21,80,443,1025-1030,5357
   python vultron.py -t server.local --skip-nvd
   python vultron.py -t 10.0.0.50 --skip-compliance
+  python vultron.py -t 192.168.1.100 --cve-lookback-days 30
 
 Scan modes:
   common   Scan 22 well-known ports (fast, default)
@@ -1360,10 +1662,17 @@ Scan modes:
   full     Scan all 65535 TCP ports (slow — use with --concurrency 200+)
   custom   Scan ports specified via --ports
 
+Protocol checks (triggered automatically on open ports):
+  FTP (21)    Anonymous login probe — CONFIRMED / POTENTIAL / INCONCLUSIVE
+  Telnet (23) Banner collection + cleartext exposure — POTENTIAL / INCONCLUSIVE
+  SNMP (161)  Default community string probe (public/private) — CONFIRMED / INCONCLUSIVE
+
 Features:
   ✓ REAL port scanning (actual TCP connections)
   ✓ REAL vulnerability detection (active checks)
   ✓ Status-aware findings: CONFIRMED / POTENTIAL / INCONCLUSIVE
+  ✓ FTP anonymous login, Telnet banner, SNMP community checks
+  ✓ Configurable CVE lookback period (--cve-lookback-days)
   ✓ NVD CVE intelligence (with retry/backoff)
   ✓ CISA KEV detection
   ✓ Compliance assessment (PCI DSS)
@@ -1389,12 +1698,20 @@ Features:
                         help='Skip NVD CVE enrichment queries')
     parser.add_argument('--skip-compliance', action='store_true',
                         help='Skip compliance assessment')
+    parser.add_argument('--cve-lookback-days', type=int, default=120, metavar='DAYS',
+                        help='Days to look back for recent CVEs (default: 120, range: 1–3650)')
     parser.add_argument('--version', action='version', version=f'Vultron {VERSION}')
 
     args = parser.parse_args()
 
     if args.scan_mode == 'custom' and not args.ports:
         parser.error("--ports is required when --scan-mode=custom")
+    if args.cve_lookback_days < 1:
+        parser.error("--cve-lookback-days must be a positive integer (got "
+                     f"{args.cve_lookback_days})")
+    if args.cve_lookback_days > 3650:
+        parser.error("--cve-lookback-days must be 3650 or less (got "
+                     f"{args.cve_lookback_days})")
 
     scanner = HybridScanner(args.target, args)
     scanner.run()
