@@ -68,6 +68,9 @@ Vulntron runs active, evidence-based checks against detected services:
 | BlueKeep | RDP port 3389 | CVE-2019-0708 | HIGH |
 | Missing HTTP security headers | Ports 80, 443, 8080, 8443 | — | MEDIUM |
 | Exposed database service | Ports 3306, 5432, 1433, 27017, 6379 | — | HIGH |
+| **FTP anonymous login** | FTP port 21 | — | HIGH (if CONFIRMED) |
+| **Telnet service exposure** | Telnet port 23 | — | HIGH (POTENTIAL) |
+| **SNMP default community** | SNMP port 161 | — | HIGH (if CONFIRMED) |
 
 Each finding is assigned a status of **CONFIRMED**, **POTENTIAL**, or **INCONCLUSIVE** based on the quality of evidence collected.
 
@@ -88,7 +91,7 @@ vultron_hybrid_<target>_<YYYYMMDD_HHMMSS>.json
 
 ### 🌐 CVE Enrichment and Fallback Handling
 
-Vulntron queries the **NVD API 2.0** for CVEs published in the last 120 days. If the API is unreachable, rate-limited, or returns an error:
+Vulntron queries the **NVD API 2.0** for CVEs published in the last N days (configurable via `--cve-lookback-days`, default 120). If the API is unreachable, rate-limited, or returns an error:
 
 - Retries are attempted (up to 3 times with exponential back-off).
 - On final failure the enrichment phase is skipped gracefully; all other results are preserved.
@@ -135,7 +138,7 @@ User supplies target + options
          │  findings list
          ▼
 ┌───────────────────┐
-│  PHASE 3          │  NVD API 2.0 query (last 120 days)
+│  PHASE 3          │  NVD API 2.0 query (configurable lookback, default 120 days)
 │  CVE Enrichment   │  → Retry / graceful fallback on API errors
 └────────┬──────────┘
          │  enriched findings
@@ -239,6 +242,24 @@ python3 vultron.py -t 192.168.1.10 --timeout 2.0 --retries 2 --concurrency 100
 python3 vultron.py -t 192.168.1.10 --skip-nvd
 ```
 
+### Narrow CVE lookback window (last 30 days only)
+
+```bash
+python3 vultron.py -t 192.168.1.10 --cve-lookback-days 30
+```
+
+### Extend CVE lookback window (last year)
+
+```bash
+python3 vultron.py -t 192.168.1.10 --cve-lookback-days 365
+```
+
+### Scan for legacy protocols (FTP, Telnet, SNMP)
+
+```bash
+python3 vultron.py -t 192.168.1.10 --scan-mode custom --ports 21,23,161
+```
+
 ### Save reports to a specific directory
 
 Reports are written to the current working directory. Change directory before running to control output location:
@@ -266,6 +287,7 @@ python3 vultron.py -t <target> [options]
 | `--concurrency` | int | `50` | Maximum number of concurrent port scan threads |
 | `--skip-nvd` | flag | `False` | Skip NVD CVE enrichment (useful for air-gapped or offline use) |
 | `--skip-compliance` | flag | `False` | Skip PCI DSS compliance assessment |
+| `--cve-lookback-days` | int | `120` | Days to look back when querying NVD for recent CVEs (range: 1–3650) |
 | `--version` | flag | — | Show version string and exit |
 
 ---
@@ -355,7 +377,8 @@ The JSON report is written alongside the HTML report. Its top-level structure:
 ```json
 {
   "cve_count": 42,
-  "query_date": "2026-04-04T17:24:57.000000"
+  "query_date": "2026-04-04T17:24:57.000000+00:00",
+  "lookback_days": 120
 }
 ```
 
@@ -482,6 +505,10 @@ Test coverage includes:
 - SMBGhost defensive classification (`TestSMBGhostNotAlwaysCritical`)
 - NVD client response handling (`TestNVDClientResponseHandling`)
 - BlueKeep status classification (`TestBlueKeepClassification`)
+- FTP anonymous login outcomes (`TestFTPAnonymousCheck`)
+- Telnet banner collection and timeout behavior (`TestTelnetBannerCheck`)
+- SNMP default community check outcomes (`TestSNMPCommunityCheck`)
+- CVE lookback days storage, defaults, and propagation (`TestCVELookbackDays`)
 
 ### Syntax Check
 
@@ -511,7 +538,7 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - **No UDP scanning**: The current implementation covers TCP only. Services running exclusively over UDP (e.g., DNS, SNMP, TFTP) will not be detected.
 - **Version detection is limited**: Service versions are derived from banner strings only. Banners can be suppressed, customized, or spoofed by the target service.
 - **Environment-dependent results**: Network topology, firewalls, load balancers, and IDS/IPS systems all affect what Vulntron can observe. Results are specific to the network path between the scanning host and the target.
-- **NVD enrichment window**: CVE queries cover the last 120 days by default. Older CVEs are not fetched through the enrichment phase; known CVEs for specific checks (EternalBlue, SMBGhost, BlueKeep) are identified regardless.
+- **NVD enrichment window**: CVE queries cover the last N days (default 120, configurable via `--cve-lookback-days`). Older CVEs are not fetched through the enrichment phase; known CVEs for specific checks (EternalBlue, SMBGhost, BlueKeep) are identified regardless.
 - **Single target per run**: Each invocation scans one target. For subnet-wide assessments, script multiple invocations.
 
 ---
@@ -521,8 +548,8 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [ ] UDP port scanning support
 - [ ] Multi-target / CIDR range input
 - [ ] Service version correlation with CPE/NVD for more precise CVE matching
-- [ ] Additional protocol checks (FTP anonymous login, Telnet banner, SNMP default community)
-- [ ] Configurable CVE lookback period (currently fixed at 120 days)
+- [x] Additional protocol checks (FTP anonymous login, Telnet banner, SNMP default community)
+- [x] Configurable CVE lookback period (`--cve-lookback-days`, default 120)
 - [ ] Machine-readable SARIF output for integration with GitHub Code Scanning
 - [ ] Optional NVD API key injection via environment variable (`VULNTRON_NVD_KEY`)
 

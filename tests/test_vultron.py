@@ -14,7 +14,7 @@ from unittest.mock import patch, MagicMock
 # Make the parent directory importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vultron import PortScanner, VulnerabilityChecker, NVDIntelligence, ReportGenerator
+from vultron import PortScanner, VulnerabilityChecker, NVDIntelligence, ReportGenerator, HybridScanner
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +356,332 @@ class TestBlueKeepClassification(unittest.TestCase):
         finding = checker.vulnerabilities[0]
         self.assertIn('evidence', finding)
         self.assertTrue(len(finding['evidence']) > 0)
+
+
+# ---------------------------------------------------------------------------
+# 7. FTP anonymous login check
+# ---------------------------------------------------------------------------
+
+class TestFTPAnonymousCheck(unittest.TestCase):
+    """check_ftp_anonymous() produces correct status for each server response."""
+
+    def _checker(self):
+        return VulnerabilityChecker("127.0.0.1", [{'port': 21, 'service': 'FTP'}])
+
+    def test_ftp_anonymous_login_confirmed(self):
+        """230 response after PASS → CONFIRMED finding."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.side_effect = [
+                b'220 FTP Server Ready\r\n',
+                b'331 Password required\r\n',
+                b'230 Login successful\r\n',
+            ]
+            checker.check_ftp_anonymous(21)
+
+        confirmed = [v for v in checker.vulnerabilities if v.get('status') == 'CONFIRMED']
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]['affected_service'], 'FTP')
+        self.assertEqual(confirmed[0]['severity'], 'HIGH')
+
+    def test_ftp_anonymous_login_denied_no_finding(self):
+        """530 response → no finding added (NOT_AFFECTED)."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.side_effect = [
+                b'220 FTP Server Ready\r\n',
+                b'331 Password required\r\n',
+                b'530 Login incorrect\r\n',
+            ]
+            checker.check_ftp_anonymous(21)
+
+        self.assertEqual(len(checker.vulnerabilities), 0)
+
+    def test_ftp_anonymous_login_timeout_inconclusive(self):
+        """Timeout → INCONCLUSIVE, never CONFIRMED."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect.side_effect = socket.timeout("timed out")
+            checker.check_ftp_anonymous(21)
+
+        inconclusive = [v for v in checker.vulnerabilities if v.get('status') == 'INCONCLUSIVE']
+        confirmed = [v for v in checker.vulnerabilities if v.get('status') == 'CONFIRMED']
+        self.assertEqual(len(inconclusive), 1)
+        self.assertEqual(len(confirmed), 0)
+
+    def test_ftp_anonymous_timeout_not_counted_as_high(self):
+        """INCONCLUSIVE FTP timeout does not inflate high severity counter."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect.side_effect = socket.timeout("timed out")
+            checker.check_ftp_anonymous(21)
+
+        counts = ReportGenerator._count_by_status_severity(checker.vulnerabilities)
+        self.assertEqual(counts['high_confirmed'], 0)
+
+    def test_ftp_anonymous_confirmed_counts_as_high(self):
+        """CONFIRMED anonymous login is counted as high severity."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.side_effect = [
+                b'220 FTP Server Ready\r\n',
+                b'331 Password required\r\n',
+                b'230 Login successful\r\n',
+            ]
+            checker.check_ftp_anonymous(21)
+
+        counts = ReportGenerator._count_by_status_severity(checker.vulnerabilities)
+        self.assertEqual(counts['high_confirmed'], 1)
+
+
+# ---------------------------------------------------------------------------
+# 8. Telnet banner check
+# ---------------------------------------------------------------------------
+
+class TestTelnetBannerCheck(unittest.TestCase):
+    """check_telnet_banner() produces correct status for each outcome."""
+
+    def _checker(self):
+        return VulnerabilityChecker("127.0.0.1", [{'port': 23, 'service': 'Telnet'}])
+
+    def test_telnet_banner_received_gives_potential(self):
+        """Banner data received → POTENTIAL (cleartext protocol exposure)."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.return_value = b'Welcome to router\r\nlogin: '
+            checker.check_telnet_banner(23)
+
+        potential = [v for v in checker.vulnerabilities if v.get('status') == 'POTENTIAL']
+        self.assertEqual(len(potential), 1)
+        self.assertEqual(potential[0]['affected_service'], 'Telnet')
+        self.assertEqual(potential[0]['severity'], 'HIGH')
+
+    def test_telnet_empty_banner_still_potential(self):
+        """No banner text but connected → still POTENTIAL."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.return_value = b''
+            checker.check_telnet_banner(23)
+
+        potential = [v for v in checker.vulnerabilities if v.get('status') == 'POTENTIAL']
+        self.assertEqual(len(potential), 1)
+
+    def test_telnet_timeout_gives_inconclusive(self):
+        """Timeout → INCONCLUSIVE, not CONFIRMED."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.side_effect = socket.timeout("timed out")
+            checker.check_telnet_banner(23)
+
+        inconclusive = [v for v in checker.vulnerabilities if v.get('status') == 'INCONCLUSIVE']
+        confirmed = [v for v in checker.vulnerabilities if v.get('status') == 'CONFIRMED']
+        self.assertEqual(len(inconclusive), 1)
+        self.assertEqual(len(confirmed), 0)
+
+    def test_telnet_timeout_not_counted_as_confirmed(self):
+        """Telnet INCONCLUSIVE does not inflate severity counters."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.side_effect = socket.timeout("timed out")
+            checker.check_telnet_banner(23)
+
+        counts = ReportGenerator._count_by_status_severity(checker.vulnerabilities)
+        self.assertEqual(counts['high_confirmed'], 0)
+        self.assertEqual(counts['critical_confirmed'], 0)
+
+    def test_telnet_banner_evidence_populated(self):
+        """Evidence list includes banner text when available."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recv.return_value = b'Cisco IOS Router\r\n'
+            checker.check_telnet_banner(23)
+
+        finding = checker.vulnerabilities[0]
+        evidence_str = ' '.join(finding.get('evidence', []))
+        self.assertIn('Cisco IOS Router', evidence_str)
+
+
+# ---------------------------------------------------------------------------
+# 9. SNMP default community check
+# ---------------------------------------------------------------------------
+
+class TestSNMPCommunityCheck(unittest.TestCase):
+    """check_snmp_community() produces correct status for each probe outcome."""
+
+    def _checker(self):
+        return VulnerabilityChecker("127.0.0.1", [{'port': 161, 'service': 'SNMP'}])
+
+    def test_snmp_public_accepted_gives_confirmed(self):
+        """SNMP response received for 'public' → CONFIRMED."""
+        checker = self._checker()
+        fake_response = b'\x30\x26\x02\x01\x00\x04\x06public\xa2\x19'
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.return_value = (fake_response, ('127.0.0.1', 161))
+            checker.check_snmp_community(161)
+
+        confirmed = [v for v in checker.vulnerabilities if v.get('status') == 'CONFIRMED']
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]['affected_service'], 'SNMP')
+        self.assertIn('public', confirmed[0]['title'])
+
+    def test_snmp_all_timeout_gives_inconclusive(self):
+        """All community probes time out → exactly one INCONCLUSIVE finding."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout("timed out")
+            checker.check_snmp_community(161)
+
+        inconclusive = [v for v in checker.vulnerabilities if v.get('status') == 'INCONCLUSIVE']
+        confirmed = [v for v in checker.vulnerabilities if v.get('status') == 'CONFIRMED']
+        self.assertEqual(len(inconclusive), 1)
+        self.assertEqual(len(confirmed), 0)
+
+    def test_snmp_timeout_not_counted_as_confirmed(self):
+        """SNMP INCONCLUSIVE does not inflate severity counters."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout("timed out")
+            checker.check_snmp_community(161)
+
+        counts = ReportGenerator._count_by_status_severity(checker.vulnerabilities)
+        self.assertEqual(counts['high_confirmed'], 0)
+        self.assertEqual(counts['critical_confirmed'], 0)
+
+    def test_snmp_confirmed_counts_as_high(self):
+        """CONFIRMED SNMP community acceptance is counted as high severity."""
+        checker = self._checker()
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.return_value = (b'\x30\x10', ('127.0.0.1', 161))
+            checker.check_snmp_community(161)
+
+        counts = ReportGenerator._count_by_status_severity(checker.vulnerabilities)
+        self.assertEqual(counts['high_confirmed'], 1)
+
+    def test_snmp_getrequest_packet_builds(self):
+        """_build_snmp_getrequest() returns a valid BER-encoded SNMP packet."""
+        pkt = VulnerabilityChecker._build_snmp_getrequest('public')
+        self.assertIsInstance(pkt, bytes)
+        self.assertGreater(len(pkt), 10)
+        # Outer SEQUENCE tag
+        self.assertEqual(pkt[0], 0x30)
+        # Should contain the community string bytes
+        self.assertIn(b'public', pkt)
+
+
+# ---------------------------------------------------------------------------
+# 10. CVE lookback days
+# ---------------------------------------------------------------------------
+
+class TestCVELookbackDays(unittest.TestCase):
+    """Configurable --cve-lookback-days wiring and validation."""
+
+    def _make_args(self, **kwargs):
+        import argparse
+        defaults = dict(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True, cve_lookback_days=120,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_hybrid_scanner_stores_custom_lookback(self):
+        """HybridScanner stores cve_lookback_days=30 from args immediately."""
+        scanner = HybridScanner("127.0.0.1", self._make_args(cve_lookback_days=30))
+        self.assertEqual(scanner.results.get('cve_lookback_days'), 30)
+
+    def test_hybrid_scanner_default_lookback_is_120(self):
+        """When no cve_lookback_days in args, HybridScanner uses default 120."""
+        import argparse
+        # Namespace without cve_lookback_days attribute
+        args = argparse.Namespace(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True,
+        )
+        scanner = HybridScanner("127.0.0.1", args)
+        self.assertEqual(scanner.results.get('cve_lookback_days'), 120)
+
+    @patch('requests.get')
+    def test_nvd_query_respects_lookback_days(self, mock_get):
+        """query_recent_cves(days=30) builds a date range ~30 days back."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {'totalResults': 0, 'vulnerabilities': []}
+        mock_get.return_value = resp
+
+        nvd = NVDIntelligence(api_key=None)
+        nvd.query_recent_cves(days=30)
+
+        self.assertTrue(mock_get.called)
+        params = mock_get.call_args.kwargs.get('params', {})
+        pub_start = params.get('pubStartDate', '')
+        self.assertIn('UTC', pub_start)
+
+    @patch('requests.get')
+    def test_nvd_different_days_not_cached_together(self, mock_get):
+        """30-day and 60-day queries must not share a cache entry."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {'totalResults': 0, 'vulnerabilities': []}
+        mock_get.return_value = resp
+
+        nvd = NVDIntelligence(api_key=None)
+        nvd.query_recent_cves(days=30)
+        nvd.query_recent_cves(days=60)
+
+        self.assertEqual(mock_get.call_count, 2,
+                         "Queries with different days should not share a cache entry")
+
+    def test_lookback_days_included_in_nvd_intelligence_after_run(self):
+        """nvd_intelligence dict must include lookback_days after a full run."""
+        from unittest.mock import patch as _patch
+        import argparse
+
+        args = argparse.Namespace(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=False, skip_compliance=True, cve_lookback_days=45,
+        )
+        scanner = HybridScanner("127.0.0.1", args)
+
+        fake_port = [{'port': 80, 'service': 'HTTP', 'state': 'open',
+                      'banner': '', 'protocol': 'tcp'}]
+
+        with _patch('vultron.PortScanner.scan', return_value=fake_port), \
+             _patch('vultron.VulnerabilityChecker.check_all', return_value=[]), \
+             _patch('vultron.NVDIntelligence.query_recent_cves', return_value=[]) as mock_nvd, \
+             _patch('vultron.ReportGenerator.generate_html'), \
+             _patch('vultron.ReportGenerator.generate_json'):
+            scanner.run()
+            mock_nvd.assert_called_once_with(45)
+
+        self.assertEqual(scanner.results['nvd_intelligence'].get('lookback_days'), 45)
 
 
 if __name__ == '__main__':
