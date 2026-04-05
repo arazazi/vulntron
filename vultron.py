@@ -1835,7 +1835,7 @@ Credentialed scanning (all modes):
   WinRM probe TCP reachability + optional authenticated session check
   WMI probe   DCOM reachability + optional authenticated namespace check
 
-  WARNING: Only use credentialed scanning on systems you are authorised to test.
+  WARNING: Only use credentialed scanning on systems you are authorized to test.
   Credentials are never written to reports or log files.
 
 Capabilities:

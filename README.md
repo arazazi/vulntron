@@ -272,7 +272,7 @@ findings = [f for check_cls in checks for f in check_cls().run(target, 9999)]
 
 > **⚠️ Authorized use only.** Credentialed scanning connects to targets using authentication credentials. Only use this feature on systems you own or have explicit written permission to assess. Never share or commit real credentials to version control.
 
-Vulntron supports **authenticated scanning** (PR1) for Linux/Unix and Windows targets via SSH, WinRM, and WMI. Credentialed scans can verify patch status, configuration, and service health in ways that unauthenticated probes cannot.
+Vultron supports **authenticated scanning** (PR1) for Linux/Unix and Windows targets via SSH, WinRM, and WMI. Credentialed scans can verify patch status, configuration, and service health in ways that unauthenticated probes cannot.
 
 ### Supported Authentication Methods
 
@@ -396,7 +396,7 @@ PR1 includes full TCP-layer reachability checks without additional dependencies.
 | WinRM (session auth) | `pywinrm` | `pip install pywinrm` |
 | WMI (namespace auth) | `impacket` | `pip install impacket` |
 
-Without these libraries, Vulntron falls back to **TCP connectivity verification** only and reports this clearly in the finding evidence.
+Without these libraries, Vultron falls back to **TCP connectivity verification** only and reports this clearly in the finding evidence.
 
 ### Security Design
 
