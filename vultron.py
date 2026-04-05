@@ -48,6 +48,20 @@ try:
 except ImportError:
     HAS_THREADING = False
 
+# Plugin framework — graceful fallback when plugins/ is not importable
+try:
+    # Ensure the directory containing vultron.py is on sys.path so that the
+    # ``plugins`` package can always be found regardless of the working directory.
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPT_DIR)
+
+    import plugins.checks  # noqa: F401 — auto-registers all built-in checks
+    from plugins import CheckRegistry, Finding, ScanMetadata
+    _HAS_PLUGINS = True
+except ImportError:
+    _HAS_PLUGINS = False
+
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
@@ -1380,7 +1394,8 @@ class ReportGenerator:
                     <div style="font-size:12px;color:var(--text-secondary);">
                         🎯 CVSS {vuln.get('cvss','N/A')} | 🔌 Port {vuln.get('port','N/A')}/TCP |
                         ⚡ {'Exploit Available' if vuln.get('exploit_available') else 'No known exploit'} |
-                        🛡 {vuln.get('affected_service','N/A')}
+                        🛡 {vuln.get('affected_service','N/A')} |
+                        📊 Confidence: {int(vuln.get('confidence', 0.9) * 100)}%
                     </div>
                 </div>
 '''
@@ -1417,7 +1432,8 @@ class ReportGenerator:
                     <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
                     <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
                     <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')}
+                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')} |
+                        📊 Confidence: {int(vuln.get('confidence', 0.5) * 100)}%
                     </div>
                 </div>
 '''
@@ -1450,7 +1466,8 @@ class ReportGenerator:
                     <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
                     <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
                     <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')}
+                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')} |
+                        📊 Confidence: {int(vuln.get('confidence', 0.2) * 100)}%
                     </div>
                 </div>
 '''
@@ -1573,10 +1590,23 @@ class HybridScanner:
         print(BANNER)
         print(Colors.header(f"[TARGET] {self.target}\n"))
 
-        # Phase 1: Port Scanning
-        print(Colors.header("[PHASE 1] PORT SCANNING"))
         args = self.args
         scan_mode = getattr(args, 'scan_mode', 'common')
+
+        # Capture scan start time for metadata
+        if _HAS_PLUGINS:
+            _scan_meta = ScanMetadata.new(
+                self.target,
+                config={
+                    'timeout': getattr(args, 'timeout', 1.0),
+                    'retries': getattr(args, 'retries', 1),
+                    'concurrency': getattr(args, 'concurrency', 50),
+                    'mode': scan_mode,
+                },
+            )
+
+        # Phase 1: Port Scanning
+        print(Colors.header("[PHASE 1] PORT SCANNING"))
         custom_ports: List[int] = []
         if scan_mode == 'custom' and getattr(args, 'ports', None):
             custom_ports = PortScanner.parse_port_spec(args.ports)
@@ -1593,13 +1623,28 @@ class HybridScanner:
 
         if not self.results['open_ports']:
             print(Colors.warning("No open ports found!"))
+            if _HAS_PLUGINS:
+                _scan_meta.ended = datetime.now(timezone.utc).isoformat()
+                self.results['scan_metadata'] = _scan_meta.to_dict()
             return
 
-        # Phase 2: Vulnerability Checks
+        # [PHASE 2] Vulnerability Checks (legacy VulnerabilityChecker path)
         vuln_checker = VulnerabilityChecker(self.target, self.results['open_ports'])
-        self.results['vulnerabilities'] = vuln_checker.check_all()
+        legacy_findings = vuln_checker.check_all()
 
-        # Phase 3: NVD Intelligence (optional)
+        # Adapter: promote legacy dicts to unified Finding objects, then serialise
+        # back to dicts that include all original keys plus the new unified fields
+        # (confidence, cve_refs, target, scan_timestamp, …).  This preserves full
+        # backward compatibility while enriching the output with Phase A metadata.
+        if _HAS_PLUGINS:
+            self.results['vulnerabilities'] = [
+                Finding.from_legacy_dict(d, self.target).to_dict()
+                for d in legacy_findings
+            ]
+        else:
+            self.results['vulnerabilities'] = legacy_findings
+
+        # [PHASE 3] NVD Intelligence (optional)
         if not getattr(args, 'skip_nvd', False):
             nvd = NVDIntelligence(NVD_API_KEY)
             lookback_days = self.results['cve_lookback_days']
@@ -1610,12 +1655,17 @@ class HybridScanner:
                 'lookback_days': lookback_days,
             }
 
-        # Phase 4: Compliance
+        # [PHASE 3] Compliance
         if not getattr(args, 'skip_compliance', False):
             compliance_checker = ComplianceChecker(self.results)
             self.results['compliance'] = compliance_checker.check_pci_dss()
 
-        # Phase 5: Generate Reports
+        # Finalise scan metadata
+        if _HAS_PLUGINS:
+            _scan_meta.ended = datetime.now(timezone.utc).isoformat()
+            self.results['scan_metadata'] = _scan_meta.to_dict()
+
+        # [PHASE 4] Report Generation
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         target_safe = self.target.replace('.', '_')

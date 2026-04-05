@@ -684,5 +684,692 @@ class TestCVELookbackDays(unittest.TestCase):
         self.assertEqual(scanner.results['nvd_intelligence'].get('lookback_days'), 45)
 
 
-if __name__ == '__main__':
+# ---------------------------------------------------------------------------
+# 11. Phase A — Plugin registration / discovery
+# ---------------------------------------------------------------------------
+
+class TestPhaseAPluginRegistration(unittest.TestCase):
+    """Plugin registration, discovery, and base contract validation."""
+
+    def setUp(self):
+        from plugins import CheckRegistry
+        # Snapshot existing registrations so we can restore after each test
+        self._saved = dict(CheckRegistry._checks)
+
+    def tearDown(self):
+        from plugins import CheckRegistry
+        CheckRegistry._checks.clear()
+        CheckRegistry._checks.update(self._saved)
+
+    def test_register_and_discover_by_id(self):
+        """Registering a check makes it discoverable via get()."""
+        from plugins import BaseCheck, CheckRegistry
+
+        class MyCheck(BaseCheck):
+            check_id = "TEST-DISCOVER-001"
+            title = "Discovery test"
+            description = "Test"
+            category = "network"
+            default_severity = "LOW"
+            required_ports = [9901]
+            service_matchers = []
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        CheckRegistry.register(MyCheck)
+        self.assertIs(CheckRegistry.get("TEST-DISCOVER-001"), MyCheck)
+
+    def test_all_checks_includes_registered(self):
+        """all_checks() contains the freshly registered check."""
+        from plugins import BaseCheck, CheckRegistry
+
+        class AnotherCheck(BaseCheck):
+            check_id = "TEST-ALLCHECKS-002"
+            title = "All-checks test"
+            description = "Test"
+            category = "service"
+            default_severity = "MEDIUM"
+            required_ports = [9902]
+            service_matchers = []
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        CheckRegistry.register(AnotherCheck)
+        self.assertIn(AnotherCheck, CheckRegistry.all_checks())
+
+    def test_register_as_decorator(self):
+        """@CheckRegistry.register decorator works and returns the class unchanged."""
+        from plugins import BaseCheck, CheckRegistry
+
+        @CheckRegistry.register
+        class DecoratedCheck(BaseCheck):
+            check_id = "TEST-DECO-003"
+            title = "Decorated"
+            description = "Test"
+            category = "config"
+            default_severity = "INFO"
+            required_ports = [8081]
+            service_matchers = ["HTTP-Alt"]
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        self.assertIsNotNone(CheckRegistry.get("TEST-DECO-003"))
+        # Decorator must return the original class
+        self.assertTrue(issubclass(DecoratedCheck, BaseCheck))
+
+    def test_register_raises_without_check_id(self):
+        """Registering a check without check_id raises ValueError."""
+        from plugins import BaseCheck, CheckRegistry
+
+        class NoIdCheck(BaseCheck):
+            check_id = ""  # intentionally empty
+            title = "No ID"
+            description = "Test"
+            category = "network"
+            default_severity = "LOW"
+            required_ports = []
+            service_matchers = []
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        with self.assertRaises(ValueError):
+            CheckRegistry.register(NoIdCheck)
+
+    def test_checks_for_port_returns_matching(self):
+        """checks_for_port() returns checks whose required_ports include the port."""
+        from plugins import BaseCheck, CheckRegistry
+
+        class Port9910Check(BaseCheck):
+            check_id = "TEST-PORT-9910"
+            title = "Port 9910"
+            description = "Test"
+            category = "network"
+            default_severity = "LOW"
+            required_ports = [9910]
+            service_matchers = []
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        CheckRegistry.register(Port9910Check)
+        matches = CheckRegistry.checks_for_port(9910)
+        self.assertIn(Port9910Check, matches)
+        no_matches = CheckRegistry.checks_for_port(9911)
+        self.assertNotIn(Port9910Check, no_matches)
+
+    def test_checks_for_port_service_matcher(self):
+        """checks_for_port() also matches via service_matchers (case-insensitive)."""
+        from plugins import BaseCheck, CheckRegistry
+
+        class SvcCheck(BaseCheck):
+            check_id = "TEST-SVC-9920"
+            title = "Service matcher test"
+            description = "Test"
+            category = "service"
+            default_severity = "MEDIUM"
+            required_ports = []
+            service_matchers = ["TestSvc"]
+
+            def run(self, target, port, **kwargs):
+                return []
+
+        CheckRegistry.register(SvcCheck)
+        # Match by service name (case-insensitive)
+        self.assertIn(SvcCheck, CheckRegistry.checks_for_port(80, service="testsvc"))
+        # No match for a different service
+        self.assertNotIn(SvcCheck, CheckRegistry.checks_for_port(80, service="HTTP"))
+
+    def test_base_check_requires_run_method(self):
+        """Instantiating a BaseCheck subclass without run() raises TypeError."""
+        from plugins import BaseCheck
+
+        class NoRunCheck(BaseCheck):
+            check_id = "NO-RUN"
+            title = "No run"
+            description = "Test"
+            category = "network"
+            default_severity = "LOW"
+            required_ports = []
+            service_matchers = []
+            # No run() method
+
+        with self.assertRaises(TypeError):
+            NoRunCheck()
+
+    def test_clear_removes_all(self):
+        """clear() empties the registry."""
+        from plugins import CheckRegistry
+        CheckRegistry.clear()
+        self.assertEqual(CheckRegistry.all_checks(), [])
+
+
+# ---------------------------------------------------------------------------
+# 12. Phase A — Finding schema serialisation and adapter
+# ---------------------------------------------------------------------------
+
+class TestFindingSchema(unittest.TestCase):
+    """Finding schema serialisation, adapter layer, and confidence mapping."""
+
+    def _legacy(self, **kwargs):
+        base = {
+            "id": "MS17-010",
+            "cve": "CVE-2017-0144",
+            "name": "EternalBlue",
+            "title": "EternalBlue SMBv1 RCE",
+            "severity": "CRITICAL",
+            "status": "CONFIRMED",
+            "port": 445,
+            "affected_service": "SMB",
+            "description": "SMBv1 exploit",
+            "evidence": ["SMBv1 accepted"],
+            "cisa_kev": True,
+            "exploit_available": True,
+            "cvss": 9.8,
+            "remediation": "Patch",
+        }
+        base.update(kwargs)
+        return base
+
+    def test_from_legacy_dict_core_fields(self):
+        """from_legacy_dict() maps all core legacy fields correctly."""
+        from plugins import Finding
+        d = self._legacy()
+        f = Finding.from_legacy_dict(d, target="10.0.0.1")
+        self.assertEqual(f.id, "MS17-010")
+        self.assertEqual(f.status, "CONFIRMED")
+        self.assertEqual(f.severity, "CRITICAL")
+        self.assertEqual(f.port, 445)
+        self.assertEqual(f.service, "SMB")
+        self.assertEqual(f.target, "10.0.0.1")
+        self.assertEqual(f.cve_refs, ["CVE-2017-0144"])
+        self.assertTrue(f.cisa_kev)
+        self.assertTrue(f.exploit_available)
+        self.assertAlmostEqual(f.cvss, 9.8)
+
+    def test_to_dict_preserves_legacy_keys(self):
+        """to_dict() produces all legacy keys that existing code expects."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(), target="10.0.0.1")
+        out = f.to_dict()
+        for key in ("id", "cve", "name", "title", "severity", "status",
+                    "port", "affected_service", "description", "evidence",
+                    "cisa_kev", "exploit_available", "cvss", "remediation"):
+            self.assertIn(key, out, f"Legacy key '{key}' missing from to_dict() output")
+
+    def test_to_dict_adds_new_fields(self):
+        """to_dict() adds confidence, cve_refs, target, evidence_raw."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(), target="10.0.0.1")
+        out = f.to_dict()
+        self.assertIn("confidence", out)
+        self.assertIn("cve_refs", out)
+        self.assertIn("target", out)
+        self.assertIn("evidence_raw", out)
+
+    def test_confidence_confirmed(self):
+        """CONFIRMED status → confidence ≈ 0.9."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(status="CONFIRMED"))
+        self.assertAlmostEqual(f.confidence, 0.9)
+
+    def test_confidence_potential(self):
+        """POTENTIAL status → confidence ≈ 0.5."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(status="POTENTIAL"))
+        self.assertAlmostEqual(f.confidence, 0.5)
+
+    def test_confidence_inconclusive(self):
+        """INCONCLUSIVE status → confidence ≈ 0.2."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(status="INCONCLUSIVE"))
+        self.assertAlmostEqual(f.confidence, 0.2)
+
+    def test_confidence_not_affected(self):
+        """NOT_AFFECTED status → confidence == 0.0."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(status="NOT_AFFECTED"))
+        self.assertAlmostEqual(f.confidence, 0.0)
+
+    def test_evidence_items_preserved(self):
+        """evidence list is preserved through from_legacy_dict → to_dict round-trip."""
+        from plugins import Finding
+        items = ["item A", "item B", "item C"]
+        f = Finding.from_legacy_dict(self._legacy(evidence=items))
+        self.assertEqual(f.evidence.items, items)
+        self.assertEqual(f.to_dict()["evidence"], items)
+
+    def test_no_cve_handled(self):
+        """When cve is 'N/A', cve_refs is empty."""
+        from plugins import Finding
+        f = Finding.from_legacy_dict(self._legacy(cve="N/A"))
+        self.assertEqual(f.cve_refs, [])
+        self.assertEqual(f.to_dict()["cve"], "N/A")
+
+    def test_count_by_status_still_works_on_converted_findings(self):
+        """ReportGenerator._count_by_status_severity() works on to_dict() output."""
+        from plugins import Finding
+        findings = [
+            Finding.from_legacy_dict(self._legacy(status="CONFIRMED"), "h").to_dict(),
+            Finding.from_legacy_dict(self._legacy(status="POTENTIAL"), "h").to_dict(),
+            Finding.from_legacy_dict(self._legacy(status="INCONCLUSIVE"), "h").to_dict(),
+        ]
+        counts = ReportGenerator._count_by_status_severity(findings)
+        self.assertEqual(counts["critical_confirmed"], 1)
+        self.assertEqual(counts["potential"], 1)
+        self.assertEqual(counts["inconclusive"], 1)
+
+    def test_scan_metadata_new(self):
+        """ScanMetadata.new() produces a valid metadata object with UUID and timestamp."""
+        from plugins import ScanMetadata
+        meta = ScanMetadata.new("192.168.1.1", config={"timeout": 1.0, "mode": "common"})
+        self.assertTrue(len(meta.scan_id) == 36)  # UUID4 format
+        self.assertIn("T", meta.started)           # ISO-8601 timestamp
+        self.assertEqual(meta.target, "192.168.1.1")
+        self.assertEqual(meta.config["timeout"], 1.0)
+
+    def test_scan_metadata_to_dict(self):
+        """ScanMetadata.to_dict() includes all required keys."""
+        from plugins import ScanMetadata
+        meta = ScanMetadata.new("10.0.0.1", config={"mode": "top1000"})
+        d = meta.to_dict()
+        for key in ("scan_id", "target", "started", "ended", "config"):
+            self.assertIn(key, d)
+        self.assertEqual(d["target"], "10.0.0.1")
+
+
+# ---------------------------------------------------------------------------
+# 13. Phase A — Pipeline emits unified findings
+# ---------------------------------------------------------------------------
+
+class TestPipelineUnifiedFindings(unittest.TestCase):
+    """HybridScanner.run() promotes legacy findings to the unified schema."""
+
+    def _make_args(self, **kwargs):
+        import argparse
+        defaults = dict(
+            scan_mode="common", timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True, cve_lookback_days=120,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _run_with_fake_findings(self, legacy_vulns):
+        """Helper: run the scanner with mocked port and vuln results."""
+        scanner = HybridScanner("127.0.0.1", self._make_args())
+        fake_port = [{"port": 445, "service": "SMB", "state": "open",
+                      "banner": "", "protocol": "tcp"}]
+        with patch("vultron.PortScanner.scan", return_value=fake_port), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=legacy_vulns), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+        return scanner
+
+    def test_pipeline_findings_have_confidence_field(self):
+        """Findings in results include the 'confidence' field."""
+        legacy = [{"id": "MS17-010", "cve": "CVE-2017-0144", "name": "EB",
+                   "title": "EternalBlue", "severity": "CRITICAL", "status": "CONFIRMED",
+                   "port": 445, "affected_service": "SMB", "description": "test",
+                   "evidence": ["test"], "cisa_kev": True, "exploit_available": True,
+                   "cvss": 9.8, "remediation": "patch"}]
+        scanner = self._run_with_fake_findings(legacy)
+        self.assertTrue(len(scanner.results["vulnerabilities"]) > 0)
+        finding = scanner.results["vulnerabilities"][0]
+        self.assertIn("confidence", finding)
+        self.assertAlmostEqual(finding["confidence"], 0.9)
+
+    def test_pipeline_findings_have_cve_refs(self):
+        """Findings in results include the 'cve_refs' list."""
+        legacy = [{"id": "MS17-010", "cve": "CVE-2017-0144", "name": "EB",
+                   "title": "EternalBlue", "severity": "CRITICAL", "status": "CONFIRMED",
+                   "port": 445, "affected_service": "SMB", "description": "test",
+                   "evidence": [], "cisa_kev": False, "exploit_available": False,
+                   "cvss": 9.8}]
+        scanner = self._run_with_fake_findings(legacy)
+        finding = scanner.results["vulnerabilities"][0]
+        self.assertIn("cve_refs", finding)
+        self.assertIn("CVE-2017-0144", finding["cve_refs"])
+
+    def test_pipeline_findings_have_target(self):
+        """Findings in results carry the 'target' field."""
+        legacy = [{"id": "TEST", "cve": "N/A", "name": "T", "title": "Test",
+                   "severity": "HIGH", "status": "POTENTIAL",
+                   "port": 445, "affected_service": "SMB", "description": "t",
+                   "evidence": [], "cisa_kev": False, "exploit_available": False}]
+        scanner = self._run_with_fake_findings(legacy)
+        finding = scanner.results["vulnerabilities"][0]
+        self.assertEqual(finding.get("target"), "127.0.0.1")
+
+    def test_pipeline_stores_scan_metadata(self):
+        """results['scan_metadata'] is populated after a successful scan."""
+        scanner = self._run_with_fake_findings([])
+        self.assertIn("scan_metadata", scanner.results)
+        meta = scanner.results["scan_metadata"]
+        self.assertIn("scan_id", meta)
+        self.assertIn("started", meta)
+        self.assertIn("ended", meta)
+        self.assertEqual(meta["target"], "127.0.0.1")
+
+    def test_pipeline_scan_metadata_config(self):
+        """scan_metadata.config contains runtime scan configuration."""
+        scanner = self._run_with_fake_findings([])
+        config = scanner.results["scan_metadata"]["config"]
+        self.assertIn("mode", config)
+        self.assertIn("timeout", config)
+
+    def test_pipeline_existing_legacy_keys_preserved(self):
+        """All original finding keys survive the unified-schema conversion."""
+        legacy = [{"id": "FTP-ANON-21", "cve": "N/A", "name": "FTP Anon",
+                   "title": "FTP anonymous login accepted", "severity": "HIGH",
+                   "status": "CONFIRMED", "port": 21, "affected_service": "FTP",
+                   "description": "anon ftp", "evidence": ["banner"],
+                   "cisa_kev": False, "exploit_available": False,
+                   "remediation": "Disable anon"}]
+        scanner = self._run_with_fake_findings(legacy)
+        finding = scanner.results["vulnerabilities"][0]
+        for key in ("id", "name", "title", "severity", "status",
+                    "port", "affected_service", "description", "evidence"):
+            self.assertIn(key, finding, f"Legacy key '{key}' lost after pipeline conversion")
+
+    def test_pipeline_counter_correctness_after_conversion(self):
+        """Summary counts derived from converted findings remain correct."""
+        legacy = [
+            {"id": "A", "cve": "N/A", "name": "A", "title": "A",
+             "severity": "CRITICAL", "status": "CONFIRMED",
+             "port": 445, "affected_service": "SMB", "description": "",
+             "evidence": [], "cisa_kev": True, "exploit_available": True, "cvss": 9.8},
+            {"id": "B", "cve": "N/A", "name": "B", "title": "B",
+             "severity": "HIGH", "status": "POTENTIAL",
+             "port": 445, "affected_service": "SMB", "description": "",
+             "evidence": [], "cisa_kev": False, "exploit_available": False},
+        ]
+        scanner = self._run_with_fake_findings(legacy)
+        counts = ReportGenerator._count_by_status_severity(
+            scanner.results["vulnerabilities"]
+        )
+        self.assertEqual(counts["critical_confirmed"], 1)
+        self.assertEqual(counts["potential"], 1)
+        self.assertEqual(counts["kev_confirmed"], 1)
+
+    def test_scan_metadata_stored_even_when_no_open_ports(self):
+        """scan_metadata is stored in results even when port scan finds nothing."""
+        scanner = HybridScanner("127.0.0.1", self._make_args())
+        with patch("vultron.PortScanner.scan", return_value=[]):
+            scanner.run()
+        # scan_metadata should be present so the scan record is preserved
+        self.assertIn("scan_metadata", scanner.results)
+        meta = scanner.results["scan_metadata"]
+        self.assertIn("scan_id", meta)
+        self.assertIn("ended", meta)
+        self.assertIsNotNone(meta["ended"])
+
+
+# ---------------------------------------------------------------------------
+# 14. Phase A — Reporter consumes unified findings
+# ---------------------------------------------------------------------------
+
+class TestReporterUnifiedFindings(unittest.TestCase):
+    """ReportGenerator handles unified Finding fields (confidence, cve_refs, etc.)."""
+
+    def _make_results(self, findings):
+        from datetime import datetime
+        return {
+            "target": "192.168.1.1",
+            "timestamp": datetime.now().isoformat(),
+            "scanner_version": "4.0.0-HYBRID",
+            "scan_mode": "common",
+            "cve_lookback_days": 120,
+            "open_ports": [],
+            "vulnerabilities": findings,
+            "nvd_intelligence": {},
+            "compliance": {},
+        }
+
+    def test_html_report_renders_confirmed_finding(self):
+        """generate_html() includes title, status, and severity for a CONFIRMED finding."""
+        import tempfile, os
+        finding = {
+            "id": "T-001", "cve": "N/A", "name": "TestFinding",
+            "title": "Test Security Finding", "severity": "HIGH",
+            "status": "CONFIRMED", "port": 80, "affected_service": "HTTP",
+            "description": "A test finding.", "evidence": ["proof"],
+            "cisa_kev": False, "exploit_available": False,
+            "cvss": 7.5, "remediation": "Fix it.",
+            "confidence": 0.9, "cve_refs": [], "target": "192.168.1.1",
+        }
+        reporter = ReportGenerator(self._make_results([finding]))
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            fname = f.name
+        try:
+            reporter.generate_html(fname)
+            with open(fname, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("Test Security Finding", content)
+            self.assertIn("CONFIRMED", content)
+            self.assertIn("HIGH", content)
+        finally:
+            os.unlink(fname)
+
+    def test_html_report_shows_confidence_percentage(self):
+        """generate_html() renders the confidence value for confirmed findings."""
+        import tempfile, os
+        finding = {
+            "id": "T-002", "cve": "CVE-2024-0001", "name": "ConfTest",
+            "title": "Confidence Test", "severity": "CRITICAL",
+            "status": "CONFIRMED", "port": 445, "affected_service": "SMB",
+            "description": "Test.", "evidence": [],
+            "cisa_kev": True, "exploit_available": True, "cvss": 9.8,
+            "confidence": 0.9, "cve_refs": ["CVE-2024-0001"], "target": "192.168.1.1",
+        }
+        reporter = ReportGenerator(self._make_results([finding]))
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            fname = f.name
+        try:
+            reporter.generate_html(fname)
+            with open(fname, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Confidence should appear as a percentage string
+            self.assertIn("90%", content)
+        finally:
+            os.unlink(fname)
+
+    def test_json_report_includes_confidence(self):
+        """generate_json() serialises the 'confidence' field."""
+        import tempfile, os, json
+        finding = {
+            "id": "T-003", "cve": "N/A", "name": "JsonTest",
+            "title": "JSON confidence test", "severity": "MEDIUM",
+            "status": "POTENTIAL", "port": 23, "affected_service": "Telnet",
+            "description": "test", "evidence": ["e1"],
+            "cisa_kev": False, "exploit_available": False,
+            "confidence": 0.5, "cve_refs": [], "target": "192.168.1.1",
+        }
+        reporter = ReportGenerator(self._make_results([finding]))
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            fname = f.name
+        try:
+            reporter.generate_json(fname)
+            with open(fname) as f:
+                data = json.load(f)
+            vuln = data["vulnerabilities"][0]
+            self.assertIn("confidence", vuln)
+            self.assertAlmostEqual(vuln["confidence"], 0.5)
+        finally:
+            os.unlink(fname)
+
+    def test_json_report_includes_cve_refs(self):
+        """generate_json() serialises the 'cve_refs' list."""
+        import tempfile, os, json
+        finding = {
+            "id": "T-004", "cve": "CVE-2017-0144", "name": "EternalBlue",
+            "title": "EternalBlue test", "severity": "CRITICAL",
+            "status": "CONFIRMED", "port": 445, "affected_service": "SMB",
+            "description": "test", "evidence": [],
+            "cisa_kev": True, "exploit_available": True, "cvss": 9.8,
+            "confidence": 0.9, "cve_refs": ["CVE-2017-0144"], "target": "192.168.1.1",
+        }
+        reporter = ReportGenerator(self._make_results([finding]))
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            fname = f.name
+        try:
+            reporter.generate_json(fname)
+            with open(fname) as f:
+                data = json.load(f)
+            vuln = data["vulnerabilities"][0]
+            self.assertIn("cve_refs", vuln)
+            self.assertIn("CVE-2017-0144", vuln["cve_refs"])
+        finally:
+            os.unlink(fname)
+
+
+# ---------------------------------------------------------------------------
+# 15. Phase A — Built-in plugin checks
+# ---------------------------------------------------------------------------
+
+class TestBuiltinPluginChecks(unittest.TestCase):
+    """Built-in plugin checks are registered and return Finding objects."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Ensure built-in checks are registered before any test runs."""
+        import plugins.checks  # noqa: F401
+
+    def test_eternal_blue_registered(self):
+        """EternalBlue check is registered under 'MS17-010'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("MS17-010"))
+
+    def test_smbghost_registered(self):
+        """SMBGhost check is registered under 'CVE-2020-0796'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("CVE-2020-0796"))
+
+    def test_ftp_anon_registered(self):
+        """FTP anonymous login check is registered under 'FTP-ANON'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("FTP-ANON"))
+
+    def test_telnet_registered(self):
+        """Telnet exposure check is registered under 'TELNET-EXPOSURE'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("TELNET-EXPOSURE"))
+
+    def test_snmp_registered(self):
+        """SNMP community check is registered under 'SNMP-DEFAULT-COMMUNITY'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("SNMP-DEFAULT-COMMUNITY"))
+
+    def test_bluekeep_registered(self):
+        """BlueKeep check is registered under 'CVE-2019-0708'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("CVE-2019-0708"))
+
+    def test_db_exposure_registered(self):
+        """Database exposure check is registered under 'DB-EXPOSURE'."""
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("DB-EXPOSURE"))
+
+    def test_eternal_blue_timeout_gives_inconclusive_finding(self):
+        """EternalBlueCheck.run() returns an INCONCLUSIVE Finding on timeout."""
+        from plugins import CheckRegistry, Finding
+        check = CheckRegistry.get("MS17-010")()
+        with patch("socket.socket") as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect.side_effect = socket.timeout("timed out")
+            findings = check.run("127.0.0.1", 445)
+        self.assertEqual(len(findings), 1)
+        self.assertIsInstance(findings[0], Finding)
+        self.assertEqual(findings[0].status, "INCONCLUSIVE")
+        self.assertEqual(findings[0].cve_refs, ["CVE-2017-0144"])
+
+    def test_eternal_blue_confirmed_finding(self):
+        """EternalBlueCheck.run() returns a CONFIRMED Finding when SMBv1 responds."""
+        from plugins import CheckRegistry, Finding
+        check = CheckRegistry.get("MS17-010")()
+        smb1_response = b"\xff\x53\x4d\x42" + b"\x00" * 60
+        with patch("socket.socket") as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect.return_value = None
+            mock_sock.recv.return_value = smb1_response
+            findings = check.run("127.0.0.1", 445)
+        self.assertTrue(len(findings) > 0)
+        self.assertEqual(findings[0].status, "CONFIRMED")
+        self.assertEqual(findings[0].severity, "CRITICAL")
+        self.assertAlmostEqual(findings[0].confidence, 0.9)
+
+    def test_ftp_anon_timeout_returns_inconclusive_finding(self):
+        """FTPAnonCheck.run() returns an INCONCLUSIVE Finding on timeout."""
+        from plugins import CheckRegistry, Finding
+        check = CheckRegistry.get("FTP-ANON")()
+        with patch("socket.socket") as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect.side_effect = socket.timeout("timed out")
+            findings = check.run("127.0.0.1", 21)
+        self.assertIsInstance(findings, list)
+        self.assertEqual(len(findings), 1)
+        self.assertIsInstance(findings[0], Finding)
+        self.assertEqual(findings[0].status, "INCONCLUSIVE")
+
+    def test_snmp_timeout_returns_inconclusive_finding(self):
+        """SNMPCommunityCheck.run() returns an INCONCLUSIVE Finding when all probes time out."""
+        from plugins import CheckRegistry, Finding
+        check = CheckRegistry.get("SNMP-DEFAULT-COMMUNITY")()
+        with patch("socket.socket") as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout("timed out")
+            findings = check.run("127.0.0.1", 161)
+        self.assertEqual(len(findings), 1)
+        self.assertIsInstance(findings[0], Finding)
+        self.assertEqual(findings[0].status, "INCONCLUSIVE")
+
+    def test_bluekeep_always_potential(self):
+        """BlueKeepCheck.run() always returns a POTENTIAL finding (cannot confirm without creds)."""
+        from plugins import CheckRegistry, Finding
+        check = CheckRegistry.get("CVE-2019-0708")()
+        findings = check.run("127.0.0.1", 3389)
+        self.assertEqual(len(findings), 1)
+        self.assertIsInstance(findings[0], Finding)
+        self.assertEqual(findings[0].status, "POTENTIAL")
+        self.assertIn("CVE-2019-0708", findings[0].cve_refs)
+
+    def test_plugin_run_returns_list_of_findings(self):
+        """All registered built-in checks return a list (possibly empty) of Finding objects."""
+        from plugins import CheckRegistry, Finding
+        for check_cls in CheckRegistry.all_checks():
+            check = check_cls()
+            with patch("socket.socket") as mock_cls:
+                mock_sock = MagicMock()
+                mock_cls.return_value = mock_sock
+                mock_sock.connect.side_effect = socket.timeout("timed out")
+                mock_sock.recvfrom.side_effect = socket.timeout("timed out")
+                result = check.run("127.0.0.1", 9999)
+            self.assertIsInstance(result, list,
+                                  f"{check_cls.check_id}.run() must return a list")
+            for item in result:
+                self.assertIsInstance(item, Finding,
+                                      f"{check_cls.check_id}.run() must return Finding objects")
+
+    def test_eternal_blue_check_for_port_445(self):
+        """CheckRegistry dispatches to EternalBlueCheck for port 445."""
+        from plugins import CheckRegistry
+        check_ids = [c.check_id for c in CheckRegistry.checks_for_port(445)]
+        self.assertIn("MS17-010", check_ids)
+
+    def test_ftp_check_for_port_21(self):
+        """CheckRegistry dispatches to FTPAnonCheck for port 21."""
+        from plugins import CheckRegistry
+        check_ids = [c.check_id for c in CheckRegistry.checks_for_port(21)]
+        self.assertIn("FTP-ANON", check_ids)
+
+
+if __name__ == "__main__":
     unittest.main(verbosity=2)
+
