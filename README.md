@@ -121,6 +121,8 @@ If you are unsure whether you have authorization, **do not run the scan**.
 
 ## 🏗️ Architecture Overview
 
+### High-level scan pipeline
+
 ```
 User supplies target + options
         │
@@ -134,8 +136,9 @@ User supplies target + options
 ┌───────────────────┐
 │  PHASE 2          │  Protocol-specific probes (SMB, RDP, HTTP, DB)
 │  Vuln Checks      │  → Evidence collected → CONFIRMED / POTENTIAL / INCONCLUSIVE
+│  (Plugin checks)  │  → Legacy VulnerabilityChecker + adapter → unified Finding schema
 └────────┬──────────┘
-         │  findings list
+         │  unified Finding objects (serialised as dicts)
          ▼
 ┌───────────────────┐
 │  PHASE 3          │  NVD API 2.0 query (configurable lookback, default 120 days)
@@ -147,12 +150,119 @@ User supplies target + options
 │  PHASE 4          │  PCI DSS 3.2.1 evaluation (optional, --skip-compliance)
 │  Compliance       │  → Pass / Fail score + issue list
 └────────┬──────────┘
-         │  all results
+         │  all results + scan metadata
          ▼
 ┌───────────────────┐
 │  PHASE 5          │  HTML dashboard + JSON data file
 │  Report Gen       │  → Saved to working directory
 └───────────────────┘
+```
+
+### Phase A — Plugin Framework (`plugins/`)
+
+Phase A introduced a modular plugin system and a unified finding schema as the foundation for future phases.
+
+#### Package layout
+
+```
+plugins/
+├── __init__.py       # Public API: BaseCheck, CheckRegistry, Finding, ScanMetadata, Evidence
+├── schema.py         # Finding, Evidence, ScanMetadata dataclasses (unified schema)
+├── base.py           # BaseCheck abstract class (check contract)
+├── registry.py       # CheckRegistry (registration and port/service dispatch)
+└── checks/
+    ├── __init__.py   # Auto-imports smb and network to register all built-in checks
+    ├── smb.py        # EternalBlueCheck, SMBGhostCheck
+    └── network.py    # BlueKeepCheck, FTPAnonCheck, TelnetBannerCheck,
+                      # SNMPCommunityCheck, DatabaseExposureCheck, WebHeadersCheck
+```
+
+#### Unified Finding schema
+
+Every check result is represented as a `Finding` object defined in `plugins/schema.py`.  Key fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `str` | Stable check/finding ID (e.g. `MS17-010`) |
+| `title` | `str` | Short human-readable title |
+| `description` | `str` | Full description |
+| `status` | `str` | `CONFIRMED` / `POTENTIAL` / `INCONCLUSIVE` / `NOT_AFFECTED` |
+| `severity` | `str` | `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `INFO` |
+| `confidence` | `float` | 0.0–1.0 (CONFIRMED=0.9, POTENTIAL=0.5, INCONCLUSIVE=0.2) |
+| `target` | `str` | Host/IP scanned |
+| `port` | `int?` | Port number, or `None` |
+| `service` | `str?` | Service name, or `None` |
+| `evidence` | `Evidence` | `items: List[str]` + optional `raw: str` |
+| `cve_refs` | `List[str]` | CVE identifiers (e.g. `["CVE-2017-0144"]`) |
+| `cvss` | `float?` | CVSS base score, or `None` |
+| `remediation` | `str?` | Recommended remediation |
+| `cisa_kev` | `bool` | Whether listed in CISA KEV catalogue |
+| `exploit_available` | `bool` | Public exploit known |
+
+`ScanMetadata` captures scan-level context: `scan_id` (UUID4), `target`, `started`/`ended` (ISO-8601), and `config` (timeout, retries, concurrency, mode).
+
+#### Backward compatibility
+
+`Finding.from_legacy_dict()` adapts any dict produced by the existing `VulnerabilityChecker` methods into a `Finding` object.  `Finding.to_dict()` serialises it back to a dict that contains **all original keys** plus the new unified fields.  This means no existing code or tests need to change.
+
+The pipeline applies this adapter automatically: `VulnerabilityChecker` still runs all checks unchanged; its output dicts are promoted to `Finding` objects and then serialised with the enriched keys before being stored in `results['vulnerabilities']`.
+
+#### Adding a new plugin check
+
+1. Create or add to a file in `plugins/checks/` (or anywhere on the Python path).
+2. Subclass `BaseCheck` and decorate with `@CheckRegistry.register`:
+
+```python
+from plugins import BaseCheck, CheckRegistry, Evidence, Finding
+
+@CheckRegistry.register
+class MyServiceCheck(BaseCheck):
+    check_id         = 'MY-SERVICE-001'   # stable, unique ID
+    title            = 'My Service Exposure'
+    description      = 'Detects insecure exposure of My Service on port 9999.'
+    category         = 'network'          # 'network' | 'service' | 'config'
+    default_severity = 'HIGH'
+    required_ports   = [9999]             # used by CheckRegistry.checks_for_port()
+    service_matchers = ['MyService']      # matched case-insensitively
+
+    def run(self, target: str, port: int = 9999, **kwargs):
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((target, port))
+            sock.close()
+            return [Finding(
+                id=self.check_id, title=self.title,
+                description='My Service is reachable from an external host.',
+                status='CONFIRMED', severity=self.default_severity,
+                confidence=0.9, target=target, port=port, service='MyService',
+                evidence=Evidence(items=[f'Port {port}/tcp accepted connection']),
+                remediation='Restrict access via firewall.',
+            )]
+        except socket.timeout:
+            return [Finding(
+                id=self.check_id, title=self.title + ' — inconclusive (timeout)',
+                description='Probe timed out.',
+                status='INCONCLUSIVE', severity=self.default_severity,
+                confidence=0.2, target=target, port=port,
+            )]
+        except Exception:
+            return []
+```
+
+3. Import the module in `plugins/checks/__init__.py` to auto-register it:
+
+```python
+from . import my_module  # noqa: F401
+```
+
+4. Discover it via the registry:
+
+```python
+from plugins import CheckRegistry
+checks = CheckRegistry.checks_for_port(9999)
+findings = [f for check_cls in checks for f in check_cls().run(target, 9999)]
 ```
 
 ---
@@ -332,7 +442,14 @@ The JSON report is written alongside the HTML report. Its top-level structure:
   "open_ports": [ ... ],
   "vulnerabilities": [ ... ],
   "nvd_intelligence": { ... },
-  "compliance": { ... }
+  "compliance": { ... },
+  "scan_metadata": {
+    "scan_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "target": "192.168.1.10",
+    "started": "2026-04-04T17:24:45.000000+00:00",
+    "ended": "2026-04-04T17:24:57.000000+00:00",
+    "config": { "timeout": 1.0, "retries": 1, "concurrency": 50, "mode": "common" }
+  }
 }
 ```
 
@@ -368,8 +485,16 @@ The JSON report is written alongside the HTML report. Its top-level structure:
   "cisa_kev": true,
   "exploit_available": true,
   "cvss": 9.3,
-  "remediation": "Disable SMBv1 and apply MS17-010 patch immediately."
+  "remediation": "Disable SMBv1 and apply MS17-010 patch immediately.",
+  "confidence": 0.9,
+  "cve_refs": ["CVE-2017-0144"],
+  "evidence_raw": null,
+  "target": "192.168.1.10",
+  "scan_timestamp": null
 }
+```
+
+> **Phase A unified fields**: `confidence` (0.0–1.0), `cve_refs` (list of CVE IDs), `evidence_raw` (optional raw snippet), and `target` are added by the Phase A adapter and are present on every finding in the output.
 ```
 
 #### `nvd_intelligence` object
@@ -509,6 +634,11 @@ Test coverage includes:
 - Telnet banner collection and timeout behavior (`TestTelnetBannerCheck`)
 - SNMP default community check outcomes (`TestSNMPCommunityCheck`)
 - CVE lookback days storage, defaults, and propagation (`TestCVELookbackDays`)
+- **Phase A — Plugin registration and discovery** (`TestPhaseAPluginRegistration`)
+- **Phase A — Finding schema serialisation and adapter** (`TestFindingSchema`)
+- **Phase A — Pipeline emits unified findings** (`TestPipelineUnifiedFindings`)
+- **Phase A — Reporter renders unified finding fields** (`TestReporterUnifiedFindings`)
+- **Phase A — Built-in plugin checks** (`TestBuiltinPluginChecks`)
 
 ### Syntax Check
 
@@ -550,6 +680,11 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [ ] Service version correlation with CPE/NVD for more precise CVE matching
 - [x] Additional protocol checks (FTP anonymous login, Telnet banner, SNMP default community)
 - [x] Configurable CVE lookback period (`--cve-lookback-days`, default 120)
+- [x] **Phase A: Plugin framework** — `plugins/` package, `BaseCheck` / `CheckRegistry`, 8 built-in checks
+- [x] **Phase A: Unified finding schema** — `Finding`, `Evidence`, `ScanMetadata` dataclasses; adapter layer for backward compat
+- [ ] Phase B: Credentialed checks (SSH, WMI)
+- [ ] Phase C: Scheduled / continuous scanning
+- [ ] Phase D: Web UI
 - [ ] Machine-readable SARIF output for integration with GitHub Code Scanning
 - [ ] Optional NVD API key injection via environment variable (`VULNTRON_NVD_KEY`)
 
