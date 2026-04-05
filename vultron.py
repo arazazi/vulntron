@@ -7,17 +7,18 @@
 Defensive vulnerability assessment and reporting tool for authorized environments.
 
 Capabilities:
-- TCP port discovery across configurable scan modes
-- Service fingerprinting via banner collection
+- TCP and UDP port discovery across configurable scan modes
+- Service fingerprinting via banner collection with version hints and confidence scores
 - Active vulnerability checks with evidence-based status (CONFIRMED / POTENTIAL / INCONCLUSIVE)
 - Protocol checks: FTP anonymous login, Telnet banner, SNMP community strings
+- UDP scanning with protocol-aware probes (DNS, NTP, SNMP) and state classification
 - CVE enrichment via NVD API with configurable lookback window
 - CISA Known Exploited Vulnerabilities (KEV) detection
 - Compliance assessment (PCI DSS)
 - HTML and JSON report generation
 
 Author: Azazi
-Version: 4.0.0
+Version: 4.1.0
 """
 
 import sys
@@ -70,6 +71,8 @@ try:
         build_default_provider,
         AuthenticatedExecutor,
     )
+    from plugins.udp_scanner import UDPScanner, UDP_SERVICE_NAMES, UDP_DEFAULT_PORTS
+    from plugins.fingerprint import fingerprint_banner, normalize_service_name, ServiceFingerprint
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -77,7 +80,7 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 BANNER = f"""
 {'='*90}
 ╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0
@@ -257,8 +260,9 @@ class PortScanner:
         """Scan single port with banner grabbing and optional retries.
 
         ``self.retries`` is the total number of connection attempts (minimum 1).
+        Each result is enriched with a :class:`ServiceFingerprint` summary.
         """
-        for _attempt in range(max(1, self.retries)):
+        for attempt in range(max(1, self.retries)):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(self.timeout)
@@ -267,14 +271,25 @@ class PortScanner:
                 if result == 0:
                     service = self.SERVICE_NAMES.get(port, f'Unknown-{port}')
                     banner = self.grab_banner(sock, port)
+                    banner_str = banner[:100] if banner else ''
 
-                    return {
+                    # Enrich with fingerprint data when the plugin layer is available
+                    fp_dict: Optional[Dict] = None
+                    if _HAS_PLUGINS:
+                        fp = fingerprint_banner(banner_str, port, 'tcp', service)
+                        fp_dict = fp.to_dict()
+
+                    port_record: Dict = {
                         'port': port,
                         'state': 'open',
                         'service': service,
-                        'banner': banner[:100] if banner else '',
-                        'protocol': 'tcp'
+                        'banner': banner_str,
+                        'protocol': 'tcp',
                     }
+                    if fp_dict is not None:
+                        port_record['fingerprint'] = fp_dict
+                    return port_record
+
                 sock.close()
                 return None  # closed/filtered — no need to retry
             except Exception:
@@ -1147,9 +1162,11 @@ class ReportGenerator:
         target = self.results.get('target', 'Unknown')
         timestamp = self.results.get('timestamp', datetime.now().isoformat())
         open_ports = self.results.get('open_ports', [])
+        udp_ports = self.results.get('udp_ports', [])
         vulns = self.results.get('vulnerabilities', [])
         compliance = self.results.get('compliance', {})
         scan_mode = self.results.get('scan_mode', 'common')
+        scan_protocol = self.results.get('scan_protocol', 'tcp')
         cve_lookback_days = self.results.get('cve_lookback_days', 120)
 
         counts = self._count_by_status_severity(vulns)
@@ -1362,9 +1379,14 @@ class ReportGenerator:
                 <div style="font-size: 13px; color: var(--text-secondary);">Actively exploited</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Open Ports</div>
+                <div class="stat-label">Open TCP Ports</div>
                 <div class="stat-value info">{len(open_ports)}</div>
                 <div style="font-size: 13px; color: var(--text-secondary);">Scan mode: {scan_mode}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">UDP Ports</div>
+                <div class="stat-value info">{len(udp_ports)}</div>
+                <div style="font-size: 13px; color: var(--text-secondary);">open / open|filtered</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Risk Score</div>
@@ -1404,7 +1426,7 @@ class ReportGenerator:
                     <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
                     <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
                     <div style="font-size:12px;color:var(--text-secondary);">
-                        🎯 CVSS {vuln.get('cvss','N/A')} | 🔌 Port {vuln.get('port','N/A')}/TCP |
+                        🎯 CVSS {vuln.get('cvss','N/A')} | 🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} |
                         ⚡ {'Exploit Available' if vuln.get('exploit_available') else 'No known exploit'} |
                         🛡 {vuln.get('affected_service','N/A')} |
                         📊 Confidence: {int(vuln.get('confidence', 0.9) * 100)}%
@@ -1444,7 +1466,7 @@ class ReportGenerator:
                     <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
                     <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
                     <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')} |
+                        🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} | 🛡 {vuln.get('affected_service','N/A')} |
                         📊 Confidence: {int(vuln.get('confidence', 0.5) * 100)}%
                     </div>
                 </div>
@@ -1478,7 +1500,7 @@ class ReportGenerator:
                     <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
                     <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
                     <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/TCP | 🛡 {vuln.get('affected_service','N/A')} |
+                        🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} | 🛡 {vuln.get('affected_service','N/A')} |
                         📊 Confidence: {int(vuln.get('confidence', 0.2) * 100)}%
                     </div>
                 </div>
@@ -1491,11 +1513,12 @@ class ReportGenerator:
         </div>
 '''
 
-        # --- Open ports table ---
-        html += '''
+        # --- TCP Open ports table ---
+        if open_ports:
+            html += '''
         <div class="card">
             <div class="card-header">
-                <h3 class="card-title">🔓 Open Ports &amp; Services</h3>
+                <h3 class="card-title">🔓 Open TCP Ports &amp; Services</h3>
             </div>
             <div class="card-body">
                 <table>
@@ -1503,22 +1526,67 @@ class ReportGenerator:
                         <tr>
                             <th>Port</th>
                             <th>Service</th>
+                            <th>State</th>
+                            <th>Protocol</th>
+                            <th>Version</th>
+                            <th>Banner</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+'''
+            for port in open_ports:
+                fp = port.get('fingerprint', {})
+                version_hint = fp.get('version', '') or ''
+                html += f'''
+                        <tr>
+                            <td><strong>{port['port']}</strong></td>
+                            <td>{port['service']}</td>
+                            <td>{port.get('state', 'open')}</td>
+                            <td>{port['protocol']}</td>
+                            <td style="font-size:12px;opacity:0.8;">{version_hint}</td>
+                            <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
+                        </tr>
+'''
+            html += '''
+                    </tbody>
+                </table>
+            </div>
+        </div>
+'''
+
+        # --- UDP ports table ---
+        if udp_ports:
+            html += '''
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">📡 UDP Ports &amp; Services</h3>
+            </div>
+            <div class="card-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Port</th>
+                            <th>Service</th>
+                            <th>State</th>
                             <th>Protocol</th>
                             <th>Banner</th>
                         </tr>
                     </thead>
                     <tbody>
 '''
-        for port in open_ports:
-            html += f'''
+            for port in udp_ports:
+                state = port.get('state', 'open|filtered')
+                state_colour = '#3fb950' if state == 'open' else '#d29922'
+                html += f'''
                         <tr>
                             <td><strong>{port['port']}</strong></td>
                             <td>{port['service']}</td>
-                            <td>{port['protocol']}</td>
+                            <td style="color:{state_colour};">{state}</td>
+                            <td>udp</td>
                             <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
                         </tr>
 '''
-        html += '''
+            html += '''
                     </tbody>
                 </table>
             </div>
@@ -1557,7 +1625,7 @@ class ReportGenerator:
 
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.0 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.1 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -1585,13 +1653,16 @@ class HybridScanner:
         self.args = args
         scan_mode = getattr(args, 'scan_mode', 'common')
         cve_lookback_days = getattr(args, 'cve_lookback_days', 120)
+        scan_protocol = getattr(args, 'protocol', 'tcp')
         self.results = {
             'target': target,
             'timestamp': datetime.now().isoformat(),
             'scanner_version': VERSION,
             'scan_mode': scan_mode,
+            'scan_protocol': scan_protocol,
             'cve_lookback_days': cve_lookback_days,
             'open_ports': [],
+            'udp_ports': [],
             'vulnerabilities': [],
             'nvd_intelligence': {},
             'compliance': {},
@@ -1645,6 +1716,10 @@ class HybridScanner:
 
         args = self.args
         scan_mode = getattr(args, 'scan_mode', 'common')
+        scan_protocol = getattr(args, 'protocol', 'tcp')
+        udp_timeout = getattr(args, 'udp_timeout', 2.0)
+        udp_retries = getattr(args, 'udp_retries', 2)
+        udp_ports_arg = getattr(args, 'udp_ports', None)
 
         # Build credential set from CLI args (if any)
         credential_set = self._build_credential_set()
@@ -1659,36 +1734,74 @@ class HybridScanner:
                     'retries': getattr(args, 'retries', 1),
                     'concurrency': getattr(args, 'concurrency', 50),
                     'mode': scan_mode,
+                    'protocol': scan_protocol,
+                    'udp_timeout': udp_timeout,
+                    'udp_retries': udp_retries,
                     'credentialed': credentialed_mode,
                 },
             )
 
-        # Phase 1: Port Scanning
-        print(Colors.header("[PHASE 1] PORT SCANNING"))
-        custom_ports: List[int] = []
-        if scan_mode == 'custom' and getattr(args, 'ports', None):
-            custom_ports = PortScanner.parse_port_spec(args.ports)
+        # Phase 1: TCP Port Scanning (skipped when protocol=udp)
+        if scan_protocol in ('tcp', 'both'):
+            print(Colors.header("[PHASE 1] TCP PORT SCANNING"))
+            custom_ports: List[int] = []
+            if scan_mode == 'custom' and getattr(args, 'ports', None):
+                custom_ports = PortScanner.parse_port_spec(args.ports)
 
-        scanner = PortScanner(
-            self.target,
-            scan_mode=scan_mode,
-            custom_ports=custom_ports,
-            timeout=getattr(args, 'timeout', 1.0),
-            retries=getattr(args, 'retries', 1),
-            concurrency=getattr(args, 'concurrency', 50),
-        )
-        self.results['open_ports'] = scanner.scan()
+            scanner = PortScanner(
+                self.target,
+                scan_mode=scan_mode,
+                custom_ports=custom_ports,
+                timeout=getattr(args, 'timeout', 1.0),
+                retries=getattr(args, 'retries', 1),
+                concurrency=getattr(args, 'concurrency', 50),
+            )
+            self.results['open_ports'] = scanner.scan()
+        else:
+            print(Colors.info("TCP scanning skipped (protocol=udp)"))
 
-        if not self.results['open_ports']:
-            print(Colors.warning("No open ports found!"))
+        # Phase 1b: UDP Port Scanning (when protocol=udp or both)
+        if scan_protocol in ('udp', 'both') and _HAS_PLUGINS:
+            print(Colors.header("[PHASE 1b] UDP PORT SCANNING"))
+            udp_port_list: Optional[List[int]] = None
+            if udp_ports_arg:
+                udp_port_list = PortScanner.parse_port_spec(udp_ports_arg)
+
+            udp_scanner = UDPScanner(
+                target=self.target,
+                ports=udp_port_list,
+                timeout=udp_timeout,
+                retries=udp_retries,
+                concurrency=min(getattr(args, 'concurrency', 50), 30),
+            )
+            print(Colors.info(
+                f"Scanning {len(udp_scanner.ports)} UDP ports on {self.target} "
+                f"(timeout={udp_timeout}s, retries={udp_retries})..."
+            ))
+            udp_results = udp_scanner.scan()
+            self.results['udp_ports'] = udp_results
+            for r in udp_results:
+                state_label = r['state']
+                print(Colors.success(
+                    f"  {r['port']}/udp - {r['service']} [{state_label}]"
+                ))
+            print(Colors.success(f"Found {len(udp_results)} UDP ports (open/open|filtered)\n"))
+
+        # Require at least one open TCP port for vulnerability checks
+        if not self.results['open_ports'] and scan_protocol in ('tcp', 'both'):
+            print(Colors.warning("No open TCP ports found!"))
             if _HAS_PLUGINS:
                 _scan_meta.ended = datetime.now(timezone.utc).isoformat()
                 self.results['scan_metadata'] = _scan_meta.to_dict()
-            return
+            if not self.results.get('udp_ports'):
+                return
 
-        # [PHASE 2] Vulnerability Checks (legacy VulnerabilityChecker path)
-        vuln_checker = VulnerabilityChecker(self.target, self.results['open_ports'])
-        legacy_findings = vuln_checker.check_all()
+        # [PHASE 2] Vulnerability Checks — TCP only (legacy VulnerabilityChecker path)
+        if self.results['open_ports']:
+            vuln_checker = VulnerabilityChecker(self.target, self.results['open_ports'])
+            legacy_findings = vuln_checker.check_all()
+        else:
+            legacy_findings = []
 
         # Adapter: promote legacy dicts to unified Finding objects, then serialise
         # back to dicts that include all original keys plus the new unified fields
@@ -1782,7 +1895,14 @@ class HybridScanner:
 
         print(Colors.header("[SCAN COMPLETE]"))
         print(Colors.success(f"Target: {self.target}"))
-        print(Colors.success(f"Open Ports: {len(self.results['open_ports'])} (scan mode: {scan_mode})"))
+        if scan_protocol in ('tcp', 'both'):
+            print(Colors.success(
+                f"Open TCP Ports: {len(self.results['open_ports'])} (scan mode: {scan_mode})"
+            ))
+        if scan_protocol in ('udp', 'both'):
+            print(Colors.success(
+                f"UDP Ports (open/open|filtered): {len(self.results['udp_ports'])}"
+            ))
         print(Colors.critical(f"Critical Vulnerabilities (confirmed): {counts['critical_confirmed']}"))
         print(Colors.high(f"High Vulnerabilities (confirmed): {counts['high_confirmed']}"))
         print(Colors.medium(f"Medium Vulnerabilities (confirmed): {counts['medium_confirmed']}"))
@@ -1800,7 +1920,7 @@ class HybridScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v4.0 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v4.1 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1811,6 +1931,11 @@ Examples:
   python vultron.py -t server.local --skip-nvd
   python vultron.py -t 10.0.0.50 --skip-compliance
   python vultron.py -t 192.168.1.100 --cve-lookback-days 30
+
+  # UDP scanning (authorized use only):
+  python vultron.py -t 192.168.1.100 --protocol udp
+  python vultron.py -t 192.168.1.100 --protocol both --udp-timeout 3 --udp-retries 3
+  python vultron.py -t 192.168.1.100 --protocol udp --udp-ports 53,123,161,500
 
   # Credentialed scanning (authorized use only):
   python vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-password '<pass>'
@@ -1825,7 +1950,21 @@ Scan modes:
   full     Scan all 65535 TCP ports (slow — use with --concurrency 200+)
   custom   Scan ports specified via --ports
 
-Protocol checks (triggered automatically on open ports):
+Protocol modes:
+  tcp   TCP connect scan only (default)
+  udp   UDP scan only using protocol-aware probes
+  both  Combined TCP + UDP scan
+
+UDP scanning notes:
+  UDP scanning requires no elevated privileges.  Probes are lightweight and
+  non-intrusive (DNS version query, NTP mode-3 request, SNMP sysDescr read).
+  State semantics:
+    open          — probe received a response
+    open|filtered — no response; port may be open or firewall-filtered
+  UDP scanning may produce many open|filtered results on filtered networks.
+  Only use on systems and networks you are authorised to test.
+
+Protocol checks (triggered automatically on open TCP ports):
   FTP (21)    Anonymous login probe — CONFIRMED / POTENTIAL / INCONCLUSIVE
   Telnet (23) Banner collection + cleartext exposure — POTENTIAL / INCONCLUSIVE
   SNMP (161)  Default community string probe (public/private) — CONFIRMED / INCONCLUSIVE
@@ -1839,9 +1978,10 @@ Credentialed scanning (all modes):
   Credentials are never written to reports or log files.
 
 Capabilities:
-  TCP port discovery, service fingerprinting, and active vulnerability checks.
+  TCP and UDP port discovery, service fingerprinting with version hints and
+  confidence scores, and active vulnerability checks.
   CVE enrichment via NVD API, CISA KEV detection, and compliance assessment (PCI DSS).
-  Outputs structured HTML and JSON reports with evidence-based findings.
+  Outputs structured HTML and JSON reports with evidence-based, protocol-aware findings.
         """
     )
 
@@ -1866,6 +2006,34 @@ Capabilities:
     parser.add_argument('--cve-lookback-days', type=int, default=120, metavar='DAYS',
                         help='Days to look back for recent CVEs (default: 120, range: 1–3650)')
     parser.add_argument('--version', action='version', version=f'Vultron {VERSION}')
+
+    # -- UDP scanning options (PR2) -----------------------------------------
+    udp_group = parser.add_argument_group(
+        'UDP scanning (authorized use only)',
+        'Options for UDP port discovery.  Only use on systems you are authorised to test.',
+    )
+    udp_group.add_argument(
+        '--protocol',
+        choices=['tcp', 'udp', 'both'],
+        default='tcp',
+        help='Scan protocol selector: tcp (default), udp, or both',
+    )
+    udp_group.add_argument(
+        '--udp-timeout',
+        type=float, default=2.0, metavar='SECONDS',
+        help='Per-port UDP probe receive timeout in seconds (default: 2.0)',
+    )
+    udp_group.add_argument(
+        '--udp-retries',
+        type=int, default=2, metavar='N',
+        help='Total UDP probe attempts per port (default: 2)',
+    )
+    udp_group.add_argument(
+        '--udp-ports',
+        metavar='PORTS',
+        help="Custom UDP port list/ranges, e.g. '53,123,161,500-514'. "
+             "Defaults to common UDP service ports when not specified.",
+    )
 
     # -- Credentialed scanning options (PR1) --------------------------------
     cred_group = parser.add_argument_group(
