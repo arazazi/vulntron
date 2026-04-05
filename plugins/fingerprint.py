@@ -87,8 +87,8 @@ _BANNER_PATTERNS: List[_BannerPattern] = [
     (re.compile(r'PostgreSQL|pg_hba', re.I), 'PostgreSQL', None),
     # SNMP response (starts with SEQUENCE 0x30)
     (re.compile(r'^\x30'), 'SNMP', None),
-    # DNS response (transaction ID echo + flags)
-    (re.compile(r'^\x137|\x13\x37', re.S), 'DNS', None),
+    # DNS response (transaction ID echo 0x13 0x37 from our probe + flags)
+    (re.compile(r'^\x13\x37', re.S), 'DNS', None),
 ]
 
 

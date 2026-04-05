@@ -1576,12 +1576,12 @@ class ReportGenerator:
 '''
             for port in udp_ports:
                 state = port.get('state', 'open|filtered')
-                state_colour = '#3fb950' if state == 'open' else '#d29922'
+                state_color = '#3fb950' if state == 'open' else '#d29922'
                 html += f'''
                         <tr>
                             <td><strong>{port['port']}</strong></td>
                             <td>{port['service']}</td>
-                            <td style="color:{state_colour};">{state}</td>
+                            <td style="color:{state_color};">{state}</td>
                             <td>udp</td>
                             <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
                         </tr>
