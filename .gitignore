@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Credential files — never commit real credentials
+creds.json
+credentials.json
+*.credentials.json
+*_creds.json

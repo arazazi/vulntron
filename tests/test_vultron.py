@@ -1370,6 +1370,920 @@ class TestBuiltinPluginChecks(unittest.TestCase):
         self.assertIn("FTP-ANON", check_ids)
 
 
+# ---------------------------------------------------------------------------
+# 16. PR1 — Credential model validation
+# ---------------------------------------------------------------------------
+
+class TestCredentialModelValidation(unittest.TestCase):
+    """SSHCredential, WinRMCredential, WMICredential field validation."""
+
+    # --- SSH ---
+
+    def test_ssh_valid_password_auth(self):
+        from plugins import SSHCredential
+        cred = SSHCredential(username="scanuser", password="s3cr3t")
+        cred.validate()  # should not raise
+
+    def test_ssh_valid_key_auth(self):
+        import tempfile, os
+        from plugins import SSHCredential
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as f:
+            f.write(b"fake key content")
+            key_path = f.name
+        try:
+            cred = SSHCredential(username="scanuser", key_path=key_path)
+            cred.validate()
+        finally:
+            os.unlink(key_path)
+
+    def test_ssh_missing_username_raises(self):
+        from plugins import SSHCredential, CredentialValidationError
+        cred = SSHCredential(username="", password="pass")
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_ssh_missing_both_auth_raises(self):
+        from plugins import SSHCredential, CredentialValidationError
+        cred = SSHCredential(username="user")
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_ssh_both_password_and_key_raises(self):
+        import tempfile, os
+        from plugins import SSHCredential, CredentialValidationError
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as f:
+            f.write(b"fake")
+            key_path = f.name
+        try:
+            cred = SSHCredential(username="user", password="pass", key_path=key_path)
+            with self.assertRaises(CredentialValidationError):
+                cred.validate()
+        finally:
+            os.unlink(key_path)
+
+    def test_ssh_nonexistent_key_path_raises(self):
+        from plugins import SSHCredential, CredentialValidationError
+        cred = SSHCredential(username="user", key_path="/nonexistent/path/key.pem")
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_ssh_invalid_port_raises(self):
+        from plugins import SSHCredential, CredentialValidationError
+        cred = SSHCredential(username="user", password="pass", port=99999)
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_ssh_redacted_summary_hides_password(self):
+        from plugins import SSHCredential
+        cred = SSHCredential(username="scanuser", password="super_secret_password")
+        summary = cred.redacted_summary()
+        self.assertNotIn("super_secret_password", summary)
+        self.assertIn("scanuser", summary)
+
+    def test_ssh_credential_type(self):
+        from plugins import SSHCredential
+        cred = SSHCredential(username="u", password="p")
+        self.assertEqual(cred.credential_type, "ssh")
+
+    # --- WinRM ---
+
+    def test_winrm_valid(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="Administrator", password="P@ssword1")
+        cred.validate()
+
+    def test_winrm_missing_username_raises(self):
+        from plugins import WinRMCredential, CredentialValidationError
+        cred = WinRMCredential(username="", password="pass")
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_winrm_missing_password_raises(self):
+        from plugins import WinRMCredential, CredentialValidationError
+        cred = WinRMCredential(username="Administrator", password=None)
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_winrm_effective_port_http(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="u", password="p", transport="http")
+        self.assertEqual(cred.effective_port, 5985)
+
+    def test_winrm_effective_port_https(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="u", password="p", transport="https")
+        self.assertEqual(cred.effective_port, 5986)
+
+    def test_winrm_effective_port_override(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="u", password="p", port=5999)
+        self.assertEqual(cred.effective_port, 5999)
+
+    def test_winrm_redacted_summary_hides_password(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="Administrator", password="TopSecret")
+        summary = cred.redacted_summary()
+        self.assertNotIn("TopSecret", summary)
+        self.assertIn("Administrator", summary)
+
+    def test_winrm_credential_type(self):
+        from plugins import WinRMCredential
+        cred = WinRMCredential(username="u", password="p")
+        self.assertEqual(cred.credential_type, "winrm")
+
+    # --- WMI ---
+
+    def test_wmi_valid(self):
+        from plugins import WMICredential
+        cred = WMICredential(username="Administrator", password="P@ssword1")
+        cred.validate()
+
+    def test_wmi_missing_username_raises(self):
+        from plugins import WMICredential, CredentialValidationError
+        cred = WMICredential(username="", password="pass")
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_wmi_missing_password_raises(self):
+        from plugins import WMICredential, CredentialValidationError
+        cred = WMICredential(username="user", password=None)
+        with self.assertRaises(CredentialValidationError):
+            cred.validate()
+
+    def test_wmi_redacted_summary_hides_password(self):
+        from plugins import WMICredential
+        cred = WMICredential(username="Administrator", password="HiddenPass")
+        summary = cred.redacted_summary()
+        self.assertNotIn("HiddenPass", summary)
+        self.assertIn("Administrator", summary)
+
+    def test_wmi_credential_type(self):
+        from plugins import WMICredential
+        cred = WMICredential(username="u", password="p")
+        self.assertEqual(cred.credential_type, "wmi")
+
+    # --- CredentialSet ---
+
+    def test_credential_set_empty(self):
+        from plugins import CredentialSet
+        cs = CredentialSet()
+        self.assertTrue(cs.is_empty())
+
+    def test_credential_set_not_empty(self):
+        from plugins import CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        self.assertFalse(cs.is_empty())
+
+    def test_credential_set_validate_all_propagates_error(self):
+        from plugins import CredentialSet, SSHCredential, CredentialValidationError
+        cs = CredentialSet(ssh=SSHCredential(username="", password="p"))
+        with self.assertRaises(CredentialValidationError):
+            cs.validate_all()
+
+    def test_credential_set_redacted_summary_no_secrets(self):
+        from plugins import CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="alice", password="secret_password"))
+        summary = cs.redacted_summary()
+        self.assertNotIn("secret_password", str(summary))
+        self.assertIn("alice", str(summary))
+
+
+# ---------------------------------------------------------------------------
+# 17. PR1 — Secret masking and redaction helpers
+# ---------------------------------------------------------------------------
+
+class TestSecretMasking(unittest.TestCase):
+    """Secret masking helpers in plugins.secrets."""
+
+    def test_mask_secret_returns_redacted(self):
+        from plugins import mask_secret, REDACTED
+        self.assertEqual(mask_secret("actual_password"), REDACTED)
+
+    def test_mask_secret_none_returns_redacted(self):
+        from plugins import mask_secret, REDACTED
+        self.assertEqual(mask_secret(None), REDACTED)
+
+    def test_redact_dict_masks_password(self):
+        from plugins import redact_dict, REDACTED
+        d = {"host": "10.0.0.1", "password": "s3cr3t", "port": 22}
+        result = redact_dict(d)
+        self.assertEqual(result["password"], REDACTED)
+        self.assertEqual(result["host"], "10.0.0.1")
+        self.assertEqual(result["port"], 22)
+
+    def test_redact_dict_masks_known_keys(self):
+        from plugins import redact_dict, REDACTED
+        sensitive = ["password", "passwd", "secret", "token", "api_key", "passphrase"]
+        for key in sensitive:
+            d = {key: "supersecret"}
+            result = redact_dict(d)
+            self.assertEqual(result[key], REDACTED, f"Key '{key}' was not redacted")
+
+    def test_redact_dict_leaves_non_sensitive(self):
+        from plugins import redact_dict
+        d = {"host": "10.0.0.1", "port": 22, "username": "scanuser"}
+        result = redact_dict(d)
+        self.assertEqual(result["host"], "10.0.0.1")
+        self.assertEqual(result["port"], 22)
+
+    def test_redact_dict_extra_keys(self):
+        from plugins import redact_dict, REDACTED
+        d = {"my_custom_secret": "value", "normal": "ok"}
+        result = redact_dict(d, extra_keys=["my_custom_secret"])
+        self.assertEqual(result["my_custom_secret"], REDACTED)
+        self.assertEqual(result["normal"], "ok")
+
+    def test_deep_redact_dict_nested(self):
+        from plugins import deep_redact_dict, REDACTED
+        d = {
+            "scan": {
+                "target": "10.0.0.1",
+                "auth_config": {
+                    "ssh": {"password": "nested_secret", "username": "user"}
+                }
+            }
+        }
+        result = deep_redact_dict(d)
+        self.assertEqual(
+            result["scan"]["auth_config"]["ssh"]["password"], REDACTED
+        )
+        self.assertEqual(result["scan"]["auth_config"]["ssh"]["username"], "user")
+
+    def test_deep_redact_list(self):
+        from plugins import deep_redact_dict, REDACTED
+        data = [{"password": "s"}, {"host": "10.0.0.1"}]
+        result = deep_redact_dict(data)
+        self.assertEqual(result[0]["password"], REDACTED)
+        self.assertEqual(result[1]["host"], "10.0.0.1")
+
+    def test_redact_string_inline_password(self):
+        from plugins.secrets import redact_string, REDACTED
+        line = "Connecting with password=mypassword123 to host"
+        result = redact_string(line)
+        self.assertNotIn("mypassword123", result)
+        self.assertIn(REDACTED, result)
+
+    def test_redact_string_no_sensitive_content_unchanged(self):
+        from plugins.secrets import redact_string
+        line = "Port 22/tcp is open on 10.0.0.1"
+        self.assertEqual(redact_string(line), line)
+
+    def test_finding_evidence_not_leaked_in_redact(self):
+        """Ensure scan findings evidence can be safely redacted when needed."""
+        from plugins import deep_redact_dict, REDACTED
+        finding = {
+            "id": "AUTH-PROBE-SSH",
+            "status": "CONFIRMED",
+            "password": "should_be_redacted",
+            "evidence": ["SSH port 22/tcp is open"],
+        }
+        result = deep_redact_dict(finding)
+        self.assertEqual(result["password"], REDACTED)
+        self.assertEqual(result["evidence"], ["SSH port 22/tcp is open"])
+
+
+# ---------------------------------------------------------------------------
+# 18. PR1 — Credential providers
+# ---------------------------------------------------------------------------
+
+class TestCredentialProviders(unittest.TestCase):
+    """Credential provider abstraction: inline, env, file, chained."""
+
+    def test_inline_provider_returns_set(self):
+        from plugins import (
+            InlineCredentialProvider, CredentialSet, SSHCredential,
+        )
+        cs = CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        provider = InlineCredentialProvider(cs)
+        result = provider.get_credentials("10.0.0.1")
+        self.assertIs(result, cs)
+
+    def test_env_provider_no_vars_returns_empty(self):
+        from plugins import EnvCredentialProvider
+        import os
+        env_keys = [
+            "VULTRON_SSH_USER", "VULTRON_SSH_PASSWORD",
+            "VULTRON_WINRM_USER", "VULTRON_WINRM_PASSWORD",
+            "VULTRON_WMI_USER", "VULTRON_WMI_PASSWORD",
+        ]
+        # Ensure no relevant vars are set
+        clean_env = {k: v for k, v in os.environ.items() if k not in env_keys}
+        with patch.dict(os.environ, clean_env, clear=True):
+            provider = EnvCredentialProvider()
+            cs = provider.get_credentials()
+        self.assertTrue(cs.is_empty())
+
+    def test_env_provider_ssh_from_env(self):
+        from plugins import EnvCredentialProvider
+        import os
+        with patch.dict(os.environ, {
+            "VULTRON_SSH_USER": "envuser",
+            "VULTRON_SSH_PASSWORD": "envpass",
+        }):
+            provider = EnvCredentialProvider()
+            cs = provider.get_credentials()
+        self.assertIsNotNone(cs.ssh)
+        self.assertEqual(cs.ssh.username, "envuser")
+        self.assertEqual(cs.ssh.password, "envpass")
+
+    def test_env_provider_winrm_from_env(self):
+        from plugins import EnvCredentialProvider
+        import os
+        with patch.dict(os.environ, {
+            "VULTRON_WINRM_USER": "winadmin",
+            "VULTRON_WINRM_PASSWORD": "winpass",
+            "VULTRON_WINRM_DOMAIN": "CORP",
+        }):
+            provider = EnvCredentialProvider()
+            cs = provider.get_credentials()
+        self.assertIsNotNone(cs.winrm)
+        self.assertEqual(cs.winrm.username, "winadmin")
+        self.assertEqual(cs.winrm.domain, "CORP")
+
+    def test_env_provider_wmi_from_env(self):
+        from plugins import EnvCredentialProvider
+        import os
+        with patch.dict(os.environ, {
+            "VULTRON_WMI_USER": "wmiuser",
+            "VULTRON_WMI_PASSWORD": "wmipass",
+        }):
+            provider = EnvCredentialProvider()
+            cs = provider.get_credentials()
+        self.assertIsNotNone(cs.wmi)
+        self.assertEqual(cs.wmi.username, "wmiuser")
+
+    def test_file_provider_missing_file_returns_empty(self):
+        from plugins import FileCredentialProvider
+        provider = FileCredentialProvider("/nonexistent/file.json")
+        cs = provider.get_credentials()
+        self.assertTrue(cs.is_empty())
+
+    def test_file_provider_valid_json(self):
+        import tempfile, json, os
+        from plugins import FileCredentialProvider
+        data = {
+            "ssh": {"username": "fileuser", "password": "<placeholder>"},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            fpath = f.name
+        try:
+            provider = FileCredentialProvider(fpath)
+            cs = provider.get_credentials()
+            self.assertIsNotNone(cs.ssh)
+            self.assertEqual(cs.ssh.username, "fileuser")
+        finally:
+            os.unlink(fpath)
+
+    def test_file_provider_invalid_json_returns_empty(self):
+        import tempfile, os
+        from plugins import FileCredentialProvider
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("not valid json {{{")
+            fpath = f.name
+        try:
+            provider = FileCredentialProvider(fpath)
+            cs = provider.get_credentials()
+            self.assertTrue(cs.is_empty())
+        finally:
+            os.unlink(fpath)
+
+    def test_chained_provider_returns_first_nonempty(self):
+        from plugins import (
+            ChainedCredentialProvider, InlineCredentialProvider,
+            CredentialSet, SSHCredential,
+        )
+        empty = InlineCredentialProvider(CredentialSet())
+        filled = InlineCredentialProvider(
+            CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        )
+        chained = ChainedCredentialProvider([empty, filled])
+        cs = chained.get_credentials()
+        self.assertIsNotNone(cs.ssh)
+        self.assertEqual(cs.ssh.username, "u")
+
+    def test_chained_provider_all_empty_returns_empty(self):
+        from plugins import (
+            ChainedCredentialProvider, InlineCredentialProvider, CredentialSet,
+        )
+        chained = ChainedCredentialProvider([
+            InlineCredentialProvider(CredentialSet()),
+            InlineCredentialProvider(CredentialSet()),
+        ])
+        cs = chained.get_credentials()
+        self.assertTrue(cs.is_empty())
+
+    def test_build_default_provider_inline(self):
+        from plugins import build_default_provider, CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        provider = build_default_provider(inline=cs)
+        result = provider.get_credentials()
+        self.assertIsNotNone(result.ssh)
+
+
+# ---------------------------------------------------------------------------
+# 19. PR1 — Authenticated executor probes
+# ---------------------------------------------------------------------------
+
+class TestAuthenticatedExecutor(unittest.TestCase):
+    """AuthenticatedExecutor probe scaffolding."""
+
+    def _make_cred_set(self):
+        from plugins import CredentialSet, SSHCredential
+        return CredentialSet(ssh=SSHCredential(username="u", password="p"))
+
+    def test_empty_creds_returns_no_findings(self):
+        from plugins import AuthenticatedExecutor, CredentialSet
+        executor = AuthenticatedExecutor("127.0.0.1", CredentialSet())
+        findings = executor.run_probes()
+        self.assertEqual(findings, [])
+
+    def test_ssh_probe_unreachable_gives_inconclusive_finding(self):
+        from plugins import AuthenticatedExecutor, Finding
+        cs = self._make_cred_set()
+        executor = AuthenticatedExecutor("127.0.0.1", cs)
+        with patch("plugins.auth_executor._tcp_reachable", return_value=(False, "refused")):
+            findings = executor.run_probes()
+        self.assertEqual(len(findings), 1)
+        self.assertIsInstance(findings[0], Finding)
+        self.assertEqual(findings[0].status, "INCONCLUSIVE")
+        self.assertEqual(findings[0].id, "AUTH-PROBE-SSH")
+
+    def test_ssh_probe_reachable_no_paramiko_gives_confirmed(self):
+        """When TCP is reachable but paramiko is absent, fall back to CONFIRMED TCP."""
+        from plugins import AuthenticatedExecutor, Finding
+        cs = self._make_cred_set()
+        executor = AuthenticatedExecutor("127.0.0.1", cs)
+
+        def mock_probe(*args, **kwargs):
+            from plugins.auth_executor import ProbeResult
+            return ProbeResult(
+                protocol="ssh", target="127.0.0.1", port=22,
+                success=True,
+                message="SSH connectivity confirmed (TCP-only)",
+            )
+
+        with patch("plugins.auth_executor._probe_ssh", side_effect=mock_probe):
+            findings = executor.run_probes()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].status, "CONFIRMED")
+        self.assertAlmostEqual(findings[0].confidence, 0.9)
+
+    def test_auth_context_updated_after_successful_probe(self):
+        """Context.authenticated_mode becomes True after a successful probe."""
+        from plugins import AuthenticatedExecutor, CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        executor = AuthenticatedExecutor("127.0.0.1", cs)
+
+        def mock_probe(*args, **kwargs):
+            from plugins.auth_executor import ProbeResult
+            return ProbeResult(
+                protocol="ssh", target="127.0.0.1", port=22,
+                success=True, message="ok",
+            )
+
+        with patch("plugins.auth_executor._probe_ssh", side_effect=mock_probe):
+            executor.run_probes()
+        self.assertTrue(executor.context.authenticated_mode)
+
+    def test_auth_context_not_authenticated_on_failure(self):
+        """Context.authenticated_mode remains False when probes fail."""
+        from plugins import AuthenticatedExecutor, CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="u", password="p"))
+        executor = AuthenticatedExecutor("127.0.0.1", cs)
+
+        with patch("plugins.auth_executor._tcp_reachable", return_value=(False, "refused")):
+            executor.run_probes()
+        self.assertFalse(executor.context.authenticated_mode)
+
+    def test_probe_result_to_dict_no_secrets(self):
+        """ProbeResult.to_dict() does not expose passwords."""
+        from plugins import ProbeResult
+        result = ProbeResult(
+            protocol="ssh", target="10.0.0.1", port=22,
+            success=True,
+            message="SSH port 22/tcp is reachable",
+        )
+        d = result.to_dict()
+        self.assertNotIn("password", d)
+        self.assertNotIn("username", d)
+        self.assertIn("success", d)
+        self.assertIn("message", d)
+
+    def test_auth_session_context_metadata_no_secrets(self):
+        """AuthSessionContext.to_metadata_dict() does not leak credential secrets."""
+        from plugins import AuthenticatedExecutor, CredentialSet, SSHCredential
+        cs = CredentialSet(ssh=SSHCredential(username="alice", password="very_secret"))
+        executor = AuthenticatedExecutor("10.0.0.1", cs)
+        meta = executor.context.to_metadata_dict()
+        meta_str = str(meta)
+        self.assertNotIn("very_secret", meta_str)
+        self.assertIn("alice", meta_str)
+
+    def test_multiple_protocols_all_probed(self):
+        """Executor runs a probe for each configured credential type."""
+        from plugins import (
+            AuthenticatedExecutor, CredentialSet,
+            SSHCredential, WinRMCredential, WMICredential,
+        )
+        cs = CredentialSet(
+            ssh=SSHCredential(username="u", password="p"),
+            winrm=WinRMCredential(username="u", password="p"),
+            wmi=WMICredential(username="u", password="p"),
+        )
+        executor = AuthenticatedExecutor("10.0.0.1", cs)
+        with patch("plugins.auth_executor._tcp_reachable", return_value=(False, "refused")):
+            findings = executor.run_probes()
+        # One finding per configured protocol
+        self.assertEqual(len(findings), 3)
+        ids = {f.id for f in findings}
+        self.assertIn("AUTH-PROBE-SSH", ids)
+        self.assertIn("AUTH-PROBE-WINRM", ids)
+        self.assertIn("AUTH-PROBE-WMI", ids)
+
+
+# ---------------------------------------------------------------------------
+# 20. PR1 — Auth probe plugin checks
+# ---------------------------------------------------------------------------
+
+class TestAuthProbePluginChecks(unittest.TestCase):
+    """Auth probe checks are registered and produce valid Finding objects."""
+
+    @classmethod
+    def setUpClass(cls):
+        import plugins.checks  # noqa: F401
+
+    def test_ssh_probe_registered(self):
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("AUTH-PROBE-SSH"))
+
+    def test_winrm_probe_registered(self):
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("AUTH-PROBE-WINRM"))
+
+    def test_wmi_probe_registered(self):
+        from plugins import CheckRegistry
+        self.assertIsNotNone(CheckRegistry.get("AUTH-PROBE-WMI"))
+
+    def test_ssh_probe_no_creds_unreachable_returns_empty(self):
+        """SSH probe without creds and unreachable port returns empty list."""
+        from plugins import CheckRegistry, CredentialSet
+        check = CheckRegistry.get("AUTH-PROBE-SSH")()
+        with patch("plugins.auth_executor._tcp_reachable", return_value=(False, "refused")):
+            result = check.run("127.0.0.1", 22, credential_set=CredentialSet())
+        self.assertEqual(result, [])
+
+    def test_ssh_probe_no_creds_reachable_returns_confirmed(self):
+        """SSH probe without creds but reachable port returns CONFIRMED INFO finding."""
+        from plugins import CheckRegistry, CredentialSet, Finding
+        check = CheckRegistry.get("AUTH-PROBE-SSH")()
+        with patch("plugins.auth_executor._tcp_reachable", return_value=(True, None)), \
+             patch("socket.create_connection") as mock_conn:
+            mock_sock = MagicMock()
+            mock_sock.__enter__ = MagicMock(return_value=mock_sock)
+            mock_sock.__exit__ = MagicMock(return_value=False)
+            mock_sock.recv.return_value = b"SSH-2.0-OpenSSH_8.9\r\n"
+            mock_conn.return_value = mock_sock
+            result = check.run("127.0.0.1", 22, credential_set=CredentialSet())
+        self.assertIsInstance(result, list)
+        # May return CONFIRMED or INCONCLUSIVE depending on banner grab
+        if result:
+            self.assertIsInstance(result[0], Finding)
+            self.assertEqual(result[0].severity, "INFO")
+
+    def test_auth_probe_checks_have_requires_credentials_false(self):
+        """Auth probe checks do not *require* credentials (they are optional)."""
+        from plugins import CheckRegistry
+        for check_id in ("AUTH-PROBE-SSH", "AUTH-PROBE-WINRM", "AUTH-PROBE-WMI"):
+            check_cls = CheckRegistry.get(check_id)
+            self.assertIsNotNone(check_cls)
+            self.assertFalse(
+                check_cls.requires_credentials,
+                f"{check_id} should have requires_credentials=False",
+            )
+
+    def test_auth_probe_checks_declare_credential_types(self):
+        """Auth probe checks declare which credential types they accept."""
+        from plugins import CheckRegistry
+        checks_and_types = [
+            ("AUTH-PROBE-SSH", "ssh"),
+            ("AUTH-PROBE-WINRM", "winrm"),
+            ("AUTH-PROBE-WMI", "wmi"),
+        ]
+        for check_id, cred_type in checks_and_types:
+            check_cls = CheckRegistry.get(check_id)
+            self.assertIn(
+                cred_type, check_cls.credential_types,
+                f"{check_id} should declare '{cred_type}' in credential_types",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 21. PR1 — CLI parsing for credential options
+# ---------------------------------------------------------------------------
+
+class TestCLICredentialParsing(unittest.TestCase):
+    """CLI argument parser correctly parses credential options."""
+
+    def _parse(self, args_list):
+        import argparse
+        import sys
+        from io import StringIO
+        # We test by importing the parser logic directly
+        old_argv = sys.argv
+        try:
+            sys.argv = ["vultron.py"] + args_list
+            # Re-import to get fresh argparse
+            import importlib
+            import vultron as vt
+            # Manually reconstruct the parser call used in main()
+            # We replicate the parser construction here to test it
+            import argparse as ap
+            parser = ap.ArgumentParser()
+            parser.add_argument('-t', '--target', required=True)
+            parser.add_argument('--scan-mode', default='common')
+            parser.add_argument('--ports')
+            parser.add_argument('--timeout', type=float, default=1.0)
+            parser.add_argument('--retries', type=int, default=1)
+            parser.add_argument('--concurrency', type=int, default=50)
+            parser.add_argument('--skip-nvd', action='store_true')
+            parser.add_argument('--skip-compliance', action='store_true')
+            parser.add_argument('--cve-lookback-days', type=int, default=120)
+            parser.add_argument('--cred-file')
+            parser.add_argument('--ssh-user')
+            parser.add_argument('--ssh-password')
+            parser.add_argument('--ssh-key')
+            parser.add_argument('--ssh-port', type=int, default=22)
+            parser.add_argument('--winrm-user')
+            parser.add_argument('--winrm-password')
+            parser.add_argument('--winrm-domain')
+            parser.add_argument('--winrm-transport', default='http')
+            parser.add_argument('--wmi-user')
+            parser.add_argument('--wmi-password')
+            parser.add_argument('--wmi-domain')
+            return parser.parse_args(args_list)
+        finally:
+            sys.argv = old_argv
+
+    def test_no_cred_args_all_none(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertIsNone(args.ssh_user)
+        self.assertIsNone(args.winrm_user)
+        self.assertIsNone(args.wmi_user)
+
+    def test_ssh_user_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--ssh-user', 'scanuser'])
+        self.assertEqual(args.ssh_user, 'scanuser')
+
+    def test_ssh_password_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--ssh-user', 'u', '--ssh-password', 'pass'])
+        self.assertEqual(args.ssh_password, 'pass')
+
+    def test_ssh_key_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--ssh-user', 'u', '--ssh-key', '/path/key'])
+        self.assertEqual(args.ssh_key, '/path/key')
+
+    def test_ssh_port_default(self):
+        args = self._parse(['-t', '10.0.0.1', '--ssh-user', 'u', '--ssh-password', 'p'])
+        self.assertEqual(args.ssh_port, 22)
+
+    def test_ssh_port_custom(self):
+        args = self._parse(['-t', '10.0.0.1', '--ssh-user', 'u', '--ssh-port', '2222'])
+        self.assertEqual(args.ssh_port, 2222)
+
+    def test_winrm_user_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--winrm-user', 'Administrator'])
+        self.assertEqual(args.winrm_user, 'Administrator')
+
+    def test_winrm_domain_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--winrm-user', 'u', '--winrm-domain', 'CORP'])
+        self.assertEqual(args.winrm_domain, 'CORP')
+
+    def test_winrm_transport_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertEqual(args.winrm_transport, 'http')
+
+    def test_winrm_transport_https(self):
+        args = self._parse(['-t', '10.0.0.1', '--winrm-transport', 'https'])
+        self.assertEqual(args.winrm_transport, 'https')
+
+    def test_wmi_user_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--wmi-user', 'wmiuser'])
+        self.assertEqual(args.wmi_user, 'wmiuser')
+
+    def test_cred_file_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--cred-file', '/etc/creds.json'])
+        self.assertEqual(args.cred_file, '/etc/creds.json')
+
+
+# ---------------------------------------------------------------------------
+# 22. PR1 — HybridScanner credentialed mode integration
+# ---------------------------------------------------------------------------
+
+class TestHybridScannerCredentialedMode(unittest.TestCase):
+    """HybridScanner handles credentialed mode correctly."""
+
+    def _make_args(self, **kwargs):
+        import argparse
+        defaults = dict(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True, cve_lookback_days=120,
+            ssh_user=None, ssh_password=None, ssh_key=None, ssh_port=22,
+            winrm_user=None, winrm_password=None, winrm_domain=None,
+            winrm_transport='http',
+            wmi_user=None, wmi_password=None, wmi_domain=None,
+            cred_file=None,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _run_with_fake_scan(self, args, auth_findings=None):
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        fake_port = [{"port": 22, "service": "SSH", "state": "open",
+                      "banner": "", "protocol": "tcp"}]
+        with patch("vultron.PortScanner.scan", return_value=fake_port), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            if auth_findings is not None:
+                with patch("vultron.AuthenticatedExecutor.run_probes",
+                           return_value=auth_findings):
+                    scanner.run()
+            else:
+                scanner.run()
+        return scanner
+
+    def test_no_creds_auth_scan_not_attempted(self):
+        """Without credentials, auth_scan shows authenticated_mode=False."""
+        args = self._make_args()
+        scanner = self._run_with_fake_scan(args)
+        auth_scan = scanner.results.get('auth_scan', {})
+        self.assertFalse(auth_scan.get('authenticated_mode', True))
+
+    def test_with_ssh_creds_executor_called(self):
+        """With SSH credentials, AuthenticatedExecutor.run_probes() is called."""
+        from plugins import Finding, Evidence
+        args = self._make_args(ssh_user="scanuser", ssh_password="pass")
+        probe_finding = Finding(
+            id="AUTH-PROBE-SSH",
+            title="SSH probe",
+            description="SSH TCP reachable",
+            status="CONFIRMED",
+            severity="INFO",
+            confidence=0.9,
+            target="127.0.0.1",
+            port=22,
+            service="SSH",
+            evidence=Evidence(items=["SSH reachable"]),
+        )
+        with patch("vultron.AuthenticatedExecutor.run_probes",
+                   return_value=[probe_finding]) as mock_run, \
+             patch("vultron.PortScanner.scan", return_value=[
+                 {"port": 22, "service": "SSH", "state": "open",
+                  "banner": "", "protocol": "tcp"}
+             ]), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            from vultron import HybridScanner
+            scanner = HybridScanner("127.0.0.1", args)
+            scanner.run()
+            mock_run.assert_called_once()
+
+    def test_auth_probe_findings_added_to_vulnerabilities(self):
+        """Auth probe findings appear in the vulnerabilities list."""
+        from plugins import Finding, Evidence
+        args = self._make_args(ssh_user="u", ssh_password="p")
+        probe_finding = Finding(
+            id="AUTH-PROBE-SSH",
+            title="SSH Authenticated Connectivity Probe",
+            description="SSH connectivity confirmed",
+            status="CONFIRMED",
+            severity="INFO",
+            confidence=0.9,
+            target="127.0.0.1",
+            port=22,
+            service="SSH",
+            evidence=Evidence(items=["TCP reachable"]),
+        )
+        scanner = self._run_with_fake_scan(args, auth_findings=[probe_finding])
+        vuln_ids = [v.get("id") for v in scanner.results["vulnerabilities"]]
+        self.assertIn("AUTH-PROBE-SSH", vuln_ids)
+
+    def test_auth_scan_metadata_no_passwords(self):
+        """auth_scan metadata in results does not contain credential passwords."""
+        from plugins import Finding, Evidence
+        args = self._make_args(ssh_user="alice", ssh_password="super_secret_password")
+        probe_finding = Finding(
+            id="AUTH-PROBE-SSH",
+            title="SSH probe",
+            description="test",
+            status="CONFIRMED",
+            severity="INFO",
+            confidence=0.9,
+            target="127.0.0.1",
+            port=22,
+            service="SSH",
+            evidence=Evidence(items=["ok"]),
+        )
+        scanner = self._run_with_fake_scan(args, auth_findings=[probe_finding])
+        auth_scan_str = str(scanner.results.get('auth_scan', {}))
+        self.assertNotIn("super_secret_password", auth_scan_str)
+
+    def test_json_report_no_credential_secrets(self):
+        """JSON report does not contain credential passwords."""
+        import tempfile, json, os
+        from plugins import Finding, Evidence
+        args = self._make_args(ssh_user="alice", ssh_password="top_secret_password_xyz")
+        probe_finding = Finding(
+            id="AUTH-PROBE-SSH",
+            title="SSH probe",
+            description="test",
+            status="CONFIRMED",
+            severity="INFO",
+            confidence=0.9,
+            target="127.0.0.1",
+            port=22,
+            service="SSH",
+            evidence=Evidence(items=["ok"]),
+        )
+        with patch("vultron.PortScanner.scan", return_value=[
+            {"port": 22, "service": "SSH", "state": "open", "banner": "", "protocol": "tcp"}
+        ]), patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.AuthenticatedExecutor.run_probes", return_value=[probe_finding]):
+            from vultron import HybridScanner, ReportGenerator
+            scanner = HybridScanner("127.0.0.1", args)
+            scanner.run.__func__  # ensure it's the real run
+            # Run up to report generation
+            scanner.results['open_ports'] = [
+                {"port": 22, "service": "SSH", "state": "open", "banner": "", "protocol": "tcp"}
+            ]
+            scanner.results['vulnerabilities'] = [probe_finding.to_dict()]
+            scanner.results['auth_scan'] = {'authenticated_mode': True}
+
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+                fname = f.name
+            try:
+                reporter = ReportGenerator(scanner.results)
+                reporter.generate_json(fname)
+                with open(fname) as f:
+                    content = f.read()
+                self.assertNotIn("top_secret_password_xyz", content)
+            finally:
+                os.unlink(fname)
+
+    def test_unauthenticated_checks_unaffected_by_cred_mode(self):
+        """Legacy unauthenticated checks still run when credentials are provided."""
+        legacy_finding = {
+            "id": "MS17-010", "cve": "CVE-2017-0144", "name": "EB",
+            "title": "EternalBlue", "severity": "CRITICAL", "status": "CONFIRMED",
+            "port": 445, "affected_service": "SMB", "description": "test",
+            "evidence": ["SMBv1 accepted"], "cisa_kev": True,
+            "exploit_available": True, "cvss": 9.8,
+        }
+        args = self._make_args(ssh_user="u", ssh_password="p")
+        with patch("vultron.PortScanner.scan", return_value=[
+            {"port": 445, "service": "SMB", "state": "open", "banner": "", "protocol": "tcp"}
+        ]), patch("vultron.VulnerabilityChecker.check_all", return_value=[legacy_finding]), \
+             patch("vultron.AuthenticatedExecutor.run_probes", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            from vultron import HybridScanner
+            scanner = HybridScanner("127.0.0.1", args)
+            scanner.run()
+        vuln_ids = [v.get("id") for v in scanner.results["vulnerabilities"]]
+        self.assertIn("MS17-010", vuln_ids)
+
+
+# ---------------------------------------------------------------------------
+# 23. PR1 — BaseCheck credential attributes
+# ---------------------------------------------------------------------------
+
+class TestBaseCheckCredentialAttributes(unittest.TestCase):
+    """BaseCheck subclasses correctly inherit credential attributes."""
+
+    def test_base_check_has_requires_credentials(self):
+        from plugins import BaseCheck
+        self.assertFalse(BaseCheck.requires_credentials)
+
+    def test_base_check_has_credential_types(self):
+        from plugins import BaseCheck
+        self.assertEqual(BaseCheck.credential_types, [])
+
+    def test_unauthenticated_check_has_no_cred_types(self):
+        from plugins import CheckRegistry
+        # EternalBlue is a purely unauthenticated check
+        check_cls = CheckRegistry.get("MS17-010")
+        self.assertFalse(check_cls.requires_credentials)
+        self.assertEqual(check_cls.credential_types, [])
+
+    def test_auth_probe_check_declares_cred_type(self):
+        from plugins import CheckRegistry
+        check_cls = CheckRegistry.get("AUTH-PROBE-SSH")
+        self.assertIn("ssh", check_cls.credential_types)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

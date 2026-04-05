@@ -59,7 +59,17 @@ try:
         sys.path.insert(0, _SCRIPT_DIR)
 
     import plugins.checks  # noqa: F401 — auto-registers all built-in checks
-    from plugins import CheckRegistry, Finding, ScanMetadata
+    from plugins import (
+        CheckRegistry,
+        Finding,
+        ScanMetadata,
+        CredentialSet,
+        SSHCredential,
+        WinRMCredential,
+        WMICredential,
+        build_default_provider,
+        AuthenticatedExecutor,
+    )
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -1584,8 +1594,49 @@ class HybridScanner:
             'open_ports': [],
             'vulnerabilities': [],
             'nvd_intelligence': {},
-            'compliance': {}
+            'compliance': {},
+            'auth_scan': {},
         }
+
+    def _build_credential_set(self):
+        """Build a CredentialSet from CLI args.  Returns None if not applicable."""
+        if not _HAS_PLUGINS:
+            return None
+        args = self.args
+        ssh_user = getattr(args, 'ssh_user', None)
+        winrm_user = getattr(args, 'winrm_user', None)
+        wmi_user = getattr(args, 'wmi_user', None)
+        if not any([ssh_user, winrm_user, wmi_user]):
+            return None
+
+        ssh_cred = None
+        if ssh_user:
+            ssh_cred = SSHCredential(
+                username=ssh_user,
+                password=getattr(args, 'ssh_password', None) or None,
+                key_path=getattr(args, 'ssh_key', None) or None,
+                port=getattr(args, 'ssh_port', 22) or 22,
+            )
+
+        winrm_cred = None
+        if winrm_user:
+            winrm_transport = getattr(args, 'winrm_transport', 'http') or 'http'
+            winrm_cred = WinRMCredential(
+                username=winrm_user,
+                password=getattr(args, 'winrm_password', None) or None,
+                domain=getattr(args, 'winrm_domain', None) or None,
+                transport=winrm_transport,
+            )
+
+        wmi_cred = None
+        if wmi_user:
+            wmi_cred = WMICredential(
+                username=wmi_user,
+                password=getattr(args, 'wmi_password', None) or None,
+                domain=getattr(args, 'wmi_domain', None) or None,
+            )
+
+        return CredentialSet(ssh=ssh_cred, winrm=winrm_cred, wmi=wmi_cred)
 
     def run(self):
         """Execute full scan"""
@@ -1594,6 +1645,10 @@ class HybridScanner:
 
         args = self.args
         scan_mode = getattr(args, 'scan_mode', 'common')
+
+        # Build credential set from CLI args (if any)
+        credential_set = self._build_credential_set()
+        credentialed_mode = credential_set is not None and not credential_set.is_empty()
 
         # Capture scan start time for metadata
         if _HAS_PLUGINS:
@@ -1604,6 +1659,7 @@ class HybridScanner:
                     'retries': getattr(args, 'retries', 1),
                     'concurrency': getattr(args, 'concurrency', 50),
                     'mode': scan_mode,
+                    'credentialed': credentialed_mode,
                 },
             )
 
@@ -1645,6 +1701,48 @@ class HybridScanner:
             ]
         else:
             self.results['vulnerabilities'] = legacy_findings
+
+        # [PHASE 2b] Credentialed Scanning (PR1) — runs only when creds are provided
+        if _HAS_PLUGINS and credentialed_mode and credential_set is not None:
+            print(Colors.header("[PHASE 2b] CREDENTIALED SCANNING"))
+            print(Colors.info("Running authenticated connectivity probes...\n"))
+            try:
+                credential_set.validate_all()
+                executor = AuthenticatedExecutor(
+                    target=self.target,
+                    credential_set=credential_set,
+                    timeout=getattr(args, 'timeout', 5.0),
+                )
+                auth_findings = executor.run_probes()
+                ctx = executor.context
+                # Store probe metadata (no secrets) in results
+                self.results['auth_scan'] = ctx.to_metadata_dict()
+                # Append auth probe findings to the unified findings list
+                self.results['vulnerabilities'].extend(
+                    f.to_dict() for f in auth_findings
+                )
+                if ctx.authenticated_mode:
+                    print(Colors.success(
+                        f"  Authenticated scan completed: "
+                        f"{sum(1 for r in ctx.probe_results.values() if r.success)} "
+                        f"of {len(ctx.probe_results)} probes succeeded\n"
+                    ))
+                else:
+                    print(Colors.warning(
+                        "  No authentication probes succeeded — "
+                        "check credentials and target availability\n"
+                    ))
+            except Exception as exc:
+                from plugins.secrets import redact_string
+                print(Colors.warning(
+                    f"  Credentialed scan error: {redact_string(str(exc))}\n"
+                ))
+                self.results['auth_scan'] = {
+                    'authenticated_mode': False,
+                    'error': 'Credentialed scan did not complete; see console output.',
+                }
+        else:
+            self.results['auth_scan'] = {'authenticated_mode': False}
 
         # [PHASE 3] NVD Intelligence (optional)
         if not getattr(args, 'skip_nvd', False):
@@ -1691,6 +1789,12 @@ class HybridScanner:
         print(Colors.warning(f"Potential (unverified): {counts['potential']}"))
         print(Colors.warning(f"Inconclusive (manual review): {counts['inconclusive']}"))
         print(Colors.warning(f"CISA KEV (confirmed): {counts['kev_confirmed']}"))
+        auth_summary = self.results.get('auth_scan', {})
+        if credentialed_mode:
+            auth_status = "yes" if auth_summary.get('authenticated_mode') else "no"
+            print(Colors.info(f"Authenticated Scan: attempted — succeeded: {auth_status}"))
+        else:
+            print(Colors.info("Authenticated Scan: not attempted (no credentials provided)"))
         print(Colors.success(f"\nReports: {html_file}, {json_file}\n"))
 
 
@@ -1708,6 +1812,13 @@ Examples:
   python vultron.py -t 10.0.0.50 --skip-compliance
   python vultron.py -t 192.168.1.100 --cve-lookback-days 30
 
+  # Credentialed scanning (authorized use only):
+  python vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-password '<pass>'
+  python vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-key /path/to/id_rsa
+  python vultron.py -t 192.168.1.100 --winrm-user Administrator --winrm-password '<pass>'
+  python vultron.py -t 192.168.1.100 --wmi-user Administrator --wmi-password '<pass>'
+  python vultron.py -t 192.168.1.100 --cred-file /secure/path/creds.json
+
 Scan modes:
   common   Scan 22 well-known ports (fast, default)
   top1000  Scan ~1000 most frequently open ports (includes RPC/high-dyn ports)
@@ -1718,6 +1829,14 @@ Protocol checks (triggered automatically on open ports):
   FTP (21)    Anonymous login probe — CONFIRMED / POTENTIAL / INCONCLUSIVE
   Telnet (23) Banner collection + cleartext exposure — POTENTIAL / INCONCLUSIVE
   SNMP (161)  Default community string probe (public/private) — CONFIRMED / INCONCLUSIVE
+
+Credentialed scanning (all modes):
+  SSH probe   TCP reachability + optional authenticated command execution
+  WinRM probe TCP reachability + optional authenticated session check
+  WMI probe   DCOM reachability + optional authenticated namespace check
+
+  WARNING: Only use credentialed scanning on systems you are authorised to test.
+  Credentials are never written to reports or log files.
 
 Capabilities:
   TCP port discovery, service fingerprinting, and active vulnerability checks.
@@ -1748,6 +1867,42 @@ Capabilities:
                         help='Days to look back for recent CVEs (default: 120, range: 1–3650)')
     parser.add_argument('--version', action='version', version=f'Vultron {VERSION}')
 
+    # -- Credentialed scanning options (PR1) --------------------------------
+    cred_group = parser.add_argument_group(
+        'Credentialed scanning (authorized use only)',
+        'Provide credentials to enable authenticated probes. '
+        'Credentials are never written to reports or log output.',
+    )
+    cred_group.add_argument('--cred-file', metavar='FILE',
+                            help='Path to a JSON credential file. '
+                                 'See documentation for the expected format.')
+    # SSH
+    cred_group.add_argument('--ssh-user', metavar='USERNAME',
+                            help='SSH username for credentialed SSH probe')
+    cred_group.add_argument('--ssh-password', metavar='PASSWORD',
+                            help='SSH password (use --ssh-key for key-based auth)')
+    cred_group.add_argument('--ssh-key', metavar='PATH',
+                            help='Path to SSH private key file')
+    cred_group.add_argument('--ssh-port', type=int, default=22, metavar='PORT',
+                            help='SSH port (default: 22)')
+    # WinRM
+    cred_group.add_argument('--winrm-user', metavar='USERNAME',
+                            help='WinRM username for credentialed WinRM probe')
+    cred_group.add_argument('--winrm-password', metavar='PASSWORD',
+                            help='WinRM password')
+    cred_group.add_argument('--winrm-domain', metavar='DOMAIN',
+                            help='Active Directory domain for WinRM authentication')
+    cred_group.add_argument('--winrm-transport',
+                            choices=['http', 'https'], default='http',
+                            help='WinRM transport (default: http)')
+    # WMI
+    cred_group.add_argument('--wmi-user', metavar='USERNAME',
+                            help='WMI username for credentialed WMI probe')
+    cred_group.add_argument('--wmi-password', metavar='PASSWORD',
+                            help='WMI password')
+    cred_group.add_argument('--wmi-domain', metavar='DOMAIN',
+                            help='Active Directory domain for WMI authentication')
+
     args = parser.parse_args()
 
     if args.scan_mode == 'custom' and not args.ports:
@@ -1758,6 +1913,8 @@ Capabilities:
     if args.cve_lookback_days > 3650:
         parser.error("--cve-lookback-days must be 3650 or less (got "
                      f"{args.cve_lookback_days})")
+    if getattr(args, 'ssh_password', None) and getattr(args, 'ssh_key', None):
+        parser.error("--ssh-password and --ssh-key are mutually exclusive")
 
     scanner = HybridScanner(args.target, args)
     scanner.run()
