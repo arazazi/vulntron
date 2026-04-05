@@ -2284,6 +2284,570 @@ class TestBaseCheckCredentialAttributes(unittest.TestCase):
         self.assertIn("ssh", check_cls.credential_types)
 
 
+# ---------------------------------------------------------------------------
+# 24. PR2 — UDP scanner state classification
+# ---------------------------------------------------------------------------
+
+class TestUDPScannerStateClassification(unittest.TestCase):
+    """UDPScanner.scan_port() classifies port state correctly."""
+
+    def _scanner(self, **kwargs):
+        from plugins.udp_scanner import UDPScanner
+        return UDPScanner("127.0.0.1", ports=[53, 123, 161], **kwargs)
+
+    def test_response_received_state_is_open(self):
+        """When a response is received, state must be 'open'."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[53])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.return_value = (b'\x137\x81\x80', ('127.0.0.1', 53))
+            result = scanner.scan_port(53)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['state'], 'open')
+        self.assertEqual(result['protocol'], 'udp')
+        self.assertEqual(result['port'], 53)
+
+    def test_timeout_state_is_open_filtered(self):
+        """No response (timeout) must produce 'open|filtered' state."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[123])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout("timed out")
+            result = scanner.scan_port(123)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['state'], 'open|filtered')
+        self.assertEqual(result['protocol'], 'udp')
+
+    def test_icmp_unreachable_returns_none(self):
+        """ICMP port-unreachable (ConnectionRefusedError) → None (closed)."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[9999])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.sendto.side_effect = ConnectionRefusedError("port unreachable")
+            result = scanner.scan_port(9999)
+        self.assertIsNone(result)
+
+    def test_open_result_has_required_keys(self):
+        """Open port result contains port, state, service, banner, protocol."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[161])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.return_value = (b'\x30\x10', ('127.0.0.1', 161))
+            result = scanner.scan_port(161)
+        self.assertIsNotNone(result)
+        for key in ('port', 'state', 'service', 'banner', 'protocol'):
+            self.assertIn(key, result, f"Missing key '{key}' in UDP result")
+
+    def test_service_name_assigned_for_known_port(self):
+        """Known UDP ports get the correct service name."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[53])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout()
+            result = scanner.scan_port(53)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['service'], 'DNS')
+
+    def test_unknown_port_gets_fallback_service_name(self):
+        """Unknown UDP ports get 'Unknown-<port>' service name."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[54321])
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.recvfrom.side_effect = socket.timeout()
+            result = scanner.scan_port(54321)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['service'], 'Unknown-54321')
+
+    def test_scan_returns_only_non_closed_ports(self):
+        """scan() excludes ports classified as closed (None result)."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[53, 123])
+        call_count = [0]
+
+        def mock_scan_port(port):
+            call_count[0] += 1
+            if port == 53:
+                return {'port': 53, 'state': 'open|filtered',
+                        'service': 'DNS', 'banner': '', 'protocol': 'udp'}
+            return None  # 123 is closed
+
+        scanner.scan_port = mock_scan_port
+        results = scanner.scan()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['port'], 53)
+
+    def test_scan_results_sorted_by_port(self):
+        """scan() returns results sorted by port number."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[161, 53, 123])
+
+        def mock_scan_port(port):
+            return {'port': port, 'state': 'open|filtered',
+                    'service': 'test', 'banner': '', 'protocol': 'udp'}
+
+        scanner.scan_port = mock_scan_port
+        results = scanner.scan()
+        ports = [r['port'] for r in results]
+        self.assertEqual(ports, sorted(ports))
+
+    def test_oserror_retried_and_returns_none(self):
+        """OSError is retried; after all retries exhausted returns None."""
+        from plugins.udp_scanner import UDPScanner
+        scanner = UDPScanner("127.0.0.1", ports=[53], retries=2)
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.sendto.side_effect = OSError("network error")
+            result = scanner.scan_port(53)
+        self.assertIsNone(result)
+
+    def test_default_ports_is_common_udp_set(self):
+        """UDPScanner without explicit ports uses UDP_DEFAULT_PORTS."""
+        from plugins.udp_scanner import UDPScanner, UDP_DEFAULT_PORTS
+        scanner = UDPScanner("127.0.0.1")
+        self.assertEqual(sorted(scanner.ports), sorted(UDP_DEFAULT_PORTS))
+
+
+# ---------------------------------------------------------------------------
+# 25. PR2 — UDP probe builders
+# ---------------------------------------------------------------------------
+
+class TestUDPProbeBuilders(unittest.TestCase):
+    """Protocol-aware probe builder functions produce valid payloads."""
+
+    def test_dns_probe_is_bytes(self):
+        from plugins.udp_scanner import _build_dns_probe
+        pkt = _build_dns_probe()
+        self.assertIsInstance(pkt, bytes)
+        self.assertGreater(len(pkt), 12)  # at minimum a DNS header
+
+    def test_dns_probe_has_correct_transaction_id(self):
+        from plugins.udp_scanner import _build_dns_probe
+        import struct
+        pkt = _build_dns_probe()
+        tx_id = struct.unpack('>H', pkt[:2])[0]
+        self.assertEqual(tx_id, 0x1337)
+
+    def test_dns_probe_contains_version_bind(self):
+        from plugins.udp_scanner import _build_dns_probe
+        pkt = _build_dns_probe()
+        self.assertIn(b'version', pkt)
+
+    def test_ntp_probe_is_48_bytes(self):
+        from plugins.udp_scanner import _build_ntp_probe
+        pkt = _build_ntp_probe()
+        self.assertEqual(len(pkt), 48)
+
+    def test_ntp_probe_first_byte_is_0x1b(self):
+        from plugins.udp_scanner import _build_ntp_probe
+        pkt = _build_ntp_probe()
+        self.assertEqual(pkt[0], 0x1B)
+
+    def test_snmp_probe_starts_with_sequence_tag(self):
+        from plugins.udp_scanner import _build_snmp_probe
+        pkt = _build_snmp_probe('public')
+        self.assertEqual(pkt[0], 0x30)
+
+    def test_snmp_probe_contains_community_string(self):
+        from plugins.udp_scanner import _build_snmp_probe
+        pkt = _build_snmp_probe('public')
+        self.assertIn(b'public', pkt)
+
+    def test_get_udp_probe_returns_dns_for_port_53(self):
+        from plugins.udp_scanner import get_udp_probe, _build_dns_probe
+        self.assertEqual(get_udp_probe(53), _build_dns_probe())
+
+    def test_get_udp_probe_returns_ntp_for_port_123(self):
+        from plugins.udp_scanner import get_udp_probe, _build_ntp_probe
+        self.assertEqual(get_udp_probe(123), _build_ntp_probe())
+
+    def test_get_udp_probe_returns_snmp_for_port_161(self):
+        from plugins.udp_scanner import get_udp_probe, _build_snmp_probe
+        self.assertEqual(get_udp_probe(161), _build_snmp_probe())
+
+    def test_get_udp_probe_generic_fallback(self):
+        """Unknown port gets a generic non-empty probe."""
+        from plugins.udp_scanner import get_udp_probe
+        pkt = get_udp_probe(9999)
+        self.assertIsInstance(pkt, bytes)
+        self.assertGreater(len(pkt), 0)
+
+
+# ---------------------------------------------------------------------------
+# 26. PR2 — Service fingerprinting
+# ---------------------------------------------------------------------------
+
+class TestServiceFingerprinting(unittest.TestCase):
+    """fingerprint_banner() and normalize_service_name() behave correctly."""
+
+    def test_ssh_banner_identifies_ssh_with_version(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('SSH-2.0-OpenSSH_8.9p1', 22, 'tcp', 'SSH')
+        self.assertEqual(fp.service, 'SSH')
+        self.assertEqual(fp.version, 'OpenSSH_8.9p1')
+        self.assertAlmostEqual(fp.confidence, 0.9)
+
+    def test_http_banner_identifies_http(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('HTTP/1.1 200 OK\r\nServer: Apache', 80, 'tcp', 'HTTP')
+        self.assertEqual(fp.service, 'HTTP')
+        self.assertAlmostEqual(fp.confidence, 0.9)
+
+    def test_ftp_banner_identifies_ftp(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('220 FTP Server Ready', 21, 'tcp', 'FTP')
+        self.assertEqual(fp.service, 'FTP')
+        self.assertAlmostEqual(fp.confidence, 0.9)
+
+    def test_vnc_banner_identifies_vnc_with_version(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('RFB 003.008\n', 5900, 'tcp', 'VNC')
+        self.assertEqual(fp.service, 'VNC')
+        self.assertEqual(fp.version, '003.008')
+
+    def test_empty_banner_falls_back_to_port_lookup(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('', 22, 'tcp', 'SSH')
+        self.assertEqual(fp.service, 'SSH')
+        self.assertAlmostEqual(fp.confidence, 0.5)
+
+    def test_no_match_gives_unknown_service(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('', 54321, 'tcp', None)
+        self.assertTrue(fp.service.startswith('Unknown'))
+        self.assertAlmostEqual(fp.confidence, 0.2)
+
+    def test_udp_protocol_preserved(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('', 161, 'udp', 'SNMP')
+        self.assertEqual(fp.protocol, 'udp')
+
+    def test_fingerprint_to_dict_has_required_keys(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('SSH-2.0-OpenSSH_8.9', 22, 'tcp', 'SSH')
+        d = fp.to_dict()
+        for key in ('service', 'version', 'protocol', 'confidence', 'evidence'):
+            self.assertIn(key, d, f"Missing key '{key}' in fingerprint dict")
+
+    def test_fingerprint_evidence_non_empty_on_banner_match(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('SSH-2.0-OpenSSH_8.9', 22, 'tcp', 'SSH')
+        self.assertTrue(len(fp.evidence) > 0)
+
+    def test_normalize_http_proxy(self):
+        from plugins.fingerprint import normalize_service_name
+        self.assertEqual(normalize_service_name('http-proxy'), 'HTTP')
+
+    def test_normalize_https_alt(self):
+        from plugins.fingerprint import normalize_service_name
+        self.assertEqual(normalize_service_name('https-alt'), 'HTTPS')
+
+    def test_normalize_ms_rpc_dyn(self):
+        from plugins.fingerprint import normalize_service_name
+        self.assertEqual(normalize_service_name('ms-rpc-dyn'), 'MS-RPC')
+
+    def test_normalize_unknown_uppercased(self):
+        from plugins.fingerprint import normalize_service_name
+        self.assertEqual(normalize_service_name('ssh'), 'SSH')
+
+    def test_normalize_preserves_case_for_unknowns(self):
+        from plugins.fingerprint import normalize_service_name
+        self.assertEqual(normalize_service_name('custom-svc'), 'CUSTOM-SVC')
+
+    def test_mysql_banner_identifies_mysql(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('mysql_native_password\x00', 3306, 'tcp', 'MySQL')
+        self.assertEqual(fp.service, 'MySQL')
+
+    def test_redis_banner_identifies_redis(self):
+        from plugins.fingerprint import fingerprint_banner
+        fp = fingerprint_banner('-NOAUTH Authentication required', 6379, 'tcp', 'Redis')
+        self.assertEqual(fp.service, 'Redis')
+
+
+# ---------------------------------------------------------------------------
+# 27. PR2 — CLI parsing for UDP options
+# ---------------------------------------------------------------------------
+
+class TestCLIUDPParsing(unittest.TestCase):
+    """CLI parser correctly handles UDP scanning options."""
+
+    def _parse(self, args_list):
+        import argparse as ap
+        parser = ap.ArgumentParser()
+        parser.add_argument('-t', '--target', required=True)
+        parser.add_argument('--scan-mode', default='common')
+        parser.add_argument('--ports')
+        parser.add_argument('--timeout', type=float, default=1.0)
+        parser.add_argument('--retries', type=int, default=1)
+        parser.add_argument('--concurrency', type=int, default=50)
+        parser.add_argument('--skip-nvd', action='store_true')
+        parser.add_argument('--skip-compliance', action='store_true')
+        parser.add_argument('--cve-lookback-days', type=int, default=120)
+        parser.add_argument('--protocol', choices=['tcp', 'udp', 'both'], default='tcp')
+        parser.add_argument('--udp-timeout', type=float, default=2.0)
+        parser.add_argument('--udp-retries', type=int, default=2)
+        parser.add_argument('--udp-ports')
+        # Credential args (needed for parser completeness)
+        parser.add_argument('--cred-file')
+        parser.add_argument('--ssh-user')
+        parser.add_argument('--ssh-password')
+        parser.add_argument('--ssh-key')
+        parser.add_argument('--ssh-port', type=int, default=22)
+        parser.add_argument('--winrm-user')
+        parser.add_argument('--winrm-password')
+        parser.add_argument('--winrm-domain')
+        parser.add_argument('--winrm-transport', default='http')
+        parser.add_argument('--wmi-user')
+        parser.add_argument('--wmi-password')
+        parser.add_argument('--wmi-domain')
+        return parser.parse_args(args_list)
+
+    def test_protocol_default_is_tcp(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertEqual(args.protocol, 'tcp')
+
+    def test_protocol_udp_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--protocol', 'udp'])
+        self.assertEqual(args.protocol, 'udp')
+
+    def test_protocol_both_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--protocol', 'both'])
+        self.assertEqual(args.protocol, 'both')
+
+    def test_udp_timeout_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertAlmostEqual(args.udp_timeout, 2.0)
+
+    def test_udp_timeout_custom(self):
+        args = self._parse(['-t', '10.0.0.1', '--udp-timeout', '3.5'])
+        self.assertAlmostEqual(args.udp_timeout, 3.5)
+
+    def test_udp_retries_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertEqual(args.udp_retries, 2)
+
+    def test_udp_retries_custom(self):
+        args = self._parse(['-t', '10.0.0.1', '--udp-retries', '4'])
+        self.assertEqual(args.udp_retries, 4)
+
+    def test_udp_ports_default_is_none(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertIsNone(args.udp_ports)
+
+    def test_udp_ports_parsed(self):
+        args = self._parse(['-t', '10.0.0.1', '--udp-ports', '53,123,161'])
+        self.assertEqual(args.udp_ports, '53,123,161')
+
+
+# ---------------------------------------------------------------------------
+# 28. PR2 — HybridScanner UDP pipeline integration
+# ---------------------------------------------------------------------------
+
+class TestHybridScannerUDPIntegration(unittest.TestCase):
+    """HybridScanner integrates UDP results correctly."""
+
+    def _make_args(self, **kwargs):
+        import argparse
+        defaults = dict(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True, cve_lookback_days=120,
+            protocol='tcp', udp_timeout=2.0, udp_retries=2, udp_ports=None,
+            ssh_user=None, ssh_password=None, ssh_key=None, ssh_port=22,
+            winrm_user=None, winrm_password=None, winrm_domain=None,
+            winrm_transport='http',
+            wmi_user=None, wmi_password=None, wmi_domain=None,
+            cred_file=None,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _fake_udp_ports(self):
+        return [
+            {'port': 53, 'state': 'open', 'service': 'DNS',
+             'banner': '', 'protocol': 'udp'},
+            {'port': 161, 'state': 'open|filtered', 'service': 'SNMP',
+             'banner': '', 'protocol': 'udp'},
+        ]
+
+    def _fake_tcp_ports(self):
+        return [
+            {'port': 80, 'state': 'open', 'service': 'HTTP',
+             'banner': '', 'protocol': 'tcp'},
+        ]
+
+    def test_udp_only_mode_does_not_run_tcp_scan(self):
+        """When protocol=udp, TCP port scan must not be called."""
+        args = self._make_args(protocol='udp')
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        with patch("vultron.PortScanner.scan") as mock_tcp, \
+             patch("vultron.UDPScanner.scan", return_value=self._fake_udp_ports()), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+        mock_tcp.assert_not_called()
+
+    def test_udp_results_stored_in_udp_ports(self):
+        """UDP scan results appear in results['udp_ports']."""
+        args = self._make_args(protocol='udp')
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        fake_udp = self._fake_udp_ports()
+        with patch("vultron.UDPScanner.scan", return_value=fake_udp), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+        self.assertEqual(scanner.results['udp_ports'], fake_udp)
+
+    def test_both_mode_populates_both_open_ports_and_udp_ports(self):
+        """protocol=both fills open_ports (TCP) and udp_ports (UDP)."""
+        args = self._make_args(protocol='both')
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        fake_tcp = self._fake_tcp_ports()
+        fake_udp = self._fake_udp_ports()
+        with patch("vultron.PortScanner.scan", return_value=fake_tcp), \
+             patch("vultron.UDPScanner.scan", return_value=fake_udp), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+        self.assertEqual(scanner.results['open_ports'], fake_tcp)
+        self.assertEqual(scanner.results['udp_ports'], fake_udp)
+
+    def test_tcp_only_mode_udp_ports_stays_empty(self):
+        """Default TCP mode leaves udp_ports empty."""
+        args = self._make_args(protocol='tcp')
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        fake_tcp = self._fake_tcp_ports()
+        with patch("vultron.PortScanner.scan", return_value=fake_tcp), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+        self.assertEqual(scanner.results['udp_ports'], [])
+
+    def test_scan_protocol_stored_in_results(self):
+        """results['scan_protocol'] matches the --protocol arg."""
+        for proto in ('tcp', 'udp', 'both'):
+            args = self._make_args(protocol=proto)
+            from vultron import HybridScanner
+            scanner = HybridScanner("127.0.0.1", args)
+            self.assertEqual(scanner.results['scan_protocol'], proto)
+
+    def test_udp_ports_in_json_report(self):
+        """JSON report includes udp_ports when UDP scan was run."""
+        import tempfile, json, os
+        args = self._make_args(protocol='udp')
+        from vultron import HybridScanner, ReportGenerator
+        scanner = HybridScanner("127.0.0.1", args)
+        scanner.results['udp_ports'] = self._fake_udp_ports()
+
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            fname = f.name
+        try:
+            reporter = ReportGenerator(scanner.results)
+            reporter.generate_json(fname)
+            with open(fname) as f:
+                data = json.load(f)
+            self.assertIn('udp_ports', data)
+            self.assertEqual(len(data['udp_ports']), 2)
+        finally:
+            os.unlink(fname)
+
+    def test_udp_scanner_timeout_and_retries_passed_from_args(self):
+        """UDPScanner is constructed with timeout/retries from CLI args."""
+        args = self._make_args(protocol='udp', udp_timeout=4.0, udp_retries=3)
+        from vultron import HybridScanner
+        scanner = HybridScanner("127.0.0.1", args)
+        captured = {}
+
+        original_init = __import__('plugins.udp_scanner', fromlist=['UDPScanner']).UDPScanner.__init__
+
+        def patched_init(self_inner, target, ports=None, timeout=2.0,
+                         retries=2, concurrency=30):
+            captured['timeout'] = timeout
+            captured['retries'] = retries
+            original_init(self_inner, target, ports=ports, timeout=timeout,
+                          retries=retries, concurrency=concurrency)
+
+        with patch("plugins.udp_scanner.UDPScanner.__init__", patched_init), \
+             patch("plugins.udp_scanner.UDPScanner.scan", return_value=[]), \
+             patch("vultron.VulnerabilityChecker.check_all", return_value=[]), \
+             patch("vultron.ReportGenerator.generate_html"), \
+             patch("vultron.ReportGenerator.generate_json"):
+            scanner.run()
+
+        self.assertAlmostEqual(captured.get('timeout', 0), 4.0)
+        self.assertEqual(captured.get('retries', 0), 3)
+
+
+# ---------------------------------------------------------------------------
+# 29. PR2 — TCP fingerprint enrichment in PortScanner
+# ---------------------------------------------------------------------------
+
+class TestTCPFingerprintEnrichment(unittest.TestCase):
+    """PortScanner.scan_port() adds fingerprint data when plugins are available."""
+
+    def test_scan_port_open_has_fingerprint_key(self):
+        """An open TCP port result contains a 'fingerprint' dict."""
+        scanner = PortScanner("127.0.0.1")
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect_ex.return_value = 0
+            mock_sock.recv.return_value = b'SSH-2.0-OpenSSH_8.9\r\n'
+            result = scanner.scan_port(22)
+
+        self.assertIsNotNone(result)
+        # fingerprint key present when _HAS_PLUGINS is True (plugins available)
+        import vultron
+        if vultron._HAS_PLUGINS:
+            self.assertIn('fingerprint', result)
+            fp = result['fingerprint']
+            for key in ('service', 'protocol', 'confidence'):
+                self.assertIn(key, fp)
+
+    def test_scan_port_result_has_protocol_tcp(self):
+        """TCP port scan results always carry protocol='tcp'."""
+        scanner = PortScanner("127.0.0.1")
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect_ex.return_value = 0
+            mock_sock.recv.return_value = b''
+            result = scanner.scan_port(80)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['protocol'], 'tcp')
+
+    def test_scan_port_closed_returns_none(self):
+        """Closed port (non-zero connect_ex) returns None, not a dict."""
+        scanner = PortScanner("127.0.0.1")
+        with patch('socket.socket') as mock_cls:
+            mock_sock = MagicMock()
+            mock_cls.return_value = mock_sock
+            mock_sock.connect_ex.return_value = 111  # ECONNREFUSED
+            result = scanner.scan_port(9999)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
