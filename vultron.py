@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0 - HYBRID ULTIMATE
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
- ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝   ╚╝
-REAL SCANNING + FULL FEATURES + PROFESSIONAL DASHBOARD
+ ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 
-Features:
-✓ REAL Port Scanning (Actual TCP connections)
-✓ REAL Vulnerability Detection (Active checks)
-✓ NVD CVE Intelligence
-✓ CISA KEV Detection
-✓ Compliance Assessment (PCI DSS, CIS)
-✓ Professional GitHub-style Dashboard
-✓ Cross-platform (Linux/Windows)
+Defensive vulnerability assessment and reporting tool for authorized environments.
 
-Author: Abdul Raza (APU - MSc Cybersecurity)
-Version: 4.0.0-HYBRID
+Capabilities:
+- TCP port discovery across configurable scan modes
+- Service fingerprinting via banner collection
+- Active vulnerability checks with evidence-based status (CONFIRMED / POTENTIAL / INCONCLUSIVE)
+- Protocol checks: FTP anonymous login, Telnet banner, SNMP community strings
+- CVE enrichment via NVD API with configurable lookback window
+- CISA Known Exploited Vulnerabilities (KEV) detection
+- Compliance assessment (PCI DSS)
+- HTML and JSON report generation
+
+Author: Azazi
+Version: 4.0.0
 """
 
 import sys
@@ -65,14 +67,14 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "4.0.0-HYBRID"
+VERSION = "4.0.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0  - HYBRID ULTIMATE
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
- ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝   ╚╝   REAL Scanning + Full Features
+ ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
-Version: {VERSION} | Author: Abdul Raza
+Version: {VERSION} | Author: Azazi
 {'='*90}
 """
 
@@ -1129,7 +1131,7 @@ class ReportGenerator:
         }
 
     def generate_html(self, filename: str):
-        """Generate professional GitHub-style HTML dashboard"""
+        """Generate HTML assessment report"""
         print(Colors.info(f"Generating professional HTML report: {filename}"))
 
         target = self.results.get('target', 'Unknown')
@@ -1545,8 +1547,8 @@ class ReportGenerator:
 
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.0 HYBRID - Professional Security Assessment</div>
-            <div>Author: Abdul Raza | Asia Pacific University (APU) | MSc Cybersecurity</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.0 - Security Assessment</div>
+            <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
     </div>
@@ -1694,7 +1696,7 @@ class HybridScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v4.0 HYBRID - Ultimate Security Scanner',
+        description='Vultron v4.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1717,16 +1719,10 @@ Protocol checks (triggered automatically on open ports):
   Telnet (23) Banner collection + cleartext exposure — POTENTIAL / INCONCLUSIVE
   SNMP (161)  Default community string probe (public/private) — CONFIRMED / INCONCLUSIVE
 
-Features:
-  ✓ REAL port scanning (actual TCP connections)
-  ✓ REAL vulnerability detection (active checks)
-  ✓ Status-aware findings: CONFIRMED / POTENTIAL / INCONCLUSIVE
-  ✓ FTP anonymous login, Telnet banner, SNMP community checks
-  ✓ Configurable CVE lookback period (--cve-lookback-days)
-  ✓ NVD CVE intelligence (with retry/backoff)
-  ✓ CISA KEV detection
-  ✓ Compliance assessment (PCI DSS)
-  ✓ Professional GitHub-style dashboard
+Capabilities:
+  TCP port discovery, service fingerprinting, and active vulnerability checks.
+  CVE enrichment via NVD API, CISA KEV detection, and compliance assessment (PCI DSS).
+  Outputs structured HTML and JSON reports with evidence-based findings.
         """
     )
 

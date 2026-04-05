@@ -9,7 +9,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.0.0--HYBRID-success.svg)]()
+[![Version](https://img.shields.io/badge/version-4.0.0-success.svg)]()
 
 </div>
 
@@ -295,7 +295,7 @@ pip install -r requirements.txt
 python3 vultron.py --version
 ```
 
-Expected output: `Vultron 4.0.0-HYBRID`
+Expected output: `Vultron 4.0.0`
 
 > **Note:** The tool's internal name is `Vultron`; the repository is hosted as `vulntron`. Both names refer to the same project.
 
@@ -437,7 +437,7 @@ The JSON report is written alongside the HTML report. Its top-level structure:
 {
   "target": "192.168.1.10",
   "timestamp": "2026-04-04T17:24:57.123456",
-  "scanner_version": "4.0.0-HYBRID",
+  "scanner_version": "4.0.0",
   "scan_mode": "common",
   "open_ports": [ ... ],
   "vulnerabilities": [ ... ],
@@ -720,7 +720,7 @@ SOFTWARE.
 
 ### Author
 
-**Abdul Raza** (MSc Cybersecurity) — original author and maintainer.
+**Azazi** — original author and maintainer.
 
 ### Acknowledgements
 
