@@ -1095,6 +1095,18 @@ class TestPipelineUnifiedFindings(unittest.TestCase):
         self.assertEqual(counts["potential"], 1)
         self.assertEqual(counts["kev_confirmed"], 1)
 
+    def test_scan_metadata_stored_even_when_no_open_ports(self):
+        """scan_metadata is stored in results even when port scan finds nothing."""
+        scanner = HybridScanner("127.0.0.1", self._make_args())
+        with patch("vultron.PortScanner.scan", return_value=[]):
+            scanner.run()
+        # scan_metadata should be present so the scan record is preserved
+        self.assertIn("scan_metadata", scanner.results)
+        meta = scanner.results["scan_metadata"]
+        self.assertIn("scan_id", meta)
+        self.assertIn("ended", meta)
+        self.assertIsNotNone(meta["ended"])
+
 
 # ---------------------------------------------------------------------------
 # 14. Phase A — Reporter consumes unified findings

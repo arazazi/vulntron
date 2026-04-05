@@ -1623,9 +1623,12 @@ class HybridScanner:
 
         if not self.results['open_ports']:
             print(Colors.warning("No open ports found!"))
+            if _HAS_PLUGINS:
+                _scan_meta.ended = datetime.now(timezone.utc).isoformat()
+                self.results['scan_metadata'] = _scan_meta.to_dict()
             return
 
-        # Phase 2: Vulnerability Checks (legacy VulnerabilityChecker path)
+        # [PHASE 2] Vulnerability Checks (legacy VulnerabilityChecker path)
         vuln_checker = VulnerabilityChecker(self.target, self.results['open_ports'])
         legacy_findings = vuln_checker.check_all()
 
@@ -1641,7 +1644,7 @@ class HybridScanner:
         else:
             self.results['vulnerabilities'] = legacy_findings
 
-        # Phase 3: NVD Intelligence (optional)
+        # [PHASE 3] NVD Intelligence (optional)
         if not getattr(args, 'skip_nvd', False):
             nvd = NVDIntelligence(NVD_API_KEY)
             lookback_days = self.results['cve_lookback_days']
@@ -1652,7 +1655,7 @@ class HybridScanner:
                 'lookback_days': lookback_days,
             }
 
-        # Phase 4: Compliance
+        # [PHASE 3] Compliance
         if not getattr(args, 'skip_compliance', False):
             compliance_checker = ComplianceChecker(self.results)
             self.results['compliance'] = compliance_checker.check_pci_dss()
@@ -1662,7 +1665,7 @@ class HybridScanner:
             _scan_meta.ended = datetime.now(timezone.utc).isoformat()
             self.results['scan_metadata'] = _scan_meta.to_dict()
 
-        # Phase 5: Generate Reports
+        # [PHASE 4] Report Generation
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         target_safe = self.target.replace('.', '_')
