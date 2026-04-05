@@ -26,17 +26,18 @@
 1. [Features](#-features)
 2. [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization)
 3. [Architecture Overview](#-architecture-overview)
-4. [Installation](#-installation)
-5. [Quick Start](#-quick-start)
-6. [CLI Reference](#-cli-reference)
-7. [Understanding Results](#-understanding-results)
-8. [Report Formats](#-report-formats)
-9. [Examples](#-examples)
-10. [Troubleshooting](#-troubleshooting)
-11. [Development](#-development)
-12. [Known Limitations](#-known-limitations)
-13. [Roadmap](#-roadmap)
-14. [License](#-license)
+4. [Credentialed Scanning](#-credentialed-scanning)
+5. [Installation](#-installation)
+6. [Quick Start](#-quick-start)
+7. [CLI Reference](#-cli-reference)
+8. [Understanding Results](#-understanding-results)
+9. [Report Formats](#-report-formats)
+10. [Examples](#-examples)
+11. [Troubleshooting](#-troubleshooting)
+12. [Development](#-development)
+13. [Known Limitations](#-known-limitations)
+14. [Roadmap](#-roadmap)
+15. [License](#-license)
 
 ---
 
@@ -267,6 +268,181 @@ findings = [f for check_cls in checks for f in check_cls().run(target, 9999)]
 
 ---
 
+## 🔑 Credentialed Scanning
+
+> **⚠️ Authorized use only.** Credentialed scanning connects to targets using authentication credentials. Only use this feature on systems you own or have explicit written permission to assess. Never share or commit real credentials to version control.
+
+Vultron supports **authenticated scanning** (PR1) for Linux/Unix and Windows targets via SSH, WinRM, and WMI. Credentialed scans can verify patch status, configuration, and service health in ways that unauthenticated probes cannot.
+
+### Supported Authentication Methods
+
+| Protocol | Auth Methods | Default Port | OS Targets |
+|----------|-------------|-------------|------------|
+| SSH | Password, private key (RSA/ECDSA/Ed25519) | 22 | Linux, macOS, Unix-like |
+| WinRM | Username + password (NTLM/Kerberos) | 5985 (HTTP) / 5986 (HTTPS) | Windows |
+| WMI | Username + password | 135 (DCOM) | Windows |
+
+### Quick Start — Credentialed Scanning
+
+**SSH with password:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-password '<your-password>'
+```
+
+**SSH with private key:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-key /path/to/id_rsa
+```
+
+**WinRM (Windows Remote Management):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --winrm-user Administrator --winrm-password '<your-password>'
+```
+
+**WinRM with domain:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --winrm-user Administrator --winrm-domain CORP --winrm-password '<your-password>'
+```
+
+**WMI (Windows Management Instrumentation):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --wmi-user Administrator --wmi-password '<your-password>'
+```
+
+**Credentials from a file (recommended over CLI flags for automation):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --cred-file /secure/path/credentials.json
+```
+
+**Credentials from environment variables (CI / automation):**
+
+```bash
+export VULTRON_SSH_USER=scanuser
+export VULTRON_SSH_PASSWORD=<your-password>
+python3 vultron.py -t 192.168.1.100
+```
+
+### Credential File Format
+
+Create a JSON file at a secure location (not inside the repository). Example structure with **placeholder values only**:
+
+```json
+{
+    "ssh": {
+        "username": "<your-ssh-username>",
+        "password": "<your-ssh-password-or-omit-for-key-auth>",
+        "key_path": "/path/to/private/key",
+        "port": 22
+    },
+    "winrm": {
+        "username": "<your-winrm-username>",
+        "password": "<your-winrm-password>",
+        "domain": "<optional-ad-domain>",
+        "transport": "http"
+    },
+    "wmi": {
+        "username": "<your-wmi-username>",
+        "password": "<your-wmi-password>",
+        "domain": "<optional-ad-domain>"
+    }
+}
+```
+
+> All top-level keys (`ssh`, `winrm`, `wmi`) are optional. Include only the protocols you need.
+> **Never commit a credentials file to version control.** Add it to `.gitignore`.
+
+### Environment Variable Reference
+
+| Variable | Description |
+|----------|-------------|
+| `VULTRON_SSH_USER` | SSH username |
+| `VULTRON_SSH_PASSWORD` | SSH password (omit when using a key) |
+| `VULTRON_SSH_KEY_PATH` | Path to SSH private key file |
+| `VULTRON_SSH_PASSPHRASE` | Passphrase for a protected private key |
+| `VULTRON_SSH_PORT` | SSH port (default `22`) |
+| `VULTRON_WINRM_USER` | WinRM username |
+| `VULTRON_WINRM_PASSWORD` | WinRM password |
+| `VULTRON_WINRM_DOMAIN` | Active Directory domain (optional) |
+| `VULTRON_WINRM_TRANSPORT` | WinRM transport: `http` or `https` (default `http`) |
+| `VULTRON_WINRM_PORT` | WinRM port override (optional) |
+| `VULTRON_WMI_USER` | WMI username |
+| `VULTRON_WMI_PASSWORD` | WMI password |
+| `VULTRON_WMI_DOMAIN` | Active Directory domain (optional) |
+| `VULTRON_WMI_NAMESPACE` | WMI namespace (default `root/cimv2`) |
+
+### Credential Provider Precedence
+
+Credentials are resolved in the following order:
+
+1. **Inline CLI flags** (`--ssh-user`, `--ssh-password`, etc.)
+2. **Environment variables** (`VULTRON_SSH_USER`, etc.)
+3. **Credential file** (`--cred-file`)
+
+The first non-empty source wins for each protocol independently.
+
+### Optional Dependencies for Full Authentication
+
+PR1 includes full TCP-layer reachability checks without additional dependencies. For full session authentication, install the relevant library:
+
+| Protocol | Library | Install |
+|----------|---------|---------|
+| SSH (key/password auth) | `paramiko` | `pip install paramiko` |
+| WinRM (session auth) | `pywinrm` | `pip install pywinrm` |
+| WMI (namespace auth) | `impacket` | `pip install impacket` |
+
+Without these libraries, Vultron falls back to **TCP connectivity verification** only and reports this clearly in the finding evidence.
+
+### Security Design
+
+- Credentials are **never** written to HTML/JSON reports, log files, or the console.
+- Exception messages containing credential-like strings are sanitised before output.
+- The `--ssh-password` and `--ssh-key` flags are **mutually exclusive**; providing both is an error.
+- All probes are **non-invasive** — no write operations, no configuration changes.
+- `INFO` severity findings are used for authenticated probe results to distinguish them from vulnerability findings.
+
+### Credentialed Scan Output
+
+The JSON report includes an `auth_scan` field with probe results (no secrets):
+
+```json
+{
+  "auth_scan": {
+    "authenticated_mode": true,
+    "credentials_configured": {
+      "ssh": "SSHCredential(user='scanuser', auth='key', port=22)",
+      "winrm": null,
+      "wmi": null
+    },
+    "probe_results": {
+      "ssh": {
+        "protocol": "ssh",
+        "target": "192.168.1.100",
+        "port": 22,
+        "success": true,
+        "message": "SSH connectivity and authentication confirmed on 192.168.1.100:22",
+        "error": null,
+        "latency_ms": null
+      }
+    }
+  }
+}
+```
+
+### Limitations and Next Steps
+
+- **PR1 scope**: TCP connectivity and basic authentication probes only. Credentialed vulnerability checks (OS patch status, software inventory, configuration audits) are planned for subsequent PRs.
+- WinRM and WMI authentication require `pywinrm` and `impacket` respectively. TCP-only verification is available without them.
+- Windows Kerberos authentication is not yet supported (NTLM only via WinRM).
+- Future PRs will extend credentialed checks to cover patching status, compliance baselines, and service configurations.
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -399,6 +575,23 @@ python3 vultron.py -t <target> [options]
 | `--skip-compliance` | flag | `False` | Skip PCI DSS compliance assessment |
 | `--cve-lookback-days` | int | `120` | Days to look back when querying NVD for recent CVEs (range: 1–3650) |
 | `--version` | flag | — | Show version string and exit |
+
+### Credentialed Scanning Options (authorized use only)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--cred-file` | path | — | Path to a JSON credential file |
+| `--ssh-user` | string | — | SSH username |
+| `--ssh-password` | string | — | SSH password (mutually exclusive with `--ssh-key`) |
+| `--ssh-key` | path | — | Path to SSH private key file |
+| `--ssh-port` | int | `22` | SSH port |
+| `--winrm-user` | string | — | WinRM username |
+| `--winrm-password` | string | — | WinRM password |
+| `--winrm-domain` | string | — | Active Directory domain (optional) |
+| `--winrm-transport` | choice | `http` | WinRM transport: `http` or `https` |
+| `--wmi-user` | string | — | WMI username |
+| `--wmi-password` | string | — | WMI password |
+| `--wmi-domain` | string | — | Active Directory domain (optional) |
 
 ---
 
@@ -639,6 +832,14 @@ Test coverage includes:
 - **Phase A — Pipeline emits unified findings** (`TestPipelineUnifiedFindings`)
 - **Phase A — Reporter renders unified finding fields** (`TestReporterUnifiedFindings`)
 - **Phase A — Built-in plugin checks** (`TestBuiltinPluginChecks`)
+- **PR1 — Credential model validation** (`TestCredentialModelValidation`)
+- **PR1 — Secret masking and redaction helpers** (`TestSecretMasking`)
+- **PR1 — Credential providers** (`TestCredentialProviders`)
+- **PR1 — Authenticated executor probes** (`TestAuthenticatedExecutor`)
+- **PR1 — Auth probe plugin checks** (`TestAuthProbePluginChecks`)
+- **PR1 — CLI credential argument parsing** (`TestCLICredentialParsing`)
+- **PR1 — HybridScanner credentialed mode integration** (`TestHybridScannerCredentialedMode`)
+- **PR1 — BaseCheck credential attributes** (`TestBaseCheckCredentialAttributes`)
 
 ### Syntax Check
 
@@ -682,7 +883,17 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [x] Configurable CVE lookback period (`--cve-lookback-days`, default 120)
 - [x] **Phase A: Plugin framework** — `plugins/` package, `BaseCheck` / `CheckRegistry`, 8 built-in checks
 - [x] **Phase A: Unified finding schema** — `Finding`, `Evidence`, `ScanMetadata` dataclasses; adapter layer for backward compat
-- [ ] Phase B: Credentialed checks (SSH, WMI)
+- [x] **PR1: Credentialed scanning framework** — SSH/WinRM/WMI credential model, secret redaction, provider abstraction, authenticated probes
+- [ ] PR2: UDP scanner + service fingerprinting expansion
+- [ ] PR3: SSL/TLS deep inspection module
+- [ ] PR4: Asset inventory + host profiling
+- [ ] PR5: Compliance engine (CIS/NIST/ISO policy packs)
+- [ ] PR6: Patch detection (OS/package mapping via credentialed checks)
+- [ ] PR7: Web application scanner (safe, non-exploit checks)
+- [ ] PR8: Database security audits (read-only checks)
+- [ ] PR9: Network device audits (Cisco/Juniper baseline)
+- [ ] PR10: Cloud posture checks (AWS/Azure/GCP read-only)
+- [ ] PR11: Scalable CVE check-pack architecture
 - [ ] Phase C: Scheduled / continuous scanning
 - [ ] Phase D: Web UI
 - [ ] Machine-readable SARIF output for integration with GitHub Code Scanning

@@ -79,6 +79,13 @@ class BaseCheck(abc.ABC):
     required_ports: List[int] = []
     #: Service name strings this check applies to (case-insensitive)
     service_matchers: List[str] = []
+    #: Whether this check **requires** credentials to run.
+    #: When ``True`` and no credentials are provided, the check must return
+    #: an explicit SKIP finding rather than raising an exception.
+    requires_credentials: bool = False
+    #: Credential types accepted by this check (e.g. ``['ssh', 'winrm']``).
+    #: Empty list means the check does not use credentials.
+    credential_types: List[str] = []
 
     @abc.abstractmethod
     def run(self, target: str, port: int, **kwargs) -> List["Finding"]:
