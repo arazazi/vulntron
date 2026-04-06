@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦5.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 
@@ -12,13 +12,14 @@ Capabilities:
 - Active vulnerability checks with evidence-based status (CONFIRMED / POTENTIAL / INCONCLUSIVE)
 - Protocol checks: FTP anonymous login, Telnet banner, SNMP community strings
 - UDP scanning with protocol-aware probes (DNS, NTP, SNMP) and state classification
+- SSL/TLS deep inspection: cert analysis, cipher/protocol posture, legacy version detection
 - CVE enrichment via NVD API with configurable lookback window
 - CISA Known Exploited Vulnerabilities (KEV) detection
 - Compliance assessment (PCI DSS)
 - HTML and JSON report generation
 
 Author: Azazi
-Version: 4.1.0
+Version: 5.0.0
 """
 
 import sys
@@ -73,6 +74,7 @@ try:
     )
     from plugins.udp_scanner import UDPScanner, UDP_SERVICE_NAMES, UDP_DEFAULT_PORTS
     from plugins.fingerprint import fingerprint_banner, normalize_service_name, ServiceFingerprint
+    from plugins.tls_inspector import TLSInspector, is_tls_port
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -80,10 +82,10 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "4.1.0"
+VERSION = "5.0.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦4.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦5.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
@@ -1168,6 +1170,7 @@ class ReportGenerator:
         scan_mode = self.results.get('scan_mode', 'common')
         scan_protocol = self.results.get('scan_protocol', 'tcp')
         cve_lookback_days = self.results.get('cve_lookback_days', 120)
+        tls_scan = self.results.get('tls_scan', {})
 
         counts = self._count_by_status_severity(vulns)
         critical = counts['critical_confirmed']
@@ -1593,6 +1596,58 @@ class ReportGenerator:
         </div>
 '''
 
+        # --- TLS scan section ---
+        if tls_scan:
+            inspected = {port: info for port, info in tls_scan.items() if not info.get('error')}
+            if inspected:
+                html += '''
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">🔐 TLS / SSL Inspection Results</h3>
+            </div>
+            <div class="card-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Port</th>
+                            <th>Protocol</th>
+                            <th>Cipher Suite</th>
+                            <th>Bits</th>
+                            <th>Forward Secrecy</th>
+                            <th>ALPN</th>
+                            <th>Cert CN</th>
+                            <th>Cert Expires</th>
+                            <th>Trusted</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+'''
+                for port_str, info in sorted(inspected.items(), key=lambda x: int(x[0])):
+                    cert = info.get('cert_info') or {}
+                    not_after = cert.get('not_after', '') or ''
+                    expires_display = not_after[:10] if not_after else 'n/a'
+                    fs_icon = '✅' if info.get('has_forward_secrecy') else '❌'
+                    trusted_icon = '✅' if cert.get('chain_trusted') else '⚠️'
+                    html += f'''
+                        <tr>
+                            <td><strong>{port_str}</strong></td>
+                            <td>{info.get('protocol_display', 'unknown')}</td>
+                            <td style="font-family:monospace;font-size:11px;">{info.get('cipher_name', 'n/a')}</td>
+                            <td>{info.get('cipher_bits', 'n/a')}</td>
+                            <td style="text-align:center;">{fs_icon}</td>
+                            <td>{info.get('alpn') or 'n/a'}</td>
+                            <td style="font-size:12px;">{cert.get('subject_cn') or 'n/a'}</td>
+                            <td style="font-size:12px;">{expires_display}</td>
+                            <td style="text-align:center;">{trusted_icon}</td>
+                        </tr>
+'''
+                html += '''
+                    </tbody>
+                </table>
+            </div>
+        </div>
+'''
+
         # --- Compliance section ---
         if compliance:
             html += f'''
@@ -1625,7 +1680,7 @@ class ReportGenerator:
 
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v4.1 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v5.0 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -1667,6 +1722,7 @@ class HybridScanner:
             'nvd_intelligence': {},
             'compliance': {},
             'auth_scan': {},
+            'tls_scan': {},
         }
 
     def _build_credential_set(self):
@@ -1787,6 +1843,56 @@ class HybridScanner:
                 ))
             print(Colors.success(f"Found {len(udp_results)} UDP ports (open/open|filtered)\n"))
 
+        # [PHASE 1c] TLS Deep Inspection (when TCP scan ran and TLS inspection not disabled)
+        _tls_staged_findings: List[Dict] = []
+        if (
+            _HAS_PLUGINS
+            and scan_protocol in ('tcp', 'both')
+            and self.results['open_ports']
+            and not getattr(args, 'no_tls_inspect', False)
+        ):
+            tls_eligible = [p for p in self.results['open_ports'] if is_tls_port(p)]
+            if tls_eligible:
+                print(Colors.header("[PHASE 1c] TLS DEEP INSPECTION"))
+                tls_timeout = getattr(args, 'tls_timeout', 5.0)
+                tls_retries = getattr(args, 'tls_retries', 2)
+                tls_inspector = TLSInspector(
+                    target=self.target,
+                    timeout=tls_timeout,
+                    retries=tls_retries,
+                )
+                print(Colors.info(
+                    f"Inspecting {len(tls_eligible)} TLS-eligible port(s) "
+                    f"(timeout={tls_timeout}s, retries={tls_retries})..."
+                ))
+                tls_raw: Dict = {}
+                for pr in tls_eligible:
+                    port = pr['port']
+                    result = tls_inspector.inspect_port(port)
+                    tls_raw[str(port)] = result.to_dict()
+                    if result.error:
+                        print(Colors.warning(
+                            f"  {port}/tcp [TLS] handshake failed: {result.error}"
+                        ))
+                    else:
+                        proto_disp = result.to_dict().get('protocol_display', 'unknown')
+                        cert_cn = (
+                            result.cert_info.subject_cn if result.cert_info else None
+                        )
+                        cn_part = f' | CN: {cert_cn}' if cert_cn else ''
+                        print(Colors.success(
+                            f"  {port}/tcp [TLS] {proto_disp} | {result.cipher_name}{cn_part}"
+                        ))
+                    # Collect TLS findings for later — merged after Phase 2 list is built
+                    _tls_staged_findings.extend(result.to_findings(self.target))
+                self.results['tls_scan'] = tls_raw
+                tls_finding_count = sum(
+                    1 for p in tls_raw.values() if not p.get('error'))
+                print(Colors.success(
+                    f"TLS inspection complete — "
+                    f"{tls_finding_count}/{len(tls_eligible)} port(s) inspected\n"
+                ))
+
         # Require at least one open TCP port for vulnerability checks
         if not self.results['open_ports'] and scan_protocol in ('tcp', 'both'):
             print(Colors.warning("No open TCP ports found!"))
@@ -1814,6 +1920,9 @@ class HybridScanner:
             ]
         else:
             self.results['vulnerabilities'] = legacy_findings
+
+        # Merge TLS findings collected during Phase 1c into the unified list
+        self.results['vulnerabilities'].extend(_tls_staged_findings)
 
         # [PHASE 2b] Credentialed Scanning (PR1) — runs only when creds are provided
         if _HAS_PLUGINS and credentialed_mode and credential_set is not None:
@@ -1903,6 +2012,9 @@ class HybridScanner:
             print(Colors.success(
                 f"UDP Ports (open/open|filtered): {len(self.results['udp_ports'])}"
             ))
+        tls_ports_inspected = len(self.results.get('tls_scan', {}))
+        if tls_ports_inspected and not getattr(args, 'no_tls_inspect', False):
+            print(Colors.info(f"TLS Ports Inspected: {tls_ports_inspected}"))
         print(Colors.critical(f"Critical Vulnerabilities (confirmed): {counts['critical_confirmed']}"))
         print(Colors.high(f"High Vulnerabilities (confirmed): {counts['high_confirmed']}"))
         print(Colors.medium(f"Medium Vulnerabilities (confirmed): {counts['medium_confirmed']}"))
@@ -1920,7 +2032,7 @@ class HybridScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v4.1 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v5.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1936,6 +2048,11 @@ Examples:
   python vultron.py -t 192.168.1.100 --protocol udp
   python vultron.py -t 192.168.1.100 --protocol both --udp-timeout 3 --udp-retries 3
   python vultron.py -t 192.168.1.100 --protocol udp --udp-ports 53,123,161,500
+
+  # TLS deep inspection (authorized use only):
+  python vultron.py -t 192.168.1.100                       # TLS inspection auto-runs
+  python vultron.py -t 192.168.1.100 --tls-timeout 10      # slow TLS stack
+  python vultron.py -t 192.168.1.100 --no-tls-inspect      # disable TLS inspection
 
   # Credentialed scanning (authorized use only):
   python vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-password '<pass>'
@@ -1964,6 +2081,23 @@ UDP scanning notes:
   UDP scanning may produce many open|filtered results on filtered networks.
   Only use on systems and networks you are authorised to test.
 
+TLS deep inspection notes:
+  TLS inspection runs automatically for ports carrying TLS services (e.g.
+  443, 8443, 465, 993, 995, 636, 5986, 6443, etc.) when TCP scanning is
+  enabled.  All checks are non-invasive read-only TLS handshakes — no
+  exploit techniques are used.
+  Checks performed:
+    - Negotiated protocol version (TLS 1.0/1.1 legacy detection)
+    - Cipher suite weakness (RC4, NULL, EXPORT, anonymous, 3DES)
+    - Forward secrecy presence (ECDHE/DHE key exchange)
+    - Certificate expiry, not-yet-valid windows
+    - Self-signed / untrusted certificate chain
+    - Hostname / SAN mismatch (when target is a hostname)
+    - Weak signature algorithm (SHA-1, MD5) and key size (RSA < 2048)
+  Use --no-tls-inspect to disable TLS inspection entirely.
+  Disable for targets known to have very slow TLS stacks or strict
+  firewall rules that reset on repeated handshakes.
+
 Protocol checks (triggered automatically on open TCP ports):
   FTP (21)    Anonymous login probe — CONFIRMED / POTENTIAL / INCONCLUSIVE
   Telnet (23) Banner collection + cleartext exposure — POTENTIAL / INCONCLUSIVE
@@ -1980,6 +2114,7 @@ Credentialed scanning (all modes):
 Capabilities:
   TCP and UDP port discovery, service fingerprinting with version hints and
   confidence scores, and active vulnerability checks.
+  SSL/TLS deep inspection with cert, cipher, and protocol posture analysis.
   CVE enrichment via NVD API, CISA KEV detection, and compliance assessment (PCI DSS).
   Outputs structured HTML and JSON reports with evidence-based, protocol-aware findings.
         """
@@ -2033,6 +2168,27 @@ Capabilities:
         metavar='PORTS',
         help="Custom UDP port list/ranges, e.g. '53,123,161,500-514'. "
              "Defaults to common UDP service ports when not specified.",
+    )
+
+    # -- TLS deep inspection options (PR3) -----------------------------------------
+    tls_group = parser.add_argument_group(
+        'TLS deep inspection (authorized use only)',
+        'Options for SSL/TLS posture analysis.  Non-invasive handshake-based checks only.',
+    )
+    tls_group.add_argument(
+        '--no-tls-inspect',
+        action='store_true',
+        help='Disable SSL/TLS deep inspection (enabled by default for TLS-capable ports)',
+    )
+    tls_group.add_argument(
+        '--tls-timeout',
+        type=float, default=5.0, metavar='SECONDS',
+        help='Per-port TLS handshake timeout in seconds (default: 5.0)',
+    )
+    tls_group.add_argument(
+        '--tls-retries',
+        type=int, default=2, metavar='N',
+        help='TLS handshake attempt count per port (default: 2)',
     )
 
     # -- Credentialed scanning options (PR1) --------------------------------

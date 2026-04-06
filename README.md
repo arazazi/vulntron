@@ -9,13 +9,13 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.1.0-success.svg)]()
+[![Version](https://img.shields.io/badge/version-5.0.0-success.svg)]()
 
 </div>
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -28,17 +28,18 @@
 3. [Architecture Overview](#-architecture-overview)
 4. [Credentialed Scanning](#-credentialed-scanning)
 5. [UDP Scanning](#-udp-scanning)
-6. [Installation](#-installation)
-7. [Quick Start](#-quick-start)
-8. [CLI Reference](#-cli-reference)
-9. [Understanding Results](#-understanding-results)
-10. [Report Formats](#-report-formats)
-11. [Examples](#-examples)
-12. [Troubleshooting](#-troubleshooting)
-13. [Development](#-development)
-14. [Known Limitations](#-known-limitations)
-15. [Roadmap](#-roadmap)
-16. [License](#-license)
+6. [TLS Deep Inspection](#-tls-deep-inspection)
+7. [Installation](#-installation)
+8. [Quick Start](#-quick-start)
+9. [CLI Reference](#-cli-reference)
+10. [Understanding Results](#-understanding-results)
+11. [Report Formats](#-report-formats)
+12. [Examples](#-examples)
+13. [Troubleshooting](#-troubleshooting)
+14. [Development](#-development)
+15. [Known Limitations](#-known-limitations)
+16. [Roadmap](#-roadmap)
+17. [License](#-license)
 
 ---
 
@@ -152,6 +153,14 @@ User supplies target + options (--protocol tcp|udp|both)
          │  udp_ports: [{port, state, service, banner, protocol}, …]
          ▼
 ┌───────────────────┐
+│  PHASE 1c         │  TLS deep inspection (auto-enabled for TLS-capable ports)
+│  TLS Inspection   │  → Handshake metadata: protocol, cipher, ALPN, SNI
+│                   │  → Certificate analysis: expiry, CN/SAN, self-signed, key size
+│                   │  → Posture checks: legacy protocol, weak cipher, forward secrecy
+└────────┬──────────┘
+         │  tls_scan metadata + TLS findings (merged into vulnerabilities)
+         ▼
+┌───────────────────┐
 │  PHASE 2          │  Protocol-specific probes (SMB, RDP, HTTP, DB)
 │  Vuln Checks      │  → Evidence collected → CONFIRMED / POTENTIAL / INCONCLUSIVE
 │  (Plugin checks)  │  → Legacy VulnerabilityChecker + adapter → unified Finding schema
@@ -190,6 +199,7 @@ plugins/
 ├── registry.py       # CheckRegistry (registration and port/service dispatch)
 ├── udp_scanner.py    # UDPScanner: UDP engine, probe builders, state classification
 ├── fingerprint.py    # Service fingerprinting: banner parsing, normalisation, confidence
+├── tls_inspector.py  # TLSInspector: TLS handshake inspection, cert/cipher analysis
 └── checks/
     ├── __init__.py   # Auto-imports smb and network to register all built-in checks
     ├── smb.py        # EternalBlueCheck, SMBGhostCheck
@@ -566,6 +576,122 @@ UDP results appear in a dedicated `udp_ports` section of the JSON report and as 
 
 ---
 
+## 🔐 TLS Deep Inspection
+
+> **⚠️ Authorized use only.** TLS inspection is a posture analysis technique, not a vulnerability exploit. Only run on systems you own or have explicit written permission to test.
+
+Vulntron v5.0 adds **SSL/TLS deep inspection** via bounded, non-invasive TLS handshakes. The module performs **read-only handshake analysis** — it never injects data, exploits vulnerabilities, or alters server state.
+
+### What is Inspected
+
+TLS inspection runs automatically in **Phase 1c** immediately after TCP scanning, for any port carrying a TLS service.
+
+| Check Category | Details |
+|----------------|---------|
+| **Protocol version** | Detects negotiated protocol; flags TLS 1.0 and TLS 1.1 as deprecated (RFC 8996) |
+| **Legacy protocol support** | Probes for TLS 1.0/1.1 acceptance (best-effort, if OS allows) |
+| **Cipher suite** | Flags NULL, EXPORT, anonymous (ADH/AECDH), RC4, RC2, 3DES, DES |
+| **Forward secrecy** | Detects ECDHE/DHE key exchange; flags absence of forward secrecy |
+| **Certificate expiry** | CRITICAL (\<7 days), HIGH (expired), MEDIUM (\<30 days) |
+| **Certificate validity** | Flags not-yet-valid certificates |
+| **Self-signed** | Flags certificates where issuer equals subject |
+| **Untrusted chain** | Reports when system CA store cannot verify the chain |
+| **Hostname mismatch** | Compares CN/SANs against target hostname (when not an IP) |
+| **Weak signature algorithm** | Flags SHA-1 (HIGH) and MD5/MD2 (CRITICAL) when detectable |
+| **Weak key size** | Flags RSA \< 2048-bit, EC/DSA \< 224-bit |
+| **ALPN / SNI** | Captures negotiated ALPN protocol and SNI usage |
+
+### TLS-Eligible Ports
+
+TLS inspection is triggered for any TCP port that is:
+- In the well-known TLS port set: `443, 465, 636, 853, 993, 995, 5986, 6443, 8443, ...`
+- OR has a service name containing TLS-related keywords (`https`, `imaps`, `ldaps`, `smtps`, `tls`, etc.)
+
+### Quick Start — TLS Inspection
+
+TLS inspection runs automatically with a default TCP scan:
+
+```bash
+python3 vultron.py -t 192.168.1.100
+# TLS inspection auto-runs for any open ports 443, 8443, 993, 995, 636, etc.
+```
+
+**Increase timeout for slow TLS stacks:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --tls-timeout 10.0
+```
+
+**Disable TLS inspection entirely:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --no-tls-inspect
+```
+
+**Combine with full TCP scan:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --scan-mode top1000 --tls-timeout 8.0 --tls-retries 2
+```
+
+### TLS Inspection Output
+
+TLS results appear in a `tls_scan` section of the JSON report and as a dedicated table in the HTML report:
+
+```json
+{
+  "tls_scan": {
+    "443": {
+      "host": "192.168.1.100",
+      "port": 443,
+      "protocol_version": "TLSv1.2",
+      "protocol_display": "TLS 1.2",
+      "cipher_name": "ECDHE-RSA-AES256-GCM-SHA384",
+      "cipher_bits": 256,
+      "has_forward_secrecy": true,
+      "alpn": "h2",
+      "sni_used": false,
+      "cert_info": {
+        "subject_cn": "example.com",
+        "subject_san": ["example.com", "www.example.com"],
+        "issuer_cn": "R3",
+        "not_before": "2024-01-01T00:00:00+00:00",
+        "not_after": "2025-01-01T00:00:00+00:00",
+        "is_self_signed": false,
+        "chain_trusted": true,
+        "sig_algorithm": "sha256",
+        "public_key_type": "RSA",
+        "public_key_bits": 2048
+      },
+      "tls10_accepted": false,
+      "tls11_accepted": false,
+      "error": null,
+      "duration_ms": 143.7
+    }
+  }
+}
+```
+
+TLS-derived findings are merged into `results['vulnerabilities']` with `"category": "tls"` for unified reporting and severity counting.
+
+### TLS Severity Model
+
+| Severity | Condition |
+|----------|-----------|
+| CRITICAL | NULL cipher (no encryption) |
+| HIGH     | Expired certificate, hostname mismatch, RC4/EXPORT/anonymous cipher, TLS 1.0/1.1 accepted, SHA-1/MD5 signature algorithm |
+| MEDIUM   | Self-signed cert, untrusted chain, 3DES cipher, no forward secrecy, RSA \< 2048-bit key, cert expiring \< 30 days |
+
+### Implementation Notes
+
+- **Non-invasive**: Uses bounded TLS handshakes only; no exploit techniques.
+- **Graceful failure**: All connection errors, SSL handshake failures, and timeouts are handled gracefully — the scan continues and the error is recorded in `tls_scan`.
+- **Enhanced cert analysis**: When the `cryptography` library is installed (included by default in many Python environments), Vulntron extracts the certificate signature algorithm and public key size from the raw DER certificate. Without it, these fields are skipped.
+- **Legacy protocol probing**: TLS 1.0/1.1 support is probed via separate handshake attempts with `minimum_version` pinned. If the local OpenSSL policy disallows these versions, the probe is skipped gracefully (reported as `null`).
+- **Backward compatibility**: Disabling TLS inspection (`--no-tls-inspect`) or running UDP-only (`--protocol udp`) produces identical output to previous versions.
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -707,6 +833,14 @@ python3 vultron.py -t <target> [options]
 | `--udp-timeout` | float | `2.0` | Per-port UDP probe receive timeout in seconds |
 | `--udp-retries` | int | `2` | Total UDP probe attempts per port (minimum 1) |
 | `--udp-ports` | string | — | Custom UDP port list/ranges. Defaults to 16 common UDP service ports when not specified |
+
+### TLS Deep Inspection Options (authorized use only)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--no-tls-inspect` | flag | `False` | Disable SSL/TLS deep inspection (enabled by default for TLS-capable ports) |
+| `--tls-timeout` | float | `5.0` | Per-port TLS handshake timeout in seconds |
+| `--tls-retries` | int | `2` | TLS handshake attempt count per port |
 
 ### Credentialed Scanning Options (authorized use only)
 
