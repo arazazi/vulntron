@@ -9,13 +9,13 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.0.0-success.svg)]()
+[![Version](https://img.shields.io/badge/version-4.1.0-success.svg)]()
 
 </div>
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP port discovery, service fingerprinting, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -27,17 +27,18 @@
 2. [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization)
 3. [Architecture Overview](#-architecture-overview)
 4. [Credentialed Scanning](#-credentialed-scanning)
-5. [Installation](#-installation)
-6. [Quick Start](#-quick-start)
-7. [CLI Reference](#-cli-reference)
-8. [Understanding Results](#-understanding-results)
-9. [Report Formats](#-report-formats)
-10. [Examples](#-examples)
-11. [Troubleshooting](#-troubleshooting)
-12. [Development](#-development)
-13. [Known Limitations](#-known-limitations)
-14. [Roadmap](#-roadmap)
-15. [License](#-license)
+5. [UDP Scanning](#-udp-scanning)
+6. [Installation](#-installation)
+7. [Quick Start](#-quick-start)
+8. [CLI Reference](#-cli-reference)
+9. [Understanding Results](#-understanding-results)
+10. [Report Formats](#-report-formats)
+11. [Examples](#-examples)
+12. [Troubleshooting](#-troubleshooting)
+13. [Development](#-development)
+14. [Known Limitations](#-known-limitations)
+15. [Roadmap](#-roadmap)
+16. [License](#-license)
 
 ---
 
@@ -56,7 +57,16 @@ Vulntron supports four TCP port scan modes to match the scope of your assessment
 
 ### 🖧 Service Fingerprinting
 
-For each open port, Vulntron performs a banner-grab to identify the service and version string. Results are included in both reports.
+For each open port, Vulntron performs a banner-grab to identify the service and version string. Starting with v4.1, fingerprinting also assigns:
+
+- **Normalised service name** — canonical representation (e.g., `HTTP`, `SSH`, `MySQL`).
+- **Version hint** — extracted from banner when available (e.g., `OpenSSH_8.9p1`).
+- **Confidence score** — float 0.0–1.0:
+  - `0.9` — banner pattern matched (high confidence).
+  - `0.5` — port-number lookup only (reasonable assumption).
+  - `0.2` — no match found (identity uncertain).
+
+Fingerprint data is included in the `fingerprint` field of each open-port record in the JSON report.
 
 ### 🔎 Vulnerability Checks with Evidence
 
@@ -125,14 +135,21 @@ If you are unsure whether you have authorization, **do not run the scan**.
 ### High-level scan pipeline
 
 ```
-User supplies target + options
-        │
-        ▼
+User supplies target + options (--protocol tcp|udp|both)
+         │
+         ▼
 ┌───────────────────┐
 │  PHASE 1          │  TCP connect scan (multi-threaded, configurable concurrency)
-│  Port Discovery   │  → Banner grabbing per open port
+│  TCP Discovery    │  → Banner grabbing + service fingerprinting per open port
 └────────┬──────────┘
-         │  open ports + banners
+         │  open ports + banners + fingerprints
+         ▼
+┌───────────────────┐
+│  PHASE 1b         │  UDP probe scan (when --protocol udp|both)
+│  UDP Discovery    │  → Protocol-aware probes: DNS, NTP, SNMP
+│                   │  → State: open / open|filtered (no root required)
+└────────┬──────────┘
+         │  udp_ports: [{port, state, service, banner, protocol}, …]
          ▼
 ┌───────────────────┐
 │  PHASE 2          │  Protocol-specific probes (SMB, RDP, HTTP, DB)
@@ -171,6 +188,8 @@ plugins/
 ├── schema.py         # Finding, Evidence, ScanMetadata dataclasses (unified schema)
 ├── base.py           # BaseCheck abstract class (check contract)
 ├── registry.py       # CheckRegistry (registration and port/service dispatch)
+├── udp_scanner.py    # UDPScanner: UDP engine, probe builders, state classification
+├── fingerprint.py    # Service fingerprinting: banner parsing, normalisation, confidence
 └── checks/
     ├── __init__.py   # Auto-imports smb and network to register all built-in checks
     ├── smb.py        # EternalBlueCheck, SMBGhostCheck
@@ -443,6 +462,110 @@ The JSON report includes an `auth_scan` field with probe results (no secrets):
 
 ---
 
+## 📡 UDP Scanning
+
+> **⚠️ Authorized use only.** Only scan systems you own or have explicit written permission to test.
+
+Vulntron v4.1 adds **UDP port discovery** via lightweight, non-intrusive probes. UDP scanning works without root/administrator privileges and does not require any additional dependencies.
+
+### Protocol Selector
+
+Use `--protocol` to choose the scan mode:
+
+| Value | Behavior |
+|-------|----------|
+| `tcp` *(default)* | TCP connect scan only |
+| `udp` | UDP probe scan only (no TCP) |
+| `both` | TCP connect scan **and** UDP probe scan |
+
+### UDP State Semantics
+
+UDP scanning is inherently imprecise because many firewalls silently drop UDP packets. Vulntron uses a conservative three-state model:
+
+| State | Meaning |
+|-------|---------|
+| `open` | A protocol-appropriate response was received — service is running |
+| `open|filtered` | No response and no ICMP error — port may be open or filtered |
+| *(excluded)* | ICMP port-unreachable received — port is definitively closed |
+
+`open|filtered` is the most common result for filtered networks. Always verify with additional tools or network access before concluding a service is present.
+
+### Protocol-Aware Probes
+
+Vulntron sends a protocol-specific probe for known UDP services. All probes are **read-only** and **non-intrusive**:
+
+| Port | Service | Probe |
+|------|---------|-------|
+| 53 | DNS | `version.bind` TXT/CH query |
+| 123 | NTP | Mode 3 client request (48 bytes) |
+| 161 / 162 | SNMP | SNMPv1 GetRequest for `sysDescr.0` |
+| All others | — | Generic minimal datagram |
+
+### Quick Start — UDP Scanning
+
+**UDP-only scan (default UDP ports):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --protocol udp
+```
+
+**Combined TCP + UDP scan:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --protocol both
+```
+
+**UDP with custom timeout and retries:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --protocol udp --udp-timeout 3.0 --udp-retries 3
+```
+
+**UDP scan targeting specific ports:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --protocol udp --udp-ports 53,123,161,500,4500
+```
+
+**Combined scan, skip NVD (faster):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --protocol both --skip-nvd
+```
+
+### Default UDP Ports
+
+When `--udp-ports` is not specified, Vulntron probes the following 16 common UDP services:
+
+```
+53 (DNS), 67 (DHCP), 69 (TFTP), 123 (NTP), 137 (NetBIOS-NS),
+138 (NetBIOS-DGM), 161 (SNMP), 162 (SNMP-TRAP), 500 (IKE),
+514 (Syslog), 520 (RIP), 1194 (OpenVPN), 1900 (SSDP),
+4500 (IKE-NAT), 5353 (mDNS)
+```
+
+### UDP Scan Output
+
+UDP results appear in a dedicated `udp_ports` section of the JSON report and as a separate table in the HTML report:
+
+```json
+{
+  "udp_ports": [
+    {"port": 53,  "state": "open",          "service": "DNS",  "banner": "", "protocol": "udp"},
+    {"port": 161, "state": "open|filtered", "service": "SNMP", "banner": "", "protocol": "udp"}
+  ]
+}
+```
+
+### Caveats
+
+- UDP scanning may generate a high volume of `open|filtered` results on heavily firewalled networks — this is expected and not an error.
+- Raw-socket ICMP detection is not used; port-closed detection relies on `ConnectionRefusedError` from the OS, which may not always be surfaced.
+- Concurrency is capped at 30 threads for UDP (regardless of `--concurrency`) to avoid overwhelming the target or local network stack.
+- UDP scanning does **not** trigger vulnerability checks — the existing vulnerability checker runs only on TCP-discovered ports.
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -471,7 +594,7 @@ pip install -r requirements.txt
 python3 vultron.py --version
 ```
 
-Expected output: `Vultron 4.0.0`
+Expected output: `Vultron 4.1.0`
 
 > **Note:** The tool's internal name is `Vultron`; the repository is hosted as `vulntron`. Both names refer to the same project.
 
@@ -575,6 +698,15 @@ python3 vultron.py -t <target> [options]
 | `--skip-compliance` | flag | `False` | Skip PCI DSS compliance assessment |
 | `--cve-lookback-days` | int | `120` | Days to look back when querying NVD for recent CVEs (range: 1–3650) |
 | `--version` | flag | — | Show version string and exit |
+
+### UDP Scanning Options (authorized use only)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--protocol` | choice | `tcp` | Scan protocol: `tcp`, `udp`, or `both` |
+| `--udp-timeout` | float | `2.0` | Per-port UDP probe receive timeout in seconds |
+| `--udp-retries` | int | `2` | Total UDP probe attempts per port (minimum 1) |
+| `--udp-ports` | string | — | Custom UDP port list/ranges. Defaults to 16 common UDP service ports when not specified |
 
 ### Credentialed Scanning Options (authorized use only)
 
