@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦5.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦6.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 
@@ -13,13 +13,14 @@ Capabilities:
 - Protocol checks: FTP anonymous login, Telnet banner, SNMP community strings
 - UDP scanning with protocol-aware probes (DNS, NTP, SNMP) and state classification
 - SSL/TLS deep inspection: cert analysis, cipher/protocol posture, legacy version detection
+- Asset inventory: normalised asset records, host profiling, role/risk/exposure summary
 - CVE enrichment via NVD API with configurable lookback window
 - CISA Known Exploited Vulnerabilities (KEV) detection
 - Compliance assessment (PCI DSS)
 - HTML and JSON report generation
 
 Author: Azazi
-Version: 5.0.0
+Version: 6.0.0
 """
 
 import sys
@@ -75,6 +76,7 @@ try:
     from plugins.udp_scanner import UDPScanner, UDP_SERVICE_NAMES, UDP_DEFAULT_PORTS
     from plugins.fingerprint import fingerprint_banner, normalize_service_name, ServiceFingerprint
     from plugins.tls_inspector import TLSInspector, is_tls_port
+    from plugins.inventory import InventoryBuilder, HostProfiler, persist_inventory
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -82,10 +84,10 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦5.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦6.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
@@ -1171,6 +1173,7 @@ class ReportGenerator:
         scan_protocol = self.results.get('scan_protocol', 'tcp')
         cve_lookback_days = self.results.get('cve_lookback_days', 120)
         tls_scan = self.results.get('tls_scan', {})
+        inventory = self.results.get('inventory', {})
 
         counts = self._count_by_status_severity(vulns)
         critical = counts['critical_confirmed']
@@ -1678,9 +1681,60 @@ class ReportGenerator:
         </div>
 '''
 
+        # Asset inventory section (only rendered when inventory data is present)
+        inv_assets = inventory.get('assets', [])
+        if inv_assets:
+            _inv_rows = ''
+            for _a in inv_assets:
+                _tcp_count = len(_a.get('tcp_services', {}))
+                _udp_count = len(_a.get('udp_services', {}))
+                _role = _a.get('role', 'unknown')
+                _risk = _a.get('risk_level', 'none')
+                _risk_badge = {
+                    'critical': 'critical', 'high': 'critical',
+                    'medium': 'medium', 'low': 'medium', 'none': 'info',
+                }.get(_risk, 'info')
+                _exposure = _a.get('exposure_summary', '')
+                _ip = _a.get('ip') or _a.get('hostname') or target
+                _inv_rows += f'''
+                <tr>
+                    <td><strong>{_ip}</strong></td>
+                    <td>{_a.get('hostname') or '—'}</td>
+                    <td>{_role}</td>
+                    <td><span class="badge badge-{_risk_badge}">{_risk.upper()}</span></td>
+                    <td>{_tcp_count}</td>
+                    <td>{_udp_count}</td>
+                    <td style="font-size:12px">{_exposure}</td>
+                </tr>'''
+            html += f'''
+        <div class="section">
+            <div class="section-header">Asset Inventory</div>
+            <div style="padding: 20px;">
+                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
+                    {len(inv_assets)} asset(s) discovered · snapshot {inventory.get('snapshot_id', '')}
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP / Host</th>
+                            <th>Hostname</th>
+                            <th>Role</th>
+                            <th>Risk</th>
+                            <th>TCP Ports</th>
+                            <th>UDP Ports</th>
+                            <th>Exposure</th>
+                        </tr>
+                    </thead>
+                    <tbody>{_inv_rows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+'''
+
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v5.0 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v6.0 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -1723,6 +1777,7 @@ class HybridScanner:
             'compliance': {},
             'auth_scan': {},
             'tls_scan': {},
+            'inventory': {},
         }
 
     def _build_credential_set(self):
@@ -1987,6 +2042,36 @@ class HybridScanner:
             _scan_meta.ended = datetime.now(timezone.utc).isoformat()
             self.results['scan_metadata'] = _scan_meta.to_dict()
 
+        # [PHASE 3b] Asset Inventory + Host Profiling
+        _inventory_output = getattr(args, 'inventory_output', None)
+        _no_inventory = getattr(args, 'no_inventory', False)
+        if _HAS_PLUGINS and not _no_inventory:
+            print(Colors.header("[PHASE 3b] ASSET INVENTORY"))
+            _inv_builder = InventoryBuilder()
+            _snapshot = _inv_builder.build(self.results)
+            _profiler = HostProfiler()
+            for _asset in _snapshot.assets:
+                _profiler.profile(_asset)
+            self.results['inventory'] = _snapshot.to_dict()
+            _asset_count = _snapshot.asset_count
+            if _asset_count > 0:
+                _a = _snapshot.assets[0]
+                print(Colors.success(
+                    f"Asset: {_a.ip or self.target} | role: {_a.role} | "
+                    f"risk: {_a.risk_level}"
+                ))
+                print(Colors.info(f"  Exposure: {_a.exposure_summary}"))
+                for _ev in _a.role_evidence:
+                    print(Colors.info(f"  {_ev}"))
+            # Persist standalone inventory file if path provided
+            if _inventory_output:
+                try:
+                    persist_inventory(_snapshot, _inventory_output)
+                    print(Colors.success(f"Inventory saved: {_inventory_output}"))
+                except OSError as _e:
+                    print(Colors.warning(f"  Inventory save failed: {_e}"))
+            print()
+
         # [PHASE 4] Report Generation
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2027,12 +2112,19 @@ class HybridScanner:
             print(Colors.info(f"Authenticated Scan: attempted — succeeded: {auth_status}"))
         else:
             print(Colors.info("Authenticated Scan: not attempted (no credentials provided)"))
-        print(Colors.success(f"\nReports: {html_file}, {json_file}\n"))
+        inv = self.results.get('inventory', {})
+        if inv and not getattr(args, 'no_inventory', False):
+            inv_assets = inv.get('asset_count', 0)
+            print(Colors.info(f"Asset Inventory: {inv_assets} asset(s) recorded (included in JSON report)"))
+            if _inventory_output:
+                print(Colors.success(f"Standalone inventory: {_inventory_output}"))
+        report_files = f"{html_file}, {json_file}"
+        print(Colors.success(f"\nReports: {report_files}\n"))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v5.0 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v6.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2053,6 +2145,11 @@ Examples:
   python vultron.py -t 192.168.1.100                       # TLS inspection auto-runs
   python vultron.py -t 192.168.1.100 --tls-timeout 10      # slow TLS stack
   python vultron.py -t 192.168.1.100 --no-tls-inspect      # disable TLS inspection
+
+  # Asset inventory (enabled by default):
+  python vultron.py -t 192.168.1.100                              # inventory in JSON report
+  python vultron.py -t 192.168.1.100 --inventory-output inv.json  # also save standalone file
+  python vultron.py -t 192.168.1.100 --no-inventory               # disable inventory
 
   # Credentialed scanning (authorized use only):
   python vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-password '<pass>'
@@ -2189,6 +2286,24 @@ Capabilities:
         '--tls-retries',
         type=int, default=2, metavar='N',
         help='TLS handshake attempt count per port (default: 2)',
+    )
+
+    # -- Asset inventory options (PR4) ----------------------------------------
+    inv_group = parser.add_argument_group(
+        'Asset inventory (PR4)',
+        'Options for asset inventory generation and persistence.',
+    )
+    inv_group.add_argument(
+        '--no-inventory',
+        action='store_true',
+        help='Disable asset inventory generation (enabled by default)',
+    )
+    inv_group.add_argument(
+        '--inventory-output',
+        metavar='FILE',
+        help='Path for standalone inventory JSON snapshot '
+             '(e.g. inventory_192_168_1_1.json). '
+             'The inventory is also embedded in the main JSON report when not disabled.',
     )
 
     # -- Credentialed scanning options (PR1) --------------------------------

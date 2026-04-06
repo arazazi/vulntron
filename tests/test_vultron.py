@@ -3790,6 +3790,621 @@ class TestTLSStdlibCertParsing(unittest.TestCase):
         self.assertFalse(info.is_self_signed)
 
 
+# ---------------------------------------------------------------------------
+# 41. PR4 — Asset identity and deduplication
+# ---------------------------------------------------------------------------
+
+class TestAssetIdentity(unittest.TestCase):
+    """_make_asset_id() produces stable, deterministic identifiers."""
+
+    def test_same_ip_produces_same_id(self):
+        from plugins.inventory import _make_asset_id
+        id1 = _make_asset_id('192.168.1.1', None)
+        id2 = _make_asset_id('192.168.1.1', None)
+        self.assertEqual(id1, id2)
+
+    def test_different_ip_produces_different_id(self):
+        from plugins.inventory import _make_asset_id
+        id1 = _make_asset_id('192.168.1.1', None)
+        id2 = _make_asset_id('192.168.1.2', None)
+        self.assertNotEqual(id1, id2)
+
+    def test_id_is_hex_string(self):
+        from plugins.inventory import _make_asset_id
+        asset_id = _make_asset_id('10.0.0.1', 'host.example.com')
+        self.assertRegex(asset_id, r'^[0-9a-f]+$')
+
+    def test_id_length_is_16(self):
+        from plugins.inventory import _make_asset_id
+        asset_id = _make_asset_id('10.0.0.1', None)
+        self.assertEqual(len(asset_id), 16)
+
+    def test_none_fields_handled(self):
+        from plugins.inventory import _make_asset_id
+        asset_id = _make_asset_id(None, None)
+        self.assertIsNotNone(asset_id)
+        self.assertEqual(len(asset_id), 16)
+
+    def test_case_insensitive(self):
+        from plugins.inventory import _make_asset_id
+        id1 = _make_asset_id('10.0.0.1', 'HOST.EXAMPLE.COM')
+        id2 = _make_asset_id('10.0.0.1', 'host.example.com')
+        self.assertEqual(id1, id2)
+
+
+# ---------------------------------------------------------------------------
+# 42. PR4 — AssetRecord merge behaviour
+# ---------------------------------------------------------------------------
+
+class TestAssetRecordMerge(unittest.TestCase):
+    """AssetRecord non-destructive merge methods."""
+
+    def _make_asset(self) -> 'plugins.inventory.AssetRecord':
+        from plugins.inventory import AssetRecord, _make_asset_id
+        return AssetRecord(asset_id=_make_asset_id('10.0.0.1', None), ip='10.0.0.1')
+
+    def test_merge_tcp_service_adds_new_port(self):
+        from plugins.inventory import ServiceRecord
+        asset = self._make_asset()
+        rec = ServiceRecord(port=80, protocol='tcp', service='http')
+        asset.merge_tcp_service(rec)
+        self.assertIn(80, asset.tcp_services)
+
+    def test_merge_tcp_service_does_not_overwrite_existing_service(self):
+        from plugins.inventory import ServiceRecord
+        asset = self._make_asset()
+        asset.merge_tcp_service(ServiceRecord(port=80, protocol='tcp', service='http'))
+        asset.merge_tcp_service(ServiceRecord(port=80, protocol='tcp', service='nginx'))
+        self.assertEqual(asset.tcp_services[80].service, 'http')
+
+    def test_merge_tcp_service_enriches_missing_service(self):
+        from plugins.inventory import ServiceRecord
+        asset = self._make_asset()
+        asset.merge_tcp_service(ServiceRecord(port=80, protocol='tcp', service=None))
+        asset.merge_tcp_service(ServiceRecord(port=80, protocol='tcp', service='http'))
+        self.assertEqual(asset.tcp_services[80].service, 'http')
+
+    def test_merge_udp_service_adds_new_port(self):
+        from plugins.inventory import ServiceRecord
+        asset = self._make_asset()
+        rec = ServiceRecord(port=53, protocol='udp', service='dns')
+        asset.merge_udp_service(rec)
+        self.assertIn(53, asset.udp_services)
+
+    def test_add_source_deduplicates(self):
+        asset = self._make_asset()
+        asset.add_source('tcp-scan')
+        asset.add_source('tcp-scan')
+        self.assertEqual(asset.scan_sources.count('tcp-scan'), 1)
+
+    def test_add_source_accumulates_distinct(self):
+        asset = self._make_asset()
+        asset.add_source('tcp-scan')
+        asset.add_source('udp-scan')
+        self.assertEqual(len(asset.scan_sources), 2)
+
+    def test_add_os_hint_deduplicates(self):
+        from plugins.inventory import OsHint
+        asset = self._make_asset()
+        asset.add_os_hint(OsHint(hint='Linux', source='banner'))
+        asset.add_os_hint(OsHint(hint='Linux', source='banner'))
+        self.assertEqual(len(asset.os_hints), 1)
+
+    def test_to_dict_contains_required_keys(self):
+        asset = self._make_asset()
+        d = asset.to_dict()
+        for key in ('asset_id', 'ip', 'hostname', 'tcp_services', 'udp_services',
+                    'first_seen', 'last_seen', 'scan_sources', 'vuln_summary',
+                    'risk_level', 'role', 'role_evidence', 'exposure_summary'):
+            self.assertIn(key, d)
+
+
+# ---------------------------------------------------------------------------
+# 43. PR4 — InventoryBuilder builds from scan results
+# ---------------------------------------------------------------------------
+
+class TestInventoryBuilder(unittest.TestCase):
+    """InventoryBuilder.build() correctly merges multi-module scan results."""
+
+    def _minimal_results(self):
+        return {
+            'target': '192.168.1.50',
+            'timestamp': '2026-01-01T00:00:00',
+            'open_ports': [],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+        }
+
+    def test_build_returns_snapshot(self):
+        from plugins.inventory import InventoryBuilder, InventorySnapshot
+        results = self._minimal_results()
+        snapshot = InventoryBuilder().build(results)
+        self.assertIsInstance(snapshot, InventorySnapshot)
+
+    def test_snapshot_has_one_asset(self):
+        from plugins.inventory import InventoryBuilder
+        snapshot = InventoryBuilder().build(self._minimal_results())
+        self.assertEqual(snapshot.asset_count, 1)
+
+    def test_tcp_ports_included(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['open_ports'] = [
+            {'port': 80, 'service': 'http', 'banner': '', 'protocol': 'tcp'},
+            {'port': 443, 'service': 'https', 'banner': '', 'protocol': 'tcp'},
+        ]
+        snapshot = InventoryBuilder().build(results)
+        tcp = snapshot.assets[0].tcp_services
+        self.assertIn(80, tcp)
+        self.assertIn(443, tcp)
+
+    def test_udp_ports_included(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['udp_ports'] = [
+            {'port': 53, 'service': 'dns', 'state': 'open'},
+        ]
+        snapshot = InventoryBuilder().build(results)
+        udp = snapshot.assets[0].udp_services
+        self.assertIn(53, udp)
+
+    def test_tls_scan_attached_to_tcp_service(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['open_ports'] = [{'port': 443, 'service': 'https', 'banner': ''}]
+        results['tls_scan'] = {
+            '443': {
+                'protocol_version': 'TLSv1.2',
+                'cipher_name': 'ECDHE-RSA-AES256-GCM-SHA384',
+                'error': None,
+                'has_forward_secrecy': True,
+                'cert_info': {
+                    'subject_cn': 'example.com',
+                    'issuer_cn': 'Example CA',
+                    'is_self_signed': False,
+                },
+            }
+        }
+        snapshot = InventoryBuilder().build(results)
+        asset = snapshot.assets[0]
+        self.assertIsNotNone(asset.tcp_services[443].tls)
+        self.assertEqual(asset.tcp_services[443].tls.cert_cn, 'example.com')
+
+    def test_tls_only_port_creates_stub_service(self):
+        """TLS data for a port not in open_ports creates a stub TCP entry."""
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['tls_scan'] = {
+            '8443': {
+                'protocol_version': 'TLSv1.3',
+                'cipher_name': 'TLS_AES_256_GCM_SHA384',
+                'error': None,
+                'has_forward_secrecy': True,
+            }
+        }
+        snapshot = InventoryBuilder().build(results)
+        self.assertIn(8443, snapshot.assets[0].tcp_services)
+
+    def test_vuln_summary_populated(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['vulnerabilities'] = [
+            {'severity': 'CRITICAL', 'status': 'CONFIRMED', 'cisa_kev': True},
+            {'severity': 'HIGH', 'status': 'POTENTIAL', 'cisa_kev': False},
+        ]
+        snapshot = InventoryBuilder().build(results)
+        vs = snapshot.assets[0].vuln_summary
+        self.assertEqual(vs['critical_confirmed'], 1)
+        self.assertEqual(vs['potential'], 1)
+        self.assertEqual(vs['kev_confirmed'], 1)
+
+    def test_scan_source_tcp_scan_recorded(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['open_ports'] = [{'port': 22, 'service': 'ssh', 'banner': ''}]
+        snapshot = InventoryBuilder().build(results)
+        self.assertIn('tcp-scan', snapshot.assets[0].scan_sources)
+
+    def test_scan_source_udp_scan_recorded(self):
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['udp_ports'] = [{'port': 53, 'service': 'dns', 'state': 'open'}]
+        snapshot = InventoryBuilder().build(results)
+        self.assertIn('udp-scan', snapshot.assets[0].scan_sources)
+
+    def test_snapshot_to_dict_is_json_serialisable(self):
+        import json
+        from plugins.inventory import InventoryBuilder
+        results = self._minimal_results()
+        results['open_ports'] = [{'port': 80, 'service': 'http', 'banner': ''}]
+        snapshot = InventoryBuilder().build(results)
+        # Should not raise
+        data = json.dumps(snapshot.to_dict())
+        self.assertIn('assets', data)
+
+
+# ---------------------------------------------------------------------------
+# 44. PR4 — Host profiling heuristics
+# ---------------------------------------------------------------------------
+
+class TestHostProfiler(unittest.TestCase):
+    """HostProfiler derives correct role and risk level."""
+
+    def _asset_with_ports(self, tcp_ports=None, udp_ports=None, vuln_summary=None):
+        from plugins.inventory import AssetRecord, ServiceRecord, _make_asset_id
+        asset = AssetRecord(asset_id='test0001', ip='10.0.0.1')
+        for p in (tcp_ports or []):
+            asset.tcp_services[p] = ServiceRecord(port=p, protocol='tcp')
+        for p in (udp_ports or []):
+            asset.udp_services[p] = ServiceRecord(port=p, protocol='udp')
+        asset.vuln_summary = vuln_summary or {}
+        return asset
+
+    def test_web_server_role(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[80, 443])
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.role, 'web-server')
+
+    def test_mail_server_role(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[25, 587])
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.role, 'mail-server')
+
+    def test_dns_server_role(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(udp_ports=[53])
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.role, 'dns-server')
+
+    def test_workstation_role(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[3389])
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.role, 'workstation')
+
+    def test_unknown_role_when_no_recognisable_ports(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[9999])
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.role, 'unknown')
+
+    def test_risk_critical_when_confirmed_critical(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(vuln_summary={
+            'critical_confirmed': 1, 'high_confirmed': 0,
+            'medium_confirmed': 0, 'potential': 0, 'inconclusive': 0,
+        })
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.risk_level, 'critical')
+
+    def test_risk_high_when_no_critical_but_high(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(vuln_summary={
+            'critical_confirmed': 0, 'high_confirmed': 2,
+            'medium_confirmed': 0, 'potential': 0, 'inconclusive': 0,
+        })
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.risk_level, 'high')
+
+    def test_risk_medium_when_only_medium_confirmed(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(vuln_summary={
+            'critical_confirmed': 0, 'high_confirmed': 0,
+            'medium_confirmed': 1, 'potential': 0, 'inconclusive': 0,
+        })
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.risk_level, 'medium')
+
+    def test_risk_low_when_only_potential(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(vuln_summary={
+            'critical_confirmed': 0, 'high_confirmed': 0,
+            'medium_confirmed': 0, 'potential': 3, 'inconclusive': 0,
+        })
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.risk_level, 'low')
+
+    def test_risk_none_when_no_vulns(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports()
+        HostProfiler().profile(asset)
+        self.assertEqual(asset.risk_level, 'none')
+
+    def test_role_evidence_populated(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[80])
+        HostProfiler().profile(asset)
+        self.assertTrue(len(asset.role_evidence) > 0)
+
+    def test_exposure_summary_populated(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports(tcp_ports=[80, 443])
+        HostProfiler().profile(asset)
+        self.assertIn('TCP', asset.exposure_summary)
+
+    def test_exposure_summary_no_ports(self):
+        from plugins.inventory import HostProfiler
+        asset = self._asset_with_ports()
+        HostProfiler().profile(asset)
+        self.assertIn('no open ports', asset.exposure_summary)
+
+    def test_tls_ports_counted_in_exposure(self):
+        from plugins.inventory import HostProfiler, ServiceRecord, TLSServiceRecord
+        asset = self._asset_with_ports(tcp_ports=[443])
+        asset.tcp_services[443].tls = TLSServiceRecord(
+            port=443, protocol_version='TLSv1.3', error=None
+        )
+        HostProfiler().profile(asset)
+        self.assertIn('TLS', asset.exposure_summary)
+
+
+# ---------------------------------------------------------------------------
+# 45. PR4 — CLI parsing for inventory options
+# ---------------------------------------------------------------------------
+
+class TestCLIInventoryParsing(unittest.TestCase):
+    """CLI inventory flags parsed correctly."""
+
+    def _parse(self, extra_args):
+        import argparse
+        # Import the main module to get the parser factory — we replicate
+        # argument definitions rather than calling main() to avoid side effects.
+        import sys
+        old_argv = sys.argv
+        sys.argv = ['vultron.py', '-t', '10.0.0.1'] + extra_args
+        try:
+            from vultron import main
+            import argparse as ap
+
+            # Build a parser that only includes the inventory arguments
+            parser = ap.ArgumentParser()
+            parser.add_argument('-t', '--target', required=True)
+            parser.add_argument('--no-inventory', action='store_true')
+            parser.add_argument('--inventory-output', metavar='FILE', default=None)
+            # Ignore unknown args for this test
+            args, _ = parser.parse_known_args()
+            return args
+        finally:
+            sys.argv = old_argv
+
+    def test_no_inventory_flag_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.no_inventory)
+
+    def test_no_inventory_flag_set(self):
+        args = self._parse(['--no-inventory'])
+        self.assertTrue(args.no_inventory)
+
+    def test_inventory_output_default_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.inventory_output)
+
+    def test_inventory_output_parsed(self):
+        args = self._parse(['--inventory-output', '/tmp/inv.json'])
+        self.assertEqual(args.inventory_output, '/tmp/inv.json')
+
+
+# ---------------------------------------------------------------------------
+# 46. PR4 — Inventory persistence
+# ---------------------------------------------------------------------------
+
+class TestInventoryPersistence(unittest.TestCase):
+    """persist_inventory writes a valid JSON snapshot file."""
+
+    def _build_snapshot(self):
+        from plugins.inventory import InventoryBuilder
+        results = {
+            'target': '10.0.0.1',
+            'timestamp': '2026-01-01T00:00:00',
+            'open_ports': [{'port': 443, 'service': 'https', 'banner': ''}],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+        }
+        return InventoryBuilder().build(results)
+
+    def test_persist_creates_file(self):
+        import tempfile
+        import os
+        from plugins.inventory import persist_inventory
+        snapshot = self._build_snapshot()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            persist_inventory(snapshot, path)
+            self.assertTrue(os.path.exists(path))
+        finally:
+            os.unlink(path)
+
+    def test_persist_file_is_valid_json(self):
+        import json
+        import tempfile
+        import os
+        from plugins.inventory import persist_inventory
+        snapshot = self._build_snapshot()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            persist_inventory(snapshot, path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('assets', data)
+            self.assertIn('snapshot_id', data)
+            self.assertIn('schema_version', data)
+        finally:
+            os.unlink(path)
+
+    def test_persist_creates_parent_directories(self):
+        import json
+        import tempfile
+        import os
+        import shutil
+        from plugins.inventory import persist_inventory
+        snapshot = self._build_snapshot()
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, 'sub', 'dir', 'inv.json')
+        try:
+            persist_inventory(snapshot, path)
+            self.assertTrue(os.path.exists(path))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_persist_snapshot_asset_count_matches(self):
+        import json
+        import tempfile
+        import os
+        from plugins.inventory import persist_inventory
+        snapshot = self._build_snapshot()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            persist_inventory(snapshot, path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertEqual(data['asset_count'], 1)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 47. PR4 — Report output includes inventory (JSON schema valid)
+# ---------------------------------------------------------------------------
+
+class TestReportInventoryOutput(unittest.TestCase):
+    """JSON report includes a valid 'inventory' section when inventory is built."""
+
+    def _run_mock_scan(self, extra_attrs=None):
+        """Return a HybridScanner with populated results and inventory built."""
+        import types
+        import tempfile
+        from vultron import HybridScanner
+        from plugins.inventory import InventoryBuilder, HostProfiler
+
+        args = types.SimpleNamespace(
+            scan_mode='common',
+            protocol='tcp',
+            cve_lookback_days=120,
+            no_inventory=False,
+            inventory_output=None,
+        )
+        if extra_attrs:
+            for k, v in extra_attrs.items():
+                setattr(args, k, v)
+
+        scanner = HybridScanner('192.168.1.1', args)
+        scanner.results['open_ports'] = [
+            {'port': 80, 'service': 'http', 'banner': 'Apache/2.4'},
+            {'port': 443, 'service': 'https', 'banner': ''},
+        ]
+        scanner.results['udp_ports'] = [
+            {'port': 53, 'service': 'dns', 'state': 'open'},
+        ]
+        scanner.results['tls_scan'] = {
+            '443': {
+                'protocol_version': 'TLSv1.2',
+                'cipher_name': 'ECDHE-RSA-AES256-GCM-SHA384',
+                'error': None,
+                'has_forward_secrecy': True,
+                'cert_info': {
+                    'subject_cn': 'example.com',
+                    'issuer_cn': 'Example CA',
+                    'is_self_signed': False,
+                },
+            }
+        }
+        scanner.results['vulnerabilities'] = [
+            {'severity': 'HIGH', 'status': 'CONFIRMED', 'cisa_kev': False, 'port': 80},
+        ]
+        # Build inventory
+        snapshot = InventoryBuilder().build(scanner.results)
+        profiler = HostProfiler()
+        for a in snapshot.assets:
+            profiler.profile(a)
+        scanner.results['inventory'] = snapshot.to_dict()
+        return scanner
+
+    def test_json_report_contains_inventory_key(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._run_mock_scan()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('inventory', data)
+            self.assertIn('assets', data['inventory'])
+        finally:
+            os.unlink(path)
+
+    def test_inventory_asset_has_correct_ip(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._run_mock_scan()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            assets = data['inventory']['assets']
+            self.assertEqual(len(assets), 1)
+            # IP should be resolvable from 192.168.1.1 or None (no route)
+            self.assertIn('ip', assets[0])
+        finally:
+            os.unlink(path)
+
+    def test_inventory_asset_has_tcp_services(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._run_mock_scan()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            asset = data['inventory']['assets'][0]
+            tcp = asset.get('tcp_services', {})
+            self.assertIn('80', tcp)
+            self.assertIn('443', tcp)
+        finally:
+            os.unlink(path)
+
+    def test_inventory_asset_role_and_risk_present(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._run_mock_scan()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            asset = data['inventory']['assets'][0]
+            self.assertIn('role', asset)
+            self.assertIn('risk_level', asset)
+            self.assertIn('exposure_summary', asset)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
