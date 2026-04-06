@@ -571,6 +571,7 @@ class TLSResult:
 
             # Weak public key
             if cert.public_key_bits is not None and cert.public_key_type:
+                min_bits = 0
                 key_weak = False
                 if cert.public_key_type == 'RSA' and cert.public_key_bits < _MIN_RSA_BITS:
                     key_weak = True
@@ -578,8 +579,6 @@ class TLSResult:
                 elif cert.public_key_type in ('EC', 'DSA') and cert.public_key_bits < _MIN_EC_BITS:
                     key_weak = True
                     min_bits = _MIN_EC_BITS
-                else:
-                    min_bits = 0
 
                 if key_weak:
                     findings.append({
@@ -1001,9 +1000,17 @@ class TLSInspector:
     ) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str], Optional[bytes]]:
         """Connect with CERT_NONE to collect protocol / cipher / cert metadata.
 
+        CERT_NONE is required here so the connection succeeds regardless of
+        certificate validity — this is the intended behaviour for posture
+        analysis.  The negotiated version and cipher are recorded for later
+        inspection; no data is sent beyond the TLS handshake.
+
         Returns (protocol_version, cipher_name, cipher_bits, alpn, cert_der).
         """
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # nosec B502 — CERT_NONE is intentional for posture inspection.
+        # lgtm[py/insecure-protocol] — all protocol versions allowed to detect
+        # what the server actually negotiates; findings are raised for legacy versions.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # lgtm[py/insecure-protocol]
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
@@ -1037,9 +1044,12 @@ class TLSInspector:
         Returns the stdlib ``getpeercert()`` dict if the cert is trusted by
         the system CA store, ``None`` otherwise (verification failure or
         connection error).
+
+        The default context already restricts to TLS 1.2+ on modern OpenSSL
+        installations; it is used here strictly to determine trust status.
         """
         try:
-            ctx = ssl.create_default_context()
+            ctx = ssl.create_default_context()  # lgtm[py/insecure-protocol]
             ctx.check_hostname = False  # hostname check done by our own logic
             raw_sock = socket.create_connection((host, port), timeout=self.timeout)
             try:
@@ -1078,10 +1088,13 @@ class TLSInspector:
             return None
         try:
             tls_ver = getattr(ssl.TLSVersion, version_attr)
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            # Intentionally probing with a pinned legacy version to detect
+            # whether the server accepts it.  This is the diagnostic purpose
+            # of the method; findings are raised when the handshake succeeds.
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # lgtm[py/insecure-protocol]
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            ctx.minimum_version = tls_ver
+            ctx.minimum_version = tls_ver  # lgtm[py/insecure-protocol]
             ctx.maximum_version = tls_ver
             raw_sock = socket.create_connection((host, port), timeout=self.timeout)
             try:

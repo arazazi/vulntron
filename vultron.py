@@ -1866,7 +1866,6 @@ class HybridScanner:
                     f"(timeout={tls_timeout}s, retries={tls_retries})..."
                 ))
                 tls_raw: Dict = {}
-                _tls_staged_findings: List[Dict] = []
                 for pr in tls_eligible:
                     port = pr['port']
                     result = tls_inspector.inspect_port(port)
@@ -1893,8 +1892,6 @@ class HybridScanner:
                     f"TLS inspection complete — "
                     f"{tls_finding_count}/{len(tls_eligible)} port(s) inspected\n"
                 ))
-        else:
-            _tls_staged_findings = []
 
         # Require at least one open TCP port for vulnerability checks
         if not self.results['open_ports'] and scan_protocol in ('tcp', 'both'):
