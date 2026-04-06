@@ -98,6 +98,16 @@ from .providers import (
 )
 from .auth_executor import AuthenticatedExecutor, AuthSessionContext, ProbeResult
 from .secrets import REDACTED, mask_secret, redact_dict, deep_redact_dict, redact_string
+from .inventory import (
+    AssetRecord,
+    InventoryBuilder,
+    InventorySnapshot,
+    HostProfiler,
+    OsHint,
+    ServiceRecord,
+    TLSServiceRecord,
+    persist_inventory,
+)
 
 __all__ = [
     # Phase A
@@ -129,4 +139,13 @@ __all__ = [
     "redact_dict",
     "deep_redact_dict",
     "redact_string",
+    # PR4 — asset inventory
+    "AssetRecord",
+    "InventoryBuilder",
+    "InventorySnapshot",
+    "HostProfiler",
+    "OsHint",
+    "ServiceRecord",
+    "TLSServiceRecord",
+    "persist_inventory",
 ]

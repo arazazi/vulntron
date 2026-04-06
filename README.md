@@ -9,13 +9,13 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-5.0.0-success.svg)]()
+[![Version](https://img.shields.io/badge/version-6.0.0-success.svg)]()
 
 </div>
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -29,17 +29,18 @@
 4. [Credentialed Scanning](#-credentialed-scanning)
 5. [UDP Scanning](#-udp-scanning)
 6. [TLS Deep Inspection](#-tls-deep-inspection)
-7. [Installation](#-installation)
-8. [Quick Start](#-quick-start)
-9. [CLI Reference](#-cli-reference)
-10. [Understanding Results](#-understanding-results)
-11. [Report Formats](#-report-formats)
-12. [Examples](#-examples)
-13. [Troubleshooting](#-troubleshooting)
-14. [Development](#-development)
-15. [Known Limitations](#-known-limitations)
-16. [Roadmap](#-roadmap)
-17. [License](#-license)
+7. [Asset Inventory and Host Profiling](#-asset-inventory-and-host-profiling)
+8. [Installation](#-installation)
+9. [Quick Start](#-quick-start)
+10. [CLI Reference](#-cli-reference)
+11. [Understanding Results](#-understanding-results)
+12. [Report Formats](#-report-formats)
+13. [Examples](#-examples)
+14. [Troubleshooting](#-troubleshooting)
+15. [Development](#-development)
+16. [Known Limitations](#-known-limitations)
+17. [Roadmap](#-roadmap)
+18. [License](#-license)
 
 ---
 
@@ -90,10 +91,25 @@ Each finding is assigned a status of **CONFIRMED**, **POTENTIAL**, or **INCONCLU
 
 Vulntron optionally evaluates findings against **PCI DSS 3.2.1** requirements and produces a pass/fail score with a list of failing controls.
 
+### 📦 Asset Inventory and Host Profiling
+
+Vulntron v6.0 consolidates scan output into a normalised **asset inventory** (one record per scanned host).  Each record includes:
+
+- Stable deterministic asset fingerprint for future diffing
+- Resolved IP and hostname
+- All open TCP/UDP services with banners and TLS posture
+- OS hints extracted from service banners
+- Aggregated vulnerability summary
+- Inferred **host role** (`web-server`, `mail-server`, `dns-server`, etc.) with evidence
+- Derived **risk level** (`critical`, `high`, `medium`, `low`, `none`)
+- Human-readable **exposure summary**
+
+The inventory is embedded in the JSON report and can optionally be saved as a standalone file (`--inventory-output`).
+
 ### 📄 HTML + JSON Reporting
 
-- **HTML report**: A self-contained, color-coded dashboard with an executive summary, per-finding details, port table, and compliance results.
-- **JSON report**: A machine-readable file covering all phases, suitable for ingestion by SIEMs, ticketing systems, or further automation.
+- **HTML report**: A self-contained, color-coded dashboard with an executive summary, per-finding details, port table, compliance results, and an **asset inventory section** (v6.0+).
+- **JSON report**: A machine-readable file covering all phases, suitable for ingestion by SIEMs, ticketing systems, or further automation.  Includes the `inventory` key with the full normalised asset snapshot.
 
 Report filenames follow the pattern:
 ```
@@ -174,6 +190,14 @@ User supplies target + options (--protocol tcp|udp|both)
          │  enriched findings
          ▼
 ┌───────────────────┐
+│  PHASE 3b         │  Asset inventory + host profiling (auto-enabled, --no-inventory to skip)
+│  Asset Inventory  │  → Merges TCP/UDP/TLS/vuln data into one AssetRecord per host
+│                   │  → HostProfiler: role inference, risk level, exposure summary
+│                   │  → Optional standalone JSON snapshot (--inventory-output)
+└────────┬──────────┘
+         │  inventory snapshot (embedded in results)
+         ▼
+┌───────────────────┐
 │  PHASE 4          │  PCI DSS 3.2.1 evaluation (optional, --skip-compliance)
 │  Compliance       │  → Pass / Fail score + issue list
 └────────┬──────────┘
@@ -200,6 +224,7 @@ plugins/
 ├── udp_scanner.py    # UDPScanner: UDP engine, probe builders, state classification
 ├── fingerprint.py    # Service fingerprinting: banner parsing, normalisation, confidence
 ├── tls_inspector.py  # TLSInspector: TLS handshake inspection, cert/cipher analysis
+├── inventory.py      # PR4: AssetRecord, InventoryBuilder, HostProfiler, persist_inventory
 └── checks/
     ├── __init__.py   # Auto-imports smb and network to register all built-in checks
     ├── smb.py        # EternalBlueCheck, SMBGhostCheck
@@ -692,6 +717,146 @@ TLS-derived findings are merged into `results['vulnerabilities']` with `"categor
 
 ---
 
+## 📦 Asset Inventory and Host Profiling
+
+> **PR4 feature** — available in Vulntron v6.0.0+.
+
+Vulntron v6.0 introduces a **first-class asset inventory subsystem** that consolidates all scan observations (TCP ports, UDP ports, TLS posture, vulnerability findings) into a stable, normalised asset record per host. The inventory is designed for reporting, tracking, and future compliance/patch workflows.
+
+### What the Inventory Captures
+
+For each scanned host, Vulntron produces a single `AssetRecord` containing:
+
+| Field | Description |
+|-------|-------------|
+| `asset_id` | Stable 16-character hex fingerprint (SHA-256 of `<ip>\|<hostname>`) |
+| `ip` | Primary IP address (resolved from target if a hostname) |
+| `hostname` | FQDN / rDNS hostname, when available |
+| `tcp_services` | Open TCP ports with service name, banner, version, and TLS posture |
+| `udp_services` | Open UDP ports with service name and state |
+| `os_hints` | OS/platform hints extracted from banners, with source and confidence |
+| `vuln_summary` | Aggregated vulnerability counters (critical/high/medium/potential/KEV) |
+| `risk_level` | Derived risk label: `critical`, `high`, `medium`, `low`, or `none` |
+| `role` | Inferred host role: `web-server`, `mail-server`, `dns-server`, `file-server`, `database-server`, `network-device`, `workstation`, `legacy-device`, `server`, `unknown` |
+| `role_evidence` | Ports/signals that led to the role inference |
+| `exposure_summary` | One-line plain-text exposure description |
+| `scan_sources` | Modules that contributed data (`tcp-scan`, `udp-scan`, `tls-inspect`) |
+| `first_seen` / `last_seen` | Timestamps for first and most recent observation |
+
+### Host Profiling Heuristics
+
+Host profiling is performed by `HostProfiler` immediately after the inventory is built.  All heuristics are **deterministic and explainable** — the evidence used to derive each label is stored in `role_evidence`.
+
+**Role inference** is based on recognisable open ports:
+
+| Role | Trigger Ports |
+|------|--------------|
+| `mail-server` | 25, 110, 143, 465, 587, 993, 995 |
+| `dns-server` | 53 (TCP or UDP) |
+| `database-server` | 1433, 1521, 3306, 5432, 27017 |
+| `network-device` | 161, 162 (SNMP) |
+| `web-server` | 80, 443, 8080, 8443 |
+| `file-server` | 139, 445 (SMB/Samba) |
+| `workstation` | 3389 (RDP) |
+| `legacy-device` | 23 (Telnet) |
+| `server` | 22 (SSH only) |
+| `unknown` | None of the above |
+
+**Risk level** is derived from the vulnerability summary:
+
+| Risk Level | Condition |
+|------------|-----------|
+| `critical` | At least one CONFIRMED CRITICAL finding |
+| `high` | At least one CONFIRMED HIGH finding |
+| `medium` | At least one CONFIRMED MEDIUM finding |
+| `low` | Potential or inconclusive findings present |
+| `none` | No findings |
+
+### Quick Start — Asset Inventory
+
+Asset inventory runs **automatically** by default alongside every scan.  No extra flags are required:
+
+```bash
+python3 vultron.py -t 192.168.1.100
+# Inventory is built automatically and embedded in the JSON report.
+```
+
+**Save a standalone inventory JSON file:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --inventory-output inventory_192_168_1_100.json
+```
+
+**Disable inventory generation:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --no-inventory
+```
+
+### Inventory Output Format
+
+The inventory is included in the `inventory` key of the main JSON report and optionally persisted as a standalone file via `--inventory-output`.  Both use the same schema:
+
+```json
+{
+  "snapshot_id": "a1b2c3d4e5f6",
+  "schema_version": "1.0",
+  "generated_at": "2026-01-01T00:00:00+00:00",
+  "asset_count": 1,
+  "assets": [
+    {
+      "asset_id": "3f8a1b2c4d5e6f7a",
+      "ip": "192.168.1.100",
+      "hostname": "server.example.com",
+      "os_hints": [
+        { "hint": "SSH server (OpenSSH)", "source": "banner", "confidence": 0.4 }
+      ],
+      "tcp_services": {
+        "22":  { "port": 22,  "protocol": "tcp", "service": "ssh",   "banner": "SSH-2.0-OpenSSH_8.9p1", "state": "open", "version": "OpenSSH_8.9p1" },
+        "80":  { "port": 80,  "protocol": "tcp", "service": "http",  "banner": "Apache/2.4.54", "state": "open" },
+        "443": { "port": 443, "protocol": "tcp", "service": "https", "state": "open",
+                 "tls": { "port": 443, "protocol_version": "TLSv1.2", "cipher_name": "ECDHE-RSA-AES256-GCM-SHA384",
+                          "cert_cn": "server.example.com", "has_forward_secrecy": true, "error": null } }
+      },
+      "udp_services": {
+        "53": { "port": 53, "protocol": "udp", "service": "dns", "state": "open" }
+      },
+      "vuln_summary": {
+        "total": 2, "critical_confirmed": 0, "high_confirmed": 1,
+        "medium_confirmed": 0, "potential": 1, "inconclusive": 0, "kev_confirmed": 0
+      },
+      "risk_level": "high",
+      "role": "web-server",
+      "role_evidence": ["port 80/tcp open → web-server", "port 443/tcp open → web-server"],
+      "exposure_summary": "3 TCP port(s) open; 1 UDP port(s) open/filtered; 1 TLS-capable port(s)",
+      "first_seen": "2026-01-01T00:00:00",
+      "last_seen": "2026-01-01T00:00:05+00:00",
+      "scan_sources": ["tcp-scan", "tls-inspect", "udp-scan"]
+    }
+  ]
+}
+```
+
+### HTML Report — Asset Inventory Section
+
+When inventory data is present, the HTML report includes a dedicated **Asset Inventory** table showing:
+
+- IP / host identifier
+- Resolved hostname
+- Inferred role
+- Risk level badge
+- TCP and UDP port counts
+- Exposure summary
+
+### Notes and Constraints
+
+- **Single-host scope**: Each scan run targets one host and produces one asset record.  Multi-host aggregation across runs is planned for a future phase.
+- **Discovery/posture oriented**: The inventory is designed for authorized discovery and posture assessment, not production asset management.
+- **No compliance engine in this release**: Compliance/patch workflows are planned for later phases.
+- **Stable fingerprint**: The `asset_id` is deterministic — repeated scans of the same host produce the same ID, enabling future diffing.
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -841,6 +1006,13 @@ python3 vultron.py -t <target> [options]
 | `--no-tls-inspect` | flag | `False` | Disable SSL/TLS deep inspection (enabled by default for TLS-capable ports) |
 | `--tls-timeout` | float | `5.0` | Per-port TLS handshake timeout in seconds |
 | `--tls-retries` | int | `2` | TLS handshake attempt count per port |
+
+### Asset Inventory Options (PR4)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--no-inventory` | flag | `False` | Disable asset inventory generation (inventory is built by default) |
+| `--inventory-output` | path | — | Save a standalone inventory JSON snapshot to this path (also embedded in main JSON report) |
 
 ### Credentialed Scanning Options (authorized use only)
 
@@ -1150,9 +1322,9 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [x] **Phase A: Plugin framework** — `plugins/` package, `BaseCheck` / `CheckRegistry`, 8 built-in checks
 - [x] **Phase A: Unified finding schema** — `Finding`, `Evidence`, `ScanMetadata` dataclasses; adapter layer for backward compat
 - [x] **PR1: Credentialed scanning framework** — SSH/WinRM/WMI credential model, secret redaction, provider abstraction, authenticated probes
-- [ ] PR2: UDP scanner + service fingerprinting expansion
-- [ ] PR3: SSL/TLS deep inspection module
-- [ ] PR4: Asset inventory + host profiling
+- [x] **PR2: UDP scanner + service fingerprinting expansion** — protocol-aware probes (DNS/NTP/SNMP), state classification, service fingerprinting
+- [x] **PR3: SSL/TLS deep inspection module** — cert analysis, cipher/protocol posture, legacy version detection, hostname mismatch
+- [x] **PR4: Asset inventory + host profiling** — normalised asset records, deterministic fingerprint, host role/risk/exposure inference, JSON persistence
 - [ ] PR5: Compliance engine (CIS/NIST/ISO policy packs)
 - [ ] PR6: Patch detection (OS/package mapping via credentialed checks)
 - [ ] PR7: Web application scanner (safe, non-exploit checks)
