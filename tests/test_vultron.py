@@ -2848,6 +2848,949 @@ class TestTCPFingerprintEnrichment(unittest.TestCase):
         self.assertIsNone(result)
 
 
+# ---------------------------------------------------------------------------
+# 30. PR3 — TLS certificate date parsing
+# ---------------------------------------------------------------------------
+
+class TestTLSCertDateParsing(unittest.TestCase):
+    """_parse_cert_date() handles the various date formats produced by ssl.getpeercert()."""
+
+    def _parse(self, s):
+        from plugins.tls_inspector import _parse_cert_date
+        return _parse_cert_date(s)
+
+    def test_standard_date_parses(self):
+        dt = self._parse('Nov 25 12:00:00 2025 GMT')
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2025)
+        self.assertEqual(dt.month, 11)
+        self.assertEqual(dt.day, 25)
+
+    def test_single_digit_day_parses(self):
+        """Space-padded single-digit day 'Nov  5 ...' should parse correctly."""
+        dt = self._parse('Nov  5 12:00:00 2025 GMT')
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.day, 5)
+
+    def test_result_is_utc_aware(self):
+        from datetime import timezone
+        dt = self._parse('Jan 01 00:00:00 2030 GMT')
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.tzinfo, timezone.utc)
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(self._parse(''))
+
+    def test_invalid_string_returns_none(self):
+        self.assertIsNone(self._parse('not a date at all'))
+
+    def test_future_date_is_in_future(self):
+        from datetime import datetime, timezone
+        dt = self._parse('Jan 01 00:00:00 2099 GMT')
+        self.assertIsNotNone(dt)
+        self.assertGreater(dt, datetime.now(timezone.utc))
+
+    def test_past_date_is_in_past(self):
+        from datetime import datetime, timezone
+        dt = self._parse('Jan 01 00:00:00 2000 GMT')
+        self.assertIsNotNone(dt)
+        self.assertLess(dt, datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# 31. PR3 — TLS self-signed and hostname matching
+# ---------------------------------------------------------------------------
+
+class TestTLSCertAnalysis(unittest.TestCase):
+    """TLSCertInfo and helper functions for cert analysis."""
+
+    def _make_cert_info(self, **kwargs):
+        from plugins.tls_inspector import TLSCertInfo
+        defaults = dict(
+            subject_cn='example.com',
+            subject_san=['example.com', 'www.example.com'],
+            subject_ip_san=[],
+            issuer_cn='example.com',
+            not_before=None,
+            not_after=None,
+            is_self_signed=True,
+            chain_trusted=False,
+        )
+        defaults.update(kwargs)
+        return TLSCertInfo(**defaults)
+
+    def test_self_signed_detection(self):
+        cert = self._make_cert_info(is_self_signed=True)
+        self.assertTrue(cert.is_self_signed)
+
+    def test_not_self_signed(self):
+        cert = self._make_cert_info(
+            subject_cn='example.com',
+            issuer_cn='Let\'s Encrypt Authority X3',
+            is_self_signed=False,
+        )
+        self.assertFalse(cert.is_self_signed)
+
+    def test_hostname_matches_exact_san(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=['example.com', 'www.example.com'],
+            subject_cn='example.com',
+        )
+        self.assertTrue(_hostname_matches_cert('example.com', cert))
+
+    def test_hostname_matches_wildcard_san(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=['*.example.com'],
+            subject_cn='*.example.com',
+        )
+        self.assertTrue(_hostname_matches_cert('sub.example.com', cert))
+
+    def test_hostname_does_not_match(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=['example.com'],
+            subject_cn='example.com',
+        )
+        result = _hostname_matches_cert('other.com', cert)
+        self.assertFalse(result)
+
+    def test_hostname_match_case_insensitive(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=['Example.COM'],
+            subject_cn='Example.COM',
+        )
+        self.assertTrue(_hostname_matches_cert('example.com', cert))
+
+    def test_no_san_falls_back_to_cn(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=[],
+            subject_cn='example.com',
+        )
+        self.assertTrue(_hostname_matches_cert('example.com', cert))
+
+    def test_empty_cert_returns_none(self):
+        from plugins.tls_inspector import _hostname_matches_cert
+        cert = self._make_cert_info(
+            subject_san=[],
+            subject_cn=None,
+        )
+        self.assertIsNone(_hostname_matches_cert('example.com', cert))
+
+    def test_cert_info_to_dict_has_required_keys(self):
+        cert = self._make_cert_info()
+        d = cert.to_dict()
+        for key in ('subject_cn', 'subject_san', 'issuer_cn', 'not_before',
+                    'not_after', 'is_self_signed', 'chain_trusted',
+                    'sig_algorithm', 'public_key_type', 'public_key_bits'):
+            self.assertIn(key, d, f"Missing key '{key}' in cert_info dict")
+
+
+# ---------------------------------------------------------------------------
+# 32. PR3 — TLS cipher and protocol classification
+# ---------------------------------------------------------------------------
+
+class TestTLSCipherProtocolClassification(unittest.TestCase):
+    """TLSResult.to_findings() produces correct severity for cipher/protocol issues."""
+
+    def _make_result(self, **kwargs):
+        from plugins.tls_inspector import TLSResult
+        defaults = dict(
+            host='127.0.0.1',
+            port=443,
+            protocol_version='TLSv1.2',
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            cipher_bits=256,
+            has_forward_secrecy=True,
+        )
+        defaults.update(kwargs)
+        return TLSResult(**defaults)
+
+    def test_null_cipher_is_critical(self):
+        r = self._make_result(cipher_name='NULL-SHA')
+        findings = r.to_findings('127.0.0.1')
+        critical = [f for f in findings if f['severity'] == 'CRITICAL']
+        self.assertTrue(len(critical) > 0)
+
+    def test_rc4_cipher_is_high(self):
+        r = self._make_result(cipher_name='RC4-SHA', has_forward_secrecy=False)
+        findings = r.to_findings('127.0.0.1')
+        cipher_finding = next(
+            (f for f in findings if 'CIPHER' in f['id']), None)
+        self.assertIsNotNone(cipher_finding)
+        self.assertEqual(cipher_finding['severity'], 'HIGH')
+
+    def test_3des_cipher_is_medium(self):
+        r = self._make_result(cipher_name='ECDHE-RSA-3DES-EDE-CBC-SHA')
+        findings = r.to_findings('127.0.0.1')
+        cipher_finding = next(
+            (f for f in findings if 'CIPHER' in f['id']), None)
+        self.assertIsNotNone(cipher_finding)
+        self.assertEqual(cipher_finding['severity'], 'MEDIUM')
+
+    def test_good_cipher_no_cipher_finding(self):
+        r = self._make_result(
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            has_forward_secrecy=True,
+        )
+        findings = r.to_findings('127.0.0.1')
+        cipher_findings = [f for f in findings if 'CIPHER' in f['id']]
+        self.assertEqual(len(cipher_findings), 0)
+
+    def test_no_forward_secrecy_gives_medium_finding(self):
+        r = self._make_result(
+            cipher_name='RSA-AES256-CBC-SHA256',
+            has_forward_secrecy=False,
+        )
+        findings = r.to_findings('127.0.0.1')
+        fs_findings = [f for f in findings if 'NO-FS' in f['id']]
+        self.assertEqual(len(fs_findings), 1)
+        self.assertEqual(fs_findings[0]['severity'], 'MEDIUM')
+
+    def test_forward_secrecy_present_no_fs_finding(self):
+        r = self._make_result(
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            has_forward_secrecy=True,
+        )
+        findings = r.to_findings('127.0.0.1')
+        fs_findings = [f for f in findings if 'NO-FS' in f['id']]
+        self.assertEqual(len(fs_findings), 0)
+
+    def test_legacy_protocol_tls10_gives_high(self):
+        r = self._make_result(protocol_version='TLSv1')
+        findings = r.to_findings('127.0.0.1')
+        proto_findings = [f for f in findings if 'LEGACY-PROTO' in f['id']]
+        self.assertEqual(len(proto_findings), 1)
+        self.assertEqual(proto_findings[0]['severity'], 'HIGH')
+
+    def test_legacy_protocol_tls11_gives_high(self):
+        r = self._make_result(protocol_version='TLSv1.1')
+        findings = r.to_findings('127.0.0.1')
+        proto_findings = [f for f in findings if 'LEGACY-PROTO' in f['id']]
+        self.assertEqual(len(proto_findings), 1)
+        self.assertEqual(proto_findings[0]['severity'], 'HIGH')
+
+    def test_tls12_no_legacy_finding(self):
+        r = self._make_result(protocol_version='TLSv1.2')
+        findings = r.to_findings('127.0.0.1')
+        proto_findings = [f for f in findings if 'LEGACY-PROTO' in f['id']]
+        self.assertEqual(len(proto_findings), 0)
+
+    def test_tls10_accepted_finding(self):
+        r = self._make_result(protocol_version='TLSv1.2', tls10_accepted=True)
+        findings = r.to_findings('127.0.0.1')
+        tls10_findings = [f for f in findings if '1-0-ACCEPTED' in f['id']]
+        self.assertEqual(len(tls10_findings), 1)
+        self.assertEqual(tls10_findings[0]['status'], 'CONFIRMED')
+
+    def test_tls10_not_accepted_no_finding(self):
+        r = self._make_result(protocol_version='TLSv1.2', tls10_accepted=False)
+        findings = r.to_findings('127.0.0.1')
+        tls10_findings = [f for f in findings if '1-0-ACCEPTED' in f['id']]
+        self.assertEqual(len(tls10_findings), 0)
+
+    def test_findings_all_confirmed_or_empty(self):
+        """All TLS findings should be CONFIRMED (not POTENTIAL/INCONCLUSIVE)."""
+        r = self._make_result(
+            cipher_name='RC4-SHA',
+            protocol_version='TLSv1',
+            has_forward_secrecy=False,
+            tls10_accepted=True,
+        )
+        findings = r.to_findings('127.0.0.1')
+        for f in findings:
+            self.assertEqual(f['status'], 'CONFIRMED',
+                             f"Finding {f['id']} should be CONFIRMED, got {f['status']}")
+
+    def test_error_result_produces_no_findings(self):
+        """When error is set, to_findings() returns empty list."""
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443, error='connection refused')
+        findings = r.to_findings('127.0.0.1')
+        self.assertEqual(findings, [])
+
+
+# ---------------------------------------------------------------------------
+# 33. PR3 — TLS certificate-based findings
+# ---------------------------------------------------------------------------
+
+class TestTLSCertFindings(unittest.TestCase):
+    """to_findings() cert checks: expiry, self-signed, hostname, weak key/sig."""
+
+    def _make_result_with_cert(self, cert_kwargs):
+        from plugins.tls_inspector import TLSResult, TLSCertInfo
+        from datetime import datetime, timezone, timedelta
+        cert_defaults = dict(
+            subject_cn='example.com',
+            subject_san=['example.com'],
+            subject_ip_san=[],
+            issuer_cn='CA',
+            is_self_signed=False,
+            chain_trusted=True,
+            not_before=datetime.now(timezone.utc) - timedelta(days=30),
+            not_after=datetime.now(timezone.utc) + timedelta(days=365),
+        )
+        cert_defaults.update(cert_kwargs)
+        cert = TLSCertInfo(**cert_defaults)
+        return TLSResult(
+            host='example.com',
+            port=443,
+            protocol_version='TLSv1.2',
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            cipher_bits=256,
+            has_forward_secrecy=True,
+            cert_info=cert,
+        )
+
+    def test_expired_cert_gives_high_finding(self):
+        from datetime import datetime, timezone, timedelta
+        r = self._make_result_with_cert({
+            'not_after': datetime.now(timezone.utc) - timedelta(days=1),
+        })
+        findings = r.to_findings('example.com')
+        exp = [f for f in findings if 'EXPIRED' in f['id']]
+        self.assertEqual(len(exp), 1)
+        self.assertEqual(exp[0]['severity'], 'HIGH')
+        self.assertEqual(exp[0]['status'], 'CONFIRMED')
+
+    def test_not_yet_valid_cert_gives_high_finding(self):
+        from datetime import datetime, timezone, timedelta
+        r = self._make_result_with_cert({
+            'not_before': datetime.now(timezone.utc) + timedelta(days=1),
+        })
+        findings = r.to_findings('example.com')
+        nyv = [f for f in findings if 'NOT-YET-VALID' in f['id']]
+        self.assertEqual(len(nyv), 1)
+        self.assertEqual(nyv[0]['severity'], 'HIGH')
+
+    def test_expiring_in_7_days_is_high(self):
+        from datetime import datetime, timezone, timedelta
+        r = self._make_result_with_cert({
+            'not_after': datetime.now(timezone.utc) + timedelta(days=5),
+        })
+        findings = r.to_findings('example.com')
+        exp = [f for f in findings if 'EXPIRING' in f['id']]
+        self.assertEqual(len(exp), 1)
+        self.assertEqual(exp[0]['severity'], 'HIGH')
+
+    def test_expiring_in_20_days_is_medium(self):
+        from datetime import datetime, timezone, timedelta
+        r = self._make_result_with_cert({
+            'not_after': datetime.now(timezone.utc) + timedelta(days=20),
+        })
+        findings = r.to_findings('example.com')
+        exp = [f for f in findings if 'EXPIRING' in f['id']]
+        self.assertEqual(len(exp), 1)
+        self.assertEqual(exp[0]['severity'], 'MEDIUM')
+
+    def test_valid_cert_no_expiry_finding(self):
+        from datetime import datetime, timezone, timedelta
+        r = self._make_result_with_cert({
+            'not_after': datetime.now(timezone.utc) + timedelta(days=180),
+        })
+        findings = r.to_findings('example.com')
+        exp = [f for f in findings
+               if 'EXPIR' in f['id'] or 'EXPIRED' in f['id']]
+        self.assertEqual(len(exp), 0)
+
+    def test_self_signed_cert_gives_medium_finding(self):
+        r = self._make_result_with_cert({
+            'is_self_signed': True,
+            'chain_trusted': False,
+        })
+        findings = r.to_findings('example.com')
+        ss = [f for f in findings if 'SELF-SIGNED' in f['id']]
+        self.assertEqual(len(ss), 1)
+        self.assertEqual(ss[0]['severity'], 'MEDIUM')
+        self.assertEqual(ss[0]['status'], 'CONFIRMED')
+
+    def test_untrusted_chain_gives_medium_finding(self):
+        r = self._make_result_with_cert({
+            'is_self_signed': False,
+            'chain_trusted': False,
+        })
+        findings = r.to_findings('example.com')
+        ut = [f for f in findings if 'UNTRUSTED' in f['id']]
+        self.assertEqual(len(ut), 1)
+        self.assertEqual(ut[0]['severity'], 'MEDIUM')
+
+    def test_trusted_chain_no_trust_finding(self):
+        r = self._make_result_with_cert({
+            'is_self_signed': False,
+            'chain_trusted': True,
+        })
+        findings = r.to_findings('example.com')
+        trust_findings = [f for f in findings
+                          if 'SELF-SIGNED' in f['id'] or 'UNTRUSTED' in f['id']]
+        self.assertEqual(len(trust_findings), 0)
+
+    def test_hostname_mismatch_gives_high_finding(self):
+        r = self._make_result_with_cert({
+            'subject_cn': 'other.com',
+            'subject_san': ['other.com'],
+        })
+        findings = r.to_findings('example.com')
+        mismatch = [f for f in findings if 'HOSTNAME-MISMATCH' in f['id']]
+        self.assertEqual(len(mismatch), 1)
+        self.assertEqual(mismatch[0]['severity'], 'HIGH')
+
+    def test_hostname_match_no_mismatch_finding(self):
+        r = self._make_result_with_cert({
+            'subject_cn': 'example.com',
+            'subject_san': ['example.com'],
+        })
+        findings = r.to_findings('example.com')
+        mismatch = [f for f in findings if 'HOSTNAME-MISMATCH' in f['id']]
+        self.assertEqual(len(mismatch), 0)
+
+    def test_ip_target_skips_hostname_check(self):
+        """Hostname mismatch check is skipped when target is an IP address."""
+        r = self._make_result_with_cert({
+            'subject_cn': 'example.com',
+            'subject_san': ['example.com'],
+        })
+        findings = r.to_findings('192.168.1.1')  # IP target
+        mismatch = [f for f in findings if 'HOSTNAME-MISMATCH' in f['id']]
+        self.assertEqual(len(mismatch), 0)
+
+    def test_weak_rsa_key_gives_medium_finding(self):
+        r = self._make_result_with_cert({
+            'sig_algorithm': 'sha256',
+            'public_key_type': 'RSA',
+            'public_key_bits': 1024,
+        })
+        findings = r.to_findings('example.com')
+        key_findings = [f for f in findings if 'WEAK-KEY' in f['id']]
+        self.assertEqual(len(key_findings), 1)
+        self.assertEqual(key_findings[0]['severity'], 'MEDIUM')
+
+    def test_adequate_rsa_key_no_finding(self):
+        r = self._make_result_with_cert({
+            'public_key_type': 'RSA',
+            'public_key_bits': 2048,
+        })
+        findings = r.to_findings('example.com')
+        key_findings = [f for f in findings if 'WEAK-KEY' in f['id']]
+        self.assertEqual(len(key_findings), 0)
+
+    def test_sha1_signature_gives_high_finding(self):
+        r = self._make_result_with_cert({
+            'sig_algorithm': 'sha1',
+        })
+        findings = r.to_findings('example.com')
+        sig_findings = [f for f in findings if 'WEAK-SIG' in f['id']]
+        self.assertEqual(len(sig_findings), 1)
+        self.assertEqual(sig_findings[0]['severity'], 'HIGH')
+
+    def test_sha256_signature_no_finding(self):
+        r = self._make_result_with_cert({
+            'sig_algorithm': 'sha256',
+        })
+        findings = r.to_findings('example.com')
+        sig_findings = [f for f in findings if 'WEAK-SIG' in f['id']]
+        self.assertEqual(len(sig_findings), 0)
+
+
+# ---------------------------------------------------------------------------
+# 34. PR3 — is_tls_port() utility
+# ---------------------------------------------------------------------------
+
+class TestIsTLSPort(unittest.TestCase):
+    """is_tls_port() correctly identifies TLS-eligible port records."""
+
+    def test_443_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 443, 'service': 'HTTPS'}))
+
+    def test_8443_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 8443, 'service': 'HTTPS-Alt'}))
+
+    def test_993_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 993, 'service': 'IMAPS'}))
+
+    def test_636_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 636, 'service': 'LDAPS'}))
+
+    def test_80_is_not_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertFalse(is_tls_port({'port': 80, 'service': 'HTTP'}))
+
+    def test_22_is_not_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertFalse(is_tls_port({'port': 22, 'service': 'SSH'}))
+
+    def test_service_keyword_https_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 9000, 'service': 'https-proxy'}))
+
+    def test_service_keyword_smtps_is_tls(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertTrue(is_tls_port({'port': 465, 'service': 'SMTPS'}))
+
+    def test_unknown_port_not_tls_service(self):
+        from plugins.tls_inspector import is_tls_port
+        self.assertFalse(is_tls_port({'port': 12345, 'service': 'Unknown-12345'}))
+
+
+# ---------------------------------------------------------------------------
+# 35. PR3 — forward secrecy detection
+# ---------------------------------------------------------------------------
+
+class TestForwardSecrecyDetection(unittest.TestCase):
+    """_check_forward_secrecy() correctly identifies FS cipher suites."""
+
+    def _check(self, cipher_name):
+        from plugins.tls_inspector import _check_forward_secrecy
+        return _check_forward_secrecy(cipher_name)
+
+    def test_ecdhe_has_forward_secrecy(self):
+        self.assertTrue(self._check('ECDHE-RSA-AES256-GCM-SHA384'))
+
+    def test_dhe_has_forward_secrecy(self):
+        self.assertTrue(self._check('DHE-RSA-AES256-SHA256'))
+
+    def test_edh_has_forward_secrecy(self):
+        self.assertTrue(self._check('EDH-RSA-DES-CBC3-SHA'))
+
+    def test_rsa_no_forward_secrecy(self):
+        self.assertFalse(self._check('RSA-AES256-CBC-SHA256'))
+
+    def test_empty_string_no_forward_secrecy(self):
+        self.assertFalse(self._check(''))
+
+    def test_rc4_no_forward_secrecy(self):
+        self.assertFalse(self._check('RC4-SHA'))
+
+
+# ---------------------------------------------------------------------------
+# 36. PR3 — TLS result serialisation
+# ---------------------------------------------------------------------------
+
+class TestTLSResultSerialization(unittest.TestCase):
+    """TLSResult.to_dict() produces correct structure."""
+
+    def test_to_dict_has_required_keys(self):
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443, protocol_version='TLSv1.2',
+                      cipher_name='ECDHE-RSA-AES256-GCM-SHA384', cipher_bits=256,
+                      has_forward_secrecy=True)
+        d = r.to_dict()
+        for key in ('host', 'port', 'protocol_version', 'protocol_display',
+                    'cipher_name', 'cipher_bits', 'has_forward_secrecy',
+                    'alpn', 'sni_used', 'cert_info', 'tls10_accepted',
+                    'tls11_accepted', 'error', 'duration_ms'):
+            self.assertIn(key, d, f"Missing key '{key}' in TLSResult.to_dict()")
+
+    def test_protocol_display_tls12(self):
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443, protocol_version='TLSv1.2')
+        self.assertEqual(r.to_dict()['protocol_display'], 'TLS 1.2')
+
+    def test_protocol_display_tls13(self):
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443, protocol_version='TLSv1.3')
+        self.assertEqual(r.to_dict()['protocol_display'], 'TLS 1.3')
+
+    def test_error_result_serializes(self):
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443, error='connection refused')
+        d = r.to_dict()
+        self.assertEqual(d['error'], 'connection refused')
+
+    def test_no_error_is_none(self):
+        from plugins.tls_inspector import TLSResult
+        r = TLSResult(host='127.0.0.1', port=443)
+        self.assertIsNone(r.to_dict()['error'])
+
+
+# ---------------------------------------------------------------------------
+# 37. PR3 — TLSInspector graceful failure handling
+# ---------------------------------------------------------------------------
+
+class TestTLSInspectorGracefulFailure(unittest.TestCase):
+    """TLSInspector handles handshake failures gracefully."""
+
+    def _inspector(self, retries=1):
+        from plugins.tls_inspector import TLSInspector
+        return TLSInspector('127.0.0.1', timeout=0.5, retries=retries)
+
+    def test_connection_refused_returns_error_result(self):
+        """ConnectionRefusedError → TLSResult with error field set."""
+        inspector = self._inspector()
+        with patch('socket.create_connection') as mock_conn:
+            mock_conn.side_effect = ConnectionRefusedError('refused')
+            result = inspector.inspect_port(443)
+        self.assertIsNotNone(result.error)
+        self.assertIsNone(result.protocol_version)
+
+    def test_socket_timeout_returns_error_result(self):
+        """socket.timeout → TLSResult with error field set."""
+        import socket as _socket
+        inspector = self._inspector()
+        with patch('socket.create_connection') as mock_conn:
+            mock_conn.side_effect = _socket.timeout('timed out')
+            result = inspector.inspect_port(443)
+        self.assertIsNotNone(result.error)
+
+    def test_ssl_error_returns_error_result(self):
+        """ssl.SSLError → TLSResult with error field set."""
+        import ssl as _ssl
+        inspector = self._inspector()
+        with patch('socket.create_connection') as mock_conn:
+            mock_conn.side_effect = _ssl.SSLError('ssl error')
+            result = inspector.inspect_port(443)
+        self.assertIsNotNone(result.error)
+
+    def test_error_result_has_host_and_port(self):
+        """Even on failure, host and port are always set."""
+        inspector = self._inspector()
+        with patch('socket.create_connection') as mock_conn:
+            mock_conn.side_effect = ConnectionRefusedError('refused')
+            result = inspector.inspect_port(8443)
+        self.assertEqual(result.host, '127.0.0.1')
+        self.assertEqual(result.port, 8443)
+
+    def test_retries_respected(self):
+        """With retries=3, create_connection should be called 3 times on failure."""
+        inspector = self._inspector(retries=3)
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            raise OSError('network error')
+
+        with patch('socket.create_connection', side_effect=side_effect):
+            result = inspector.inspect_port(443)
+        self.assertEqual(call_count[0], 3)
+        self.assertIsNotNone(result.error)
+
+    def test_error_string_truncated_to_120_chars(self):
+        """Error messages longer than 120 chars are truncated."""
+        from plugins.tls_inspector import TLSInspector
+        inspector = TLSInspector('127.0.0.1')
+        long_error = 'x' * 200
+        result = inspector._sanitise_error(long_error)
+        self.assertLessEqual(len(result), 124)  # 120 + '...'
+
+    def test_inspect_ports_returns_dict_keyed_by_port(self):
+        """inspect_ports() maps port number → TLSResult."""
+        inspector = self._inspector()
+        port_records = [
+            {'port': 443, 'service': 'HTTPS'},
+            {'port': 8443, 'service': 'HTTPS-Alt'},
+        ]
+        with patch.object(inspector, 'inspect_port') as mock_ip:
+            from plugins.tls_inspector import TLSResult
+            mock_ip.side_effect = lambda p: TLSResult(
+                host='127.0.0.1', port=p, error='refused')
+            results = inspector.inspect_ports(port_records)
+        self.assertIn(443, results)
+        self.assertIn(8443, results)
+
+
+# ---------------------------------------------------------------------------
+# 38. PR3 — CLI parsing for TLS options
+# ---------------------------------------------------------------------------
+
+class TestTLSCLIParsing(unittest.TestCase):
+    """CLI parser correctly handles TLS inspection flags."""
+
+    def _parse(self, args_list):
+        import argparse as ap
+        parser = ap.ArgumentParser()
+        parser.add_argument('-t', '--target', required=True)
+        parser.add_argument('--scan-mode', default='common')
+        parser.add_argument('--ports')
+        parser.add_argument('--timeout', type=float, default=1.0)
+        parser.add_argument('--retries', type=int, default=1)
+        parser.add_argument('--concurrency', type=int, default=50)
+        parser.add_argument('--skip-nvd', action='store_true')
+        parser.add_argument('--skip-compliance', action='store_true')
+        parser.add_argument('--cve-lookback-days', type=int, default=120)
+        parser.add_argument('--protocol', choices=['tcp', 'udp', 'both'], default='tcp')
+        parser.add_argument('--udp-timeout', type=float, default=2.0)
+        parser.add_argument('--udp-retries', type=int, default=2)
+        parser.add_argument('--udp-ports')
+        # TLS options
+        parser.add_argument('--no-tls-inspect', action='store_true')
+        parser.add_argument('--tls-timeout', type=float, default=5.0)
+        parser.add_argument('--tls-retries', type=int, default=2)
+        # Credential args
+        parser.add_argument('--cred-file')
+        parser.add_argument('--ssh-user')
+        parser.add_argument('--ssh-password')
+        parser.add_argument('--ssh-key')
+        parser.add_argument('--ssh-port', type=int, default=22)
+        parser.add_argument('--winrm-user')
+        parser.add_argument('--winrm-password')
+        parser.add_argument('--winrm-domain')
+        parser.add_argument('--winrm-transport', default='http')
+        parser.add_argument('--wmi-user')
+        parser.add_argument('--wmi-password')
+        parser.add_argument('--wmi-domain')
+        return parser.parse_args(args_list)
+
+    def test_tls_inspect_enabled_by_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertFalse(args.no_tls_inspect)
+
+    def test_no_tls_inspect_flag(self):
+        args = self._parse(['-t', '10.0.0.1', '--no-tls-inspect'])
+        self.assertTrue(args.no_tls_inspect)
+
+    def test_tls_timeout_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertAlmostEqual(args.tls_timeout, 5.0)
+
+    def test_tls_timeout_custom(self):
+        args = self._parse(['-t', '10.0.0.1', '--tls-timeout', '10.0'])
+        self.assertAlmostEqual(args.tls_timeout, 10.0)
+
+    def test_tls_retries_default(self):
+        args = self._parse(['-t', '10.0.0.1'])
+        self.assertEqual(args.tls_retries, 2)
+
+    def test_tls_retries_custom(self):
+        args = self._parse(['-t', '10.0.0.1', '--tls-retries', '3'])
+        self.assertEqual(args.tls_retries, 3)
+
+
+# ---------------------------------------------------------------------------
+# 39. PR3 — HybridScanner TLS pipeline integration
+# ---------------------------------------------------------------------------
+
+class TestHybridScannerTLSIntegration(unittest.TestCase):
+    """HybridScanner integrates TLS results correctly."""
+
+    def _make_args(self, **kwargs):
+        import argparse
+        defaults = dict(
+            scan_mode='common', timeout=1.0, retries=1, concurrency=50,
+            ports=None, skip_nvd=True, skip_compliance=True, cve_lookback_days=120,
+            protocol='tcp', udp_timeout=2.0, udp_retries=2, udp_ports=None,
+            no_tls_inspect=False, tls_timeout=5.0, tls_retries=2,
+            ssh_user=None, ssh_password=None, ssh_key=None, ssh_port=22,
+            winrm_user=None, winrm_password=None, winrm_domain=None,
+            winrm_transport='http',
+            wmi_user=None, wmi_password=None, wmi_domain=None,
+            cred_file=None,
+        )
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _fake_tcp_ports_with_tls(self):
+        return [
+            {'port': 443, 'state': 'open', 'service': 'HTTPS',
+             'banner': '', 'protocol': 'tcp'},
+            {'port': 80, 'state': 'open', 'service': 'HTTP',
+             'banner': '', 'protocol': 'tcp'},
+        ]
+
+    def _fake_tls_result(self):
+        from plugins.tls_inspector import TLSResult
+        return TLSResult(
+            host='127.0.0.1',
+            port=443,
+            protocol_version='TLSv1.2',
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            cipher_bits=256,
+            has_forward_secrecy=True,
+        )
+
+    def test_tls_scan_key_in_results(self):
+        """results['tls_scan'] exists after init."""
+        args = self._make_args()
+        from vultron import HybridScanner
+        scanner = HybridScanner('127.0.0.1', args)
+        self.assertIn('tls_scan', scanner.results)
+
+    def test_tls_scan_populated_for_tls_ports(self):
+        """When TLS ports are found, tls_scan is populated."""
+        args = self._make_args(protocol='tcp')
+        from vultron import HybridScanner
+        scanner = HybridScanner('127.0.0.1', args)
+        fake_tcp = self._fake_tcp_ports_with_tls()
+        fake_tls = self._fake_tls_result()
+
+        with patch('vultron.PortScanner.scan', return_value=fake_tcp), \
+             patch('vultron.TLSInspector.inspect_port', return_value=fake_tls), \
+             patch('vultron.VulnerabilityChecker.check_all', return_value=[]), \
+             patch('vultron.ReportGenerator.generate_html'), \
+             patch('vultron.ReportGenerator.generate_json'):
+            scanner.run()
+
+        # Port 443 should have been inspected
+        self.assertIn('443', scanner.results['tls_scan'])
+
+    def test_no_tls_inspect_flag_skips_tls(self):
+        """--no-tls-inspect prevents TLS inspection."""
+        args = self._make_args(no_tls_inspect=True, protocol='tcp')
+        from vultron import HybridScanner
+        scanner = HybridScanner('127.0.0.1', args)
+        fake_tcp = self._fake_tcp_ports_with_tls()
+
+        with patch('vultron.PortScanner.scan', return_value=fake_tcp), \
+             patch('vultron.TLSInspector.inspect_port') as mock_tls, \
+             patch('vultron.VulnerabilityChecker.check_all', return_value=[]), \
+             patch('vultron.ReportGenerator.generate_html'), \
+             patch('vultron.ReportGenerator.generate_json'):
+            scanner.run()
+
+        mock_tls.assert_not_called()
+
+    def test_tls_findings_added_to_vulnerabilities(self):
+        """TLS findings from to_findings() appear in results['vulnerabilities']."""
+        args = self._make_args(protocol='tcp')
+        from vultron import HybridScanner
+        from plugins.tls_inspector import TLSResult, TLSCertInfo
+        from datetime import datetime, timezone, timedelta
+
+        scanner = HybridScanner('127.0.0.1', args)
+        fake_tcp = self._fake_tcp_ports_with_tls()
+
+        # Create a TLS result with a weak cipher to generate findings
+        tls_result = TLSResult(
+            host='127.0.0.1',
+            port=443,
+            protocol_version='TLSv1',  # legacy → produces a finding
+            cipher_name='ECDHE-RSA-AES256-GCM-SHA384',
+            cipher_bits=256,
+            has_forward_secrecy=True,
+        )
+
+        with patch('vultron.PortScanner.scan', return_value=fake_tcp), \
+             patch('vultron.TLSInspector.inspect_port', return_value=tls_result), \
+             patch('vultron.VulnerabilityChecker.check_all', return_value=[]), \
+             patch('vultron.ReportGenerator.generate_html'), \
+             patch('vultron.ReportGenerator.generate_json'):
+            scanner.run()
+
+        tls_vulns = [v for v in scanner.results['vulnerabilities']
+                     if v.get('category') == 'tls']
+        self.assertGreater(len(tls_vulns), 0)
+
+    def test_udp_only_skips_tls_inspection(self):
+        """UDP-only scan (--protocol=udp) does not trigger TLS inspection."""
+        args = self._make_args(protocol='udp')
+        from vultron import HybridScanner
+        scanner = HybridScanner('127.0.0.1', args)
+
+        with patch('vultron.UDPScanner.scan', return_value=[]), \
+             patch('vultron.TLSInspector.inspect_port') as mock_tls, \
+             patch('vultron.VulnerabilityChecker.check_all', return_value=[]), \
+             patch('vultron.ReportGenerator.generate_html'), \
+             patch('vultron.ReportGenerator.generate_json'):
+            scanner.run()
+
+        mock_tls.assert_not_called()
+
+    def test_tls_scan_in_json_report(self):
+        """JSON report includes tls_scan key."""
+        import tempfile, json, os
+        args = self._make_args()
+        from vultron import HybridScanner, ReportGenerator
+        scanner = HybridScanner('127.0.0.1', args)
+        scanner.results['tls_scan'] = {
+            '443': {
+                'host': '127.0.0.1', 'port': 443,
+                'protocol_version': 'TLSv1.2',
+                'cipher_name': 'ECDHE-RSA-AES256-GCM-SHA384',
+                'error': None,
+            }
+        }
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            fname = f.name
+        try:
+            reporter = ReportGenerator(scanner.results)
+            reporter.generate_json(fname)
+            with open(fname) as f:
+                data = json.load(f)
+            self.assertIn('tls_scan', data)
+            self.assertIn('443', data['tls_scan'])
+        finally:
+            os.unlink(fname)
+
+
+# ---------------------------------------------------------------------------
+# 40. PR3 — stdlib cert dict parsing (no cryptography needed)
+# ---------------------------------------------------------------------------
+
+class TestTLSStdlibCertParsing(unittest.TestCase):
+    """_parse_cert_from_stdlib_dict() correctly extracts cert info."""
+
+    def _sample_cert_dict(self, **overrides):
+        d = {
+            'subject': ((('commonName', 'example.com'),),),
+            'issuer': ((('commonName', 'Example CA'),),),
+            'notBefore': 'Jan 01 00:00:00 2024 GMT',
+            'notAfter': 'Jan 01 00:00:00 2026 GMT',
+            'subjectAltName': (
+                ('DNS', 'example.com'),
+                ('DNS', 'www.example.com'),
+                ('IP Address', '192.168.1.1'),
+            ),
+        }
+        d.update(overrides)
+        return d
+
+    def test_subject_cn_extracted(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertEqual(info.subject_cn, 'example.com')
+
+    def test_issuer_cn_extracted(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertEqual(info.issuer_cn, 'Example CA')
+
+    def test_dns_sans_extracted(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertIn('example.com', info.subject_san)
+        self.assertIn('www.example.com', info.subject_san)
+
+    def test_ip_sans_extracted(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertIn('192.168.1.1', info.subject_ip_san)
+
+    def test_not_after_parsed(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertIsNotNone(info.not_after)
+        self.assertEqual(info.not_after.year, 2026)
+
+    def test_not_before_parsed(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertIsNotNone(info.not_before)
+        self.assertEqual(info.not_before.year, 2024)
+
+    def test_chain_trusted_flag(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=False)
+        self.assertFalse(info.chain_trusted)
+
+    def test_self_signed_when_issuer_equals_subject(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        cert = self._sample_cert_dict()
+        cert['issuer'] = cert['subject']  # same as subject
+        info = _parse_cert_from_stdlib_dict(cert, trusted=False)
+        self.assertTrue(info.is_self_signed)
+
+    def test_not_self_signed_when_issuer_differs(self):
+        from plugins.tls_inspector import _parse_cert_from_stdlib_dict
+        info = _parse_cert_from_stdlib_dict(self._sample_cert_dict(), trusted=True)
+        self.assertFalse(info.is_self_signed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
