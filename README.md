@@ -9,13 +9,13 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-7.0.0-success.svg)]()
+[![Version](https://img.shields.io/badge/version-8.0.0-success.svg)]()
 
 </div>
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, **baseline compliance & configuration posture checks**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, **baseline compliance & configuration posture checks**, **exposure & patch-risk detection**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -31,17 +31,18 @@
 6. [TLS Deep Inspection](#-tls-deep-inspection)
 7. [Asset Inventory and Host Profiling](#-asset-inventory-and-host-profiling)
 8. [Compliance & Configuration Baseline](#-compliance--configuration-baseline)
-9. [Installation](#-installation)
-10. [Quick Start](#-quick-start)
-11. [CLI Reference](#-cli-reference)
-12. [Understanding Results](#-understanding-results)
-13. [Report Formats](#-report-formats)
-14. [Examples](#-examples)
-15. [Troubleshooting](#-troubleshooting)
-16. [Development](#-development)
-17. [Known Limitations](#-known-limitations)
-18. [Roadmap](#-roadmap)
-19. [License](#-license)
+9. [Exposure & Patch Risk Detection](#-exposure--patch-risk-detection)
+10. [Installation](#-installation)
+11. [Quick Start](#-quick-start)
+12. [CLI Reference](#-cli-reference)
+13. [Understanding Results](#-understanding-results)
+14. [Report Formats](#-report-formats)
+15. [Examples](#-examples)
+16. [Troubleshooting](#-troubleshooting)
+17. [Development](#-development)
+18. [Known Limitations](#-known-limitations)
+19. [Roadmap](#-roadmap)
+20. [License](#-license)
 
 ---
 
@@ -109,6 +110,10 @@ Controls currently implemented:
 | AUTH-002 | Auth | Anonymous-access hint in banner |
 | OS-001 | OS | OS patch posture (placeholder — credentialed only) |
 
+### 🔍 Exposure & Patch Risk Detection
+
+Vulntron v8.0 adds a **heuristic, non-intrusive exposure engine** (`plugins/exposure.py`) that derives patch-risk and exposure signals from scan data without any additional network probes.  Signal types include risky services, management interface exposure, weak TLS, certificate issues, EOL software versions, and database exposure.  All version-based signals are clearly labelled as heuristic with confidence scores.
+
 ### 📦 Asset Inventory and Host Profiling
 
 Vulntron v6.0 consolidates scan output into a normalised **asset inventory** (one record per scanned host).  Each record includes:
@@ -126,8 +131,8 @@ The inventory is embedded in the JSON report and can optionally be saved as a st
 
 ### 📄 HTML + JSON Reporting
 
-- **HTML report**: A self-contained, color-coded dashboard with an executive summary, per-finding details, port table, compliance results, and an **asset inventory section** (v6.0+).
-- **JSON report**: A machine-readable file covering all phases, suitable for ingestion by SIEMs, ticketing systems, or further automation.  Includes the `inventory` key with the full normalised asset snapshot.
+- **HTML report**: A self-contained, color-coded dashboard with an executive summary, per-finding details, port table, compliance results, an **asset inventory section** (v6.0+), and an **Exposure & Patch Risk section** (v8.0+).
+- **JSON report**: A machine-readable file covering all phases, suitable for ingestion by SIEMs, ticketing systems, or further automation.  Includes the `inventory` key with the full normalised asset snapshot and the `exposure` key with structured exposure signals.
 
 Report filenames follow the pattern:
 ```
@@ -964,6 +969,145 @@ Console summary example:
 
 ---
 
+## 🔍 Exposure & Patch Risk Detection
+
+> **PR6 feature** — available in Vulntron v8.0.0+.
+
+Vulntron v8.0 introduces a **patch and exposure detection engine** (`plugins/exposure.py`) that derives likely exposure and patch-risk signals by analysing data already gathered by earlier scan phases. **No additional network traffic is generated.**
+
+> ⚠️ **Important:** All version-based signals are heuristic — they are derived from banner/version string pattern matching and may not reflect the actual patch level. Always verify signals manually before acting on them.
+
+### How It Works
+
+The exposure engine (`ExposureEngine`) ingests the full scan result dictionary and runs a series of non-intrusive detectors:
+
+| Detector | Signal Type | Description |
+|----------|-------------|-------------|
+| Risky/cleartext service | `risky_service` | Open ports carrying dangerous legacy protocols (Telnet, FTP, r-commands, TFTP, etc.) |
+| Management interface | `management_exposure` | Management services (RDP, WinRM, SSH, SNMP, Redis, MongoDB) accessible on default ports |
+| SNMP default community | `unauthenticated_service` | SNMP default community string detected via compliance data or vulnerability findings |
+| Weak TLS posture | `weak_tls` | Deprecated protocol version (TLS 1.0/1.1), weak/broken cipher, or missing forward secrecy |
+| Certificate issues | `cert_issue` | Expired, near-expiry, or self-signed TLS certificates |
+| EOL software version | `eol_version` *(heuristic)* | Service banner matches a curated table of known end-of-life version families |
+| Anonymous service | `unauthenticated_service` | Anonymous or unauthenticated access confirmed by vulnerability/compliance findings |
+| Database exposure | `database_exposure` | Database services (MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch, etc.) on default ports |
+
+### Signal Fields
+
+Each exposure signal carries:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `signal_id` | string | Unique signal identifier (e.g., `EXP-RISKY-SVC-001`) |
+| `title` | string | Short descriptive title |
+| `description` | string | Full description with remediation guidance |
+| `evidence` | list | Specific evidence items supporting the signal |
+| `confidence` | float | 0.0–1.0 confidence score |
+| `confidence_label` | string | `HIGH` (≥0.75) / `MEDIUM` (0.45–0.74) / `LOW` (<0.45) |
+| `severity` | string | `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `INFO` |
+| `affected_asset` | string | Target host |
+| `affected_service` | string | Service name (e.g., `FTP`, `TLS:443`) |
+| `signal_type` | string | Detector category (e.g., `risky_service`, `eol_version`) |
+| `heuristic` | bool | `true` when signal is version-pattern-based inference |
+
+### EOL Version Heuristics
+
+The engine includes a conservative curated table of end-of-life software version families:
+
+| Pattern | Family | Recommended Minimum |
+|---------|--------|---------------------|
+| `OpenSSL/1.0.x` | OpenSSL 1.0.x | OpenSSL 1.1.1 or 3.x |
+| `OpenSSL/1.1.0` | OpenSSL 1.1.0 | OpenSSL 1.1.1 or 3.x |
+| `Apache/2.2.x` | Apache HTTPd 2.2.x | Apache 2.4.x |
+| `Apache/2.0.x` | Apache HTTPd 2.0.x | Apache 2.4.x |
+| `PHP/5.x` | PHP 5.x | PHP 8.x |
+| `PHP/7.0.x`, `PHP/7.1.x` | PHP 7.0–7.1.x | PHP 8.x |
+| `OpenSSH < 7.6` | OpenSSH (old) | OpenSSH 8.x+ |
+| `nginx/1.0–1.12.x` | nginx (old) | nginx 1.18+ |
+| `IIS/2–7.x` | IIS 7.x or older | IIS 10.x |
+| `MySQL/4.x–5.x` | MySQL 4/5.x | MySQL 8.x |
+
+> **No CVE database ingestion is performed.** These are conservative heuristics based on publicly known EOL dates, not real-time vulnerability data.
+
+### Quick Start — Exposure Detection
+
+Exposure detection runs **automatically** alongside every scan (enabled by default):
+
+```bash
+python3 vultron.py -t 192.168.1.100
+```
+
+**Disable exposure detection:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --no-exposure
+```
+
+**Enable additional lower-confidence heuristic signals (aggressive mode):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --exposure-aggressive
+```
+
+### Exposure Detection Output
+
+Console example:
+
+```
+[PHASE 3c] EXPOSURE & PATCH-RISK DETECTION
+Exposure signals: 5 total | critical=0 high=3 medium=2
+  [HIGH] Risky service exposed: Telnet (port 23/tcp)
+  [HIGH] Management interface exposed: RDP (port 3389/tcp)
+  [MEDIUM] Potentially end-of-life software detected: Apache HTTPd 2.2.x (port 80/tcp) [heuristic]
+```
+
+The full exposure report is embedded in both the JSON report (`exposure` key) and rendered as an **"Exposure & Patch Risk"** section in the HTML report. Heuristic signals are clearly labelled in the HTML output.
+
+### JSON Report Structure
+
+```json
+{
+  "exposure": {
+    "target": "192.168.1.100",
+    "signal_count": 5,
+    "summary": {
+      "critical": 0,
+      "high": 3,
+      "medium": 2,
+      "low": 0,
+      "info": 0
+    },
+    "top_risks": [...],
+    "signals": [
+      {
+        "signal_id": "EXP-RISKY-SVC-001",
+        "title": "Risky service exposed: Telnet (port 23/tcp)",
+        "description": "...",
+        "evidence": ["Port 23/tcp is open", "Cleartext remote access"],
+        "confidence": 0.85,
+        "confidence_label": "HIGH",
+        "severity": "HIGH",
+        "affected_asset": "192.168.1.100",
+        "affected_service": "Telnet",
+        "signal_type": "risky_service",
+        "heuristic": false
+      }
+    ]
+  }
+}
+```
+
+### Limitations and Design Constraints
+
+- **No active exploitation.** The engine never sends probes or triggers additional connections.
+- **No full CVE enrichment.** EOL version checks use a built-in curated table — not a live CVE feed.
+- **Heuristic signals may produce false positives.** Version banners can be spoofed or customised; back-ported patches may address vulnerabilities in an older version string.
+- **Confidence scores reflect signal reliability**, not exploitability.
+- **Scope concept not implemented.** All detected services are evaluated uniformly. Future phases may add network scope/trust-zone awareness.
+- The engine is designed to be **modular** for future enrichment phases (e.g., CVE correlation, CPE mapping).
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -1128,6 +1272,13 @@ python3 vultron.py -t <target> [options]
 | `--skip-compliance` | flag | `False` | Skip all compliance checks |
 | `--compliance-profile` | choice | `baseline` | Profile to run: `baseline`, `server`, or `workstation` |
 | `--compliance-only` | flag | `False` | Print a compliance-only console summary after the scan |
+
+### Exposure & Patch-Risk Detection Options (PR6)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--no-exposure` | flag | `False` | Disable exposure & patch-risk detection (enabled by default) |
+| `--exposure-aggressive` | flag | `False` | Include additional lower-confidence heuristic signals |
 
 ### Credentialed Scanning Options (authorized use only)
 
@@ -1460,7 +1611,7 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [x] **PR3: SSL/TLS deep inspection module** — cert analysis, cipher/protocol posture, legacy version detection, hostname mismatch
 - [x] **PR4: Asset inventory + host profiling** — normalised asset records, deterministic fingerprint, host role/risk/exposure inference, JSON persistence
 - [x] **PR5: Compliance & configuration baseline** — baseline posture controls (TLS, service exposure, auth), profile selection, credential-aware skip/unknown, HTML/JSON report integration
-- [ ] PR6: Patch detection (OS/package mapping via credentialed checks)
+- [x] **PR6: Exposure & patch-risk detection** — heuristic, non-intrusive exposure signals (risky services, weak TLS, EOL versions, management exposure, database exposure, cert issues); confidence-graded; HTML/JSON report integration
 - [ ] PR7: Web application scanner (safe, non-exploit checks)
 - [ ] PR8: Database security audits (read-only checks)
 - [ ] PR9: Network device audits (Cisco/Juniper baseline)
