@@ -260,27 +260,33 @@ def create_app(data_dir: str) -> "FastAPI":
         1. Strips any path components with :func:`os.path.basename`.
         2. Rejects IDs that are not purely alphanumeric / dash / underscore /
            single dots (i.e., rejects ``..``, absolute paths, etc.).
-        3. Resolves the candidate path and checks it is contained within
-           *_data_dir* using :meth:`~pathlib.Path.relative_to`.
-        4. Verifies the file exists.
+        3. Locates the matching file by iterating the *data_dir* glob (a
+           trusted source), comparing only the file stem to *safe_id*.
+           This ensures the :class:`~pathlib.Path` returned to the caller
+           originates from the directory listing, **not** from user input,
+           breaking the taint flow for downstream file operations.
+        4. Verifies containment inside *_data_dir* as defence-in-depth.
 
         Raises 400 on sanitisation / traversal failure, 404 if not found.
         """
         # 1. Strip any path-separator components
         safe_id = os.path.basename(run_id)
-        # 2. Allow only safe characters; reject ".." and leading dot
-        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', safe_id) or '..' in safe_id:
+        # 2. Allow only safe characters; reject ".." and any leading dot
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', safe_id) or ".." in safe_id:
             raise HTTPException(status_code=400, detail="Invalid run_id")
-        # 3. Resolve and check containment
-        candidate = (Path(_data_dir) / (safe_id + ".json")).resolve()
-        try:
-            candidate.relative_to(Path(_data_dir).resolve())
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid run_id (path traversal)")
-        # 4. Existence check
-        if not candidate.is_file():
-            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-        return candidate
+        # 3. Locate from directory listing (path from trusted source, not user input)
+        data_root = Path(_data_dir).resolve()
+        for fpath in data_root.glob("*.json"):
+            if fpath.stem != safe_id:
+                continue
+            resolved = fpath.resolve()
+            # 4. Defence-in-depth: verify containment
+            try:
+                resolved.relative_to(data_root)
+            except ValueError:
+                continue
+            return resolved
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
 
     def _load_or_404(run_id: str) -> Dict[str, Any]:
         """Load and validate a run by *run_id*.
