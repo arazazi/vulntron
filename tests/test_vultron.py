@@ -5170,7 +5170,807 @@ class TestCLIComplianceParsing(unittest.TestCase):
         self.assertTrue(args.compliance_only)
 
 
+# ---------------------------------------------------------------------------
+# 57. PR7 — CloudInstance dataclass
+# ---------------------------------------------------------------------------
+
+class TestCloudInstance(unittest.TestCase):
+    """CloudInstance dataclass serialisation and defaults."""
+
+    def _make_instance(self, **kwargs):
+        from plugins.cloud import CloudInstance
+        defaults = dict(
+            instance_id='i-0abc1234def567890',
+            provider='aws',
+            region='us-east-1',
+            state='running',
+        )
+        defaults.update(kwargs)
+        return CloudInstance(**defaults)
+
+    def test_to_dict_contains_required_keys(self):
+        inst = self._make_instance()
+        d = inst.to_dict()
+        for key in (
+            'instance_id', 'provider', 'region', 'state',
+            'private_ips', 'public_ips', 'tags',
+            'vpc_id', 'subnet_id', 'security_group_ids', 'instance_type',
+        ):
+            self.assertIn(key, d)
+
+    def test_to_dict_values(self):
+        inst = self._make_instance(
+            private_ips=['10.0.1.5'],
+            public_ips=['54.0.0.1'],
+            tags={'Env': 'prod', 'Owner': 'ops'},
+            vpc_id='vpc-aaa111',
+            subnet_id='subnet-bbb222',
+            security_group_ids=['sg-ccc333'],
+            instance_type='t3.micro',
+        )
+        d = inst.to_dict()
+        self.assertEqual(d['instance_id'], 'i-0abc1234def567890')
+        self.assertEqual(d['provider'], 'aws')
+        self.assertEqual(d['region'], 'us-east-1')
+        self.assertEqual(d['state'], 'running')
+        self.assertIn('10.0.1.5', d['private_ips'])
+        self.assertIn('54.0.0.1', d['public_ips'])
+        self.assertEqual(d['tags']['Env'], 'prod')
+        self.assertEqual(d['vpc_id'], 'vpc-aaa111')
+        self.assertEqual(d['subnet_id'], 'subnet-bbb222')
+        self.assertIn('sg-ccc333', d['security_group_ids'])
+        self.assertEqual(d['instance_type'], 't3.micro')
+
+    def test_default_collections_are_empty(self):
+        inst = self._make_instance()
+        self.assertEqual(inst.private_ips, [])
+        self.assertEqual(inst.public_ips, [])
+        self.assertEqual(inst.tags, {})
+        self.assertEqual(inst.security_group_ids, [])
+
+    def test_default_optionals_are_none(self):
+        inst = self._make_instance()
+        self.assertIsNone(inst.vpc_id)
+        self.assertIsNone(inst.subnet_id)
+        self.assertIsNone(inst.instance_type)
+
+
+# ---------------------------------------------------------------------------
+# 58. PR7 — CloudProvider interface
+# ---------------------------------------------------------------------------
+
+class TestCloudProviderInterface(unittest.TestCase):
+    """CloudProvider ABC cannot be instantiated; subclass must implement interface."""
+
+    def test_cannot_instantiate_abstract_class(self):
+        from plugins.cloud.base import CloudProvider
+        with self.assertRaises(TypeError):
+            CloudProvider()
+
+    def test_concrete_subclass_must_implement_provider_name(self):
+        from plugins.cloud.base import CloudProvider, CloudInstance
+        class IncompleteProvider(CloudProvider):
+            def list_instances(self):
+                return []
+        with self.assertRaises(TypeError):
+            IncompleteProvider()
+
+    def test_concrete_subclass_must_implement_list_instances(self):
+        from plugins.cloud.base import CloudProvider
+        class IncompleteProvider(CloudProvider):
+            @property
+            def provider_name(self):
+                return 'test'
+        with self.assertRaises(TypeError):
+            IncompleteProvider()
+
+    def test_is_available_defaults_to_true(self):
+        from plugins.cloud.base import CloudProvider, CloudInstance
+        class MinimalProvider(CloudProvider):
+            @property
+            def provider_name(self):
+                return 'test'
+            def list_instances(self):
+                return []
+        self.assertTrue(MinimalProvider().is_available())
+
+
+# ---------------------------------------------------------------------------
+# 59. PR7 — AWSProvider unit tests (no real AWS calls)
+# ---------------------------------------------------------------------------
+
+class TestAWSProvider(unittest.TestCase):
+    """AWSProvider behaviour with mocked boto3."""
+
+    def _make_provider(self, **kwargs):
+        from plugins.cloud.aws import AWSProvider
+        return AWSProvider(**kwargs)
+
+    def test_provider_name_is_aws(self):
+        p = self._make_provider()
+        self.assertEqual(p.provider_name, 'aws')
+
+    def test_is_available_false_when_boto3_missing(self):
+        p = self._make_provider()
+        with patch.dict('sys.modules', {'boto3': None, 'botocore': None, 'botocore.exceptions': None}):
+            # Force is_available to try the import
+            import importlib
+            import plugins.cloud.aws as aws_mod
+            orig = aws_mod.AWSProvider.is_available
+            def patched(self_inner):
+                try:
+                    import boto3  # noqa
+                    return True
+                except (ImportError, TypeError):
+                    return False
+            aws_mod.AWSProvider.is_available = patched
+            self.assertFalse(p.is_available())
+            aws_mod.AWSProvider.is_available = orig
+
+    def test_list_instances_returns_empty_when_boto3_missing(self):
+        p = self._make_provider()
+        with patch.dict('sys.modules', {'boto3': None}):
+            result = p.list_instances()
+        self.assertEqual(result, [])
+
+    def test_list_instances_returns_empty_on_exception(self):
+        p = self._make_provider()
+        mock_boto3 = MagicMock()
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.get_paginator.side_effect = Exception("Access Denied")
+        with patch.dict('sys.modules', {'boto3': mock_boto3, 'botocore': MagicMock(), 'botocore.exceptions': MagicMock()}):
+            result = p.list_instances()
+        self.assertEqual(result, [])
+
+    def test_list_instances_parses_ec2_response(self):
+        """list_instances() correctly parses a minimal EC2 describe_instances response."""
+        from plugins.cloud.aws import AWSProvider
+        p = AWSProvider(region='eu-west-1')
+        _ec2_response = {
+            'Reservations': [{
+                'Instances': [{
+                    'InstanceId': 'i-0aabbccdd11223344',
+                    'State': {'Name': 'running'},
+                    'InstanceType': 't3.medium',
+                    'Placement': {'AvailabilityZone': 'eu-west-1a'},
+                    'VpcId': 'vpc-12345678',
+                    'SubnetId': 'subnet-87654321',
+                    'PrivateIpAddress': '10.0.2.10',
+                    'PublicIpAddress': '52.1.2.3',
+                    'NetworkInterfaces': [{
+                        'PrivateIpAddresses': [
+                            {
+                                'PrivateIpAddress': '10.0.2.10',
+                                'Association': {'PublicIp': '52.1.2.3'},
+                            }
+                        ]
+                    }],
+                    'SecurityGroups': [{'GroupId': 'sg-aabbccdd'}],
+                    'Tags': [
+                        {'Key': 'Name', 'Value': 'web-prod-01'},
+                        {'Key': 'Env', 'Value': 'prod'},
+                    ],
+                }]
+            }]
+        }
+        mock_page_iter = [_ec2_response]
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = mock_page_iter
+        mock_client = MagicMock()
+        mock_client.get_paginator.return_value = mock_paginator
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_botocore_exceptions = MagicMock()
+        with patch.dict('sys.modules', {'boto3': mock_boto3, 'botocore': MagicMock(), 'botocore.exceptions': mock_botocore_exceptions}):
+            instances = p.list_instances()
+
+        self.assertEqual(len(instances), 1)
+        inst = instances[0]
+        self.assertEqual(inst.instance_id, 'i-0aabbccdd11223344')
+        self.assertEqual(inst.provider, 'aws')
+        self.assertEqual(inst.region, 'eu-west-1')
+        self.assertEqual(inst.state, 'running')
+        self.assertEqual(inst.instance_type, 't3.medium')
+        self.assertIn('10.0.2.10', inst.private_ips)
+        self.assertIn('52.1.2.3', inst.public_ips)
+        self.assertEqual(inst.vpc_id, 'vpc-12345678')
+        self.assertEqual(inst.subnet_id, 'subnet-87654321')
+        self.assertIn('sg-aabbccdd', inst.security_group_ids)
+        self.assertEqual(inst.tags['Name'], 'web-prod-01')
+        self.assertEqual(inst.tags['Env'], 'prod')
+
+    def test_tag_include_filter_passes_matching(self):
+        from plugins.cloud.aws import AWSProvider
+        from plugins.cloud.base import CloudInstance
+        p = AWSProvider(tag_include=['Env=prod'])
+        inst = CloudInstance(
+            instance_id='i-aaa', provider='aws', region='us-east-1', state='running',
+            tags={'Env': 'prod'},
+        )
+        self.assertTrue(p._passes_filters(inst))
+
+    def test_tag_include_filter_blocks_non_matching(self):
+        from plugins.cloud.aws import AWSProvider
+        from plugins.cloud.base import CloudInstance
+        p = AWSProvider(tag_include=['Env=prod'])
+        inst = CloudInstance(
+            instance_id='i-bbb', provider='aws', region='us-east-1', state='running',
+            tags={'Env': 'dev'},
+        )
+        self.assertFalse(p._passes_filters(inst))
+
+    def test_tag_exclude_filter_blocks_matching(self):
+        from plugins.cloud.aws import AWSProvider
+        from plugins.cloud.base import CloudInstance
+        p = AWSProvider(tag_exclude=['Env=dev'])
+        inst = CloudInstance(
+            instance_id='i-ccc', provider='aws', region='us-east-1', state='running',
+            tags={'Env': 'dev'},
+        )
+        self.assertFalse(p._passes_filters(inst))
+
+    def test_tag_exclude_filter_passes_non_matching(self):
+        from plugins.cloud.aws import AWSProvider
+        from plugins.cloud.base import CloudInstance
+        p = AWSProvider(tag_exclude=['Env=dev'])
+        inst = CloudInstance(
+            instance_id='i-ddd', provider='aws', region='us-east-1', state='running',
+            tags={'Env': 'prod'},
+        )
+        self.assertTrue(p._passes_filters(inst))
+
+    def test_parse_tag_filters_handles_equals_in_value(self):
+        from plugins.cloud.aws import AWSProvider
+        result = AWSProvider._parse_tag_filters(['Key=val=ue'])
+        self.assertEqual(result, [('Key', 'val=ue')])
+
+    def test_parse_tag_filters_skips_entries_without_equals(self):
+        from plugins.cloud.aws import AWSProvider
+        result = AWSProvider._parse_tag_filters(['noequals', 'Key=value'])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], ('Key', 'value'))
+
+    def test_region_stripped_from_az(self):
+        """AZ 'us-east-1a' should produce region 'us-east-1'."""
+        from plugins.cloud.aws import AWSProvider
+        inst_data = {
+            'InstanceId': 'i-test',
+            'State': {'Name': 'running'},
+            'Placement': {'AvailabilityZone': 'us-east-1a'},
+            'NetworkInterfaces': [],
+            'SecurityGroups': [],
+            'Tags': [],
+        }
+        inst = AWSProvider._parse_instance(inst_data)
+        self.assertEqual(inst.region, 'us-east-1')
+
+
+# ---------------------------------------------------------------------------
+# 60. PR7 — CloudCorrelator
+# ---------------------------------------------------------------------------
+
+class TestCloudCorrelator(unittest.TestCase):
+    """CloudCorrelator matches assets to instances and enriches AssetRecord."""
+
+    def _make_instance(self, private_ips=None, public_ips=None, **kwargs):
+        from plugins.cloud.base import CloudInstance
+        defaults = dict(
+            instance_id='i-0test',
+            provider='aws',
+            region='us-east-1',
+            state='running',
+            private_ips=private_ips or [],
+            public_ips=public_ips or [],
+            tags={'Env': 'prod'},
+            vpc_id='vpc-111',
+            subnet_id='subnet-222',
+            security_group_ids=['sg-333'],
+            instance_type='t3.micro',
+        )
+        defaults.update(kwargs)
+        return CloudInstance(**defaults)
+
+    def _make_asset(self, ip='10.0.0.1'):
+        from plugins.inventory import AssetRecord
+        import hashlib
+        asset_id = hashlib.sha256(ip.encode()).hexdigest()
+        return AssetRecord(asset_id=asset_id, ip=ip)
+
+    def test_find_match_by_private_ip(self):
+        from plugins.cloud import CloudCorrelator
+        inst = self._make_instance(private_ips=['10.0.0.1'])
+        corr = CloudCorrelator([inst])
+        result = corr.find_match('10.0.0.1')
+        self.assertIs(result, inst)
+
+    def test_find_match_by_public_ip(self):
+        from plugins.cloud import CloudCorrelator
+        inst = self._make_instance(public_ips=['52.1.2.3'])
+        corr = CloudCorrelator([inst])
+        result = corr.find_match('52.1.2.3')
+        self.assertIs(result, inst)
+
+    def test_private_ip_takes_precedence_over_public(self):
+        from plugins.cloud import CloudCorrelator
+        inst_private = self._make_instance(
+            instance_id='i-private', private_ips=['10.0.0.5']
+        )
+        inst_public = self._make_instance(
+            instance_id='i-public', public_ips=['10.0.0.5']
+        )
+        corr = CloudCorrelator([inst_private, inst_public])
+        result = corr.find_match('10.0.0.5')
+        self.assertEqual(result.instance_id, 'i-private')
+
+    def test_find_match_returns_none_for_unknown_ip(self):
+        from plugins.cloud import CloudCorrelator
+        inst = self._make_instance(private_ips=['10.0.0.1'])
+        corr = CloudCorrelator([inst])
+        self.assertIsNone(corr.find_match('192.168.1.99'))
+
+    def test_find_match_returns_none_for_none_ip(self):
+        from plugins.cloud import CloudCorrelator
+        corr = CloudCorrelator([])
+        self.assertIsNone(corr.find_match(None))
+
+    def test_instance_count_property(self):
+        from plugins.cloud import CloudCorrelator
+        instances = [
+            self._make_instance(instance_id='i-001'),
+            self._make_instance(instance_id='i-002'),
+        ]
+        corr = CloudCorrelator(instances)
+        self.assertEqual(corr.instance_count, 2)
+
+    def test_enrich_asset_attaches_cloud_fields(self):
+        from plugins.cloud import CloudCorrelator
+        inst = self._make_instance(private_ips=['10.0.0.1'])
+        corr = CloudCorrelator([inst])
+        asset = self._make_asset('10.0.0.1')
+        result = corr.enrich_asset(asset)
+        self.assertTrue(result)
+        self.assertEqual(asset.cloud_provider, 'aws')
+        self.assertEqual(asset.cloud_instance_id, 'i-0test')
+        self.assertEqual(asset.cloud_region, 'us-east-1')
+        self.assertEqual(asset.cloud_instance_state, 'running')
+        self.assertEqual(asset.cloud_instance_type, 't3.micro')
+        self.assertEqual(asset.cloud_tags, {'Env': 'prod'})
+        self.assertEqual(asset.cloud_vpc_id, 'vpc-111')
+        self.assertEqual(asset.cloud_subnet_id, 'subnet-222')
+        self.assertIn('sg-333', asset.cloud_security_group_ids)
+
+    def test_enrich_asset_adds_cloud_source(self):
+        from plugins.cloud import CloudCorrelator
+        inst = self._make_instance(private_ips=['10.0.0.1'])
+        corr = CloudCorrelator([inst])
+        asset = self._make_asset('10.0.0.1')
+        corr.enrich_asset(asset)
+        self.assertIn('cloud-aws', asset.scan_sources)
+
+    def test_enrich_asset_returns_false_when_no_match(self):
+        from plugins.cloud import CloudCorrelator
+        corr = CloudCorrelator([])
+        asset = self._make_asset('10.0.0.1')
+        result = corr.enrich_asset(asset)
+        self.assertFalse(result)
+        self.assertIsNone(asset.cloud_provider)
+
+    def test_enrich_asset_does_not_overwrite_hostname(self):
+        """Existing hostname on the asset must not be overwritten by enrichment."""
+        from plugins.cloud import CloudCorrelator
+        from plugins.inventory import AssetRecord
+        import hashlib
+        inst = self._make_instance(private_ips=['10.0.0.1'])
+        corr = CloudCorrelator([inst])
+        asset_id = hashlib.sha256(b'10.0.0.1').hexdigest()
+        asset = AssetRecord(asset_id=asset_id, ip='10.0.0.1', hostname='myserver.local')
+        corr.enrich_asset(asset)
+        self.assertEqual(asset.hostname, 'myserver.local')
+
+    def test_empty_correlator_instance_count(self):
+        from plugins.cloud import CloudCorrelator
+        corr = CloudCorrelator([])
+        self.assertEqual(corr.instance_count, 0)
+
+
+# ---------------------------------------------------------------------------
+# 61. PR7 — AssetRecord cloud fields serialisation
+# ---------------------------------------------------------------------------
+
+class TestAssetRecordCloudFields(unittest.TestCase):
+    """AssetRecord.to_dict() includes cloud metadata fields."""
+
+    def _make_asset(self, ip='10.0.0.1'):
+        from plugins.inventory import AssetRecord
+        import hashlib
+        return AssetRecord(asset_id=hashlib.sha256(ip.encode()).hexdigest(), ip=ip)
+
+    def test_to_dict_includes_cloud_keys_when_not_enriched(self):
+        asset = self._make_asset()
+        d = asset.to_dict()
+        cloud_keys = [
+            'cloud_provider', 'cloud_instance_id', 'cloud_region',
+            'cloud_instance_state', 'cloud_instance_type',
+            'cloud_tags', 'cloud_vpc_id', 'cloud_subnet_id',
+            'cloud_security_group_ids',
+        ]
+        for key in cloud_keys:
+            self.assertIn(key, d, f"Missing key: {key}")
+
+    def test_to_dict_cloud_fields_default_to_none_or_empty(self):
+        asset = self._make_asset()
+        d = asset.to_dict()
+        self.assertIsNone(d['cloud_provider'])
+        self.assertIsNone(d['cloud_instance_id'])
+        self.assertIsNone(d['cloud_region'])
+        self.assertIsNone(d['cloud_instance_state'])
+        self.assertIsNone(d['cloud_instance_type'])
+        self.assertEqual(d['cloud_tags'], {})
+        self.assertIsNone(d['cloud_vpc_id'])
+        self.assertIsNone(d['cloud_subnet_id'])
+        self.assertEqual(d['cloud_security_group_ids'], [])
+
+    def test_to_dict_includes_cloud_fields_when_enriched(self):
+        from plugins.cloud import CloudCorrelator
+        from plugins.cloud.base import CloudInstance
+        inst = CloudInstance(
+            instance_id='i-enriched',
+            provider='aws',
+            region='ap-southeast-1',
+            state='running',
+            private_ips=['10.0.0.1'],
+            tags={'Project': 'vulntron'},
+            vpc_id='vpc-xyz',
+            subnet_id='subnet-xyz',
+            security_group_ids=['sg-xyz'],
+            instance_type='m5.large',
+        )
+        corr = CloudCorrelator([inst])
+        asset = self._make_asset()
+        corr.enrich_asset(asset)
+        d = asset.to_dict()
+        self.assertEqual(d['cloud_provider'], 'aws')
+        self.assertEqual(d['cloud_instance_id'], 'i-enriched')
+        self.assertEqual(d['cloud_region'], 'ap-southeast-1')
+        self.assertEqual(d['cloud_instance_state'], 'running')
+        self.assertEqual(d['cloud_instance_type'], 'm5.large')
+        self.assertEqual(d['cloud_tags'], {'Project': 'vulntron'})
+        self.assertEqual(d['cloud_vpc_id'], 'vpc-xyz')
+        self.assertEqual(d['cloud_subnet_id'], 'subnet-xyz')
+        self.assertIn('sg-xyz', d['cloud_security_group_ids'])
+
+
+# ---------------------------------------------------------------------------
+# 62. PR7 — CLI parsing for cloud options
+# ---------------------------------------------------------------------------
+
+class TestCLICloudParsing(unittest.TestCase):
+    """Cloud enrichment CLI flags are parsed correctly."""
+
+    def _parse(self, extra_args):
+        import argparse as ap
+        parser = ap.ArgumentParser()
+        parser.add_argument('-t', '--target', required=True)
+        parser.add_argument('--cloud-provider', choices=['aws'], default=None)
+        parser.add_argument('--cloud-region', default=None)
+        parser.add_argument('--cloud-profile', default=None)
+        parser.add_argument('--cloud-tag-include', nargs='+', default=None)
+        parser.add_argument('--cloud-tag-exclude', nargs='+', default=None)
+        args, _ = parser.parse_known_args(['-t', '10.0.0.1'] + extra_args)
+        return args
+
+    def test_cloud_provider_defaults_to_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.cloud_provider)
+
+    def test_cloud_provider_aws(self):
+        args = self._parse(['--cloud-provider', 'aws'])
+        self.assertEqual(args.cloud_provider, 'aws')
+
+    def test_cloud_region_defaults_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.cloud_region)
+
+    def test_cloud_region_set(self):
+        args = self._parse(['--cloud-region', 'eu-central-1'])
+        self.assertEqual(args.cloud_region, 'eu-central-1')
+
+    def test_cloud_profile_defaults_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.cloud_profile)
+
+    def test_cloud_profile_set(self):
+        args = self._parse(['--cloud-profile', 'staging'])
+        self.assertEqual(args.cloud_profile, 'staging')
+
+    def test_cloud_tag_include_defaults_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.cloud_tag_include)
+
+    def test_cloud_tag_include_single(self):
+        args = self._parse(['--cloud-tag-include', 'Env=prod'])
+        self.assertEqual(args.cloud_tag_include, ['Env=prod'])
+
+    def test_cloud_tag_include_multiple(self):
+        args = self._parse(['--cloud-tag-include', 'Env=prod', 'Owner=ops'])
+        self.assertEqual(args.cloud_tag_include, ['Env=prod', 'Owner=ops'])
+
+    def test_cloud_tag_exclude_defaults_none(self):
+        args = self._parse([])
+        self.assertIsNone(args.cloud_tag_exclude)
+
+    def test_cloud_tag_exclude_set(self):
+        args = self._parse(['--cloud-tag-exclude', 'Env=dev'])
+        self.assertEqual(args.cloud_tag_exclude, ['Env=dev'])
+
+
+# ---------------------------------------------------------------------------
+# 63. PR7 — JSON report includes cloud_enrichment key
+# ---------------------------------------------------------------------------
+
+class TestCloudEnrichmentReportKey(unittest.TestCase):
+    """JSON report always contains a 'cloud_enrichment' key."""
+
+    def _make_results(self):
+        return {
+            'target': '10.0.0.1',
+            'timestamp': '2026-01-01T00:00:00',
+            'scanner_version': '7.1.0',
+            'scan_mode': 'common',
+            'scan_protocol': 'tcp',
+            'cve_lookback_days': 120,
+            'open_ports': [],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'nvd_intelligence': {},
+            'compliance': {},
+            'auth_scan': {},
+            'tls_scan': {},
+            'inventory': {},
+            'cloud_enrichment': {},
+        }
+
+    def test_json_report_contains_cloud_enrichment_key(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        results = self._make_results()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('cloud_enrichment', data)
+        finally:
+            os.unlink(path)
+
+    def test_json_report_cloud_enrichment_with_data(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        results = self._make_results()
+        results['cloud_enrichment'] = {
+            'provider': 'aws',
+            'region': 'us-east-1',
+            'instances_fetched': 2,
+            'assets_enriched': 1,
+            'instances': [],
+        }
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            ce = data['cloud_enrichment']
+            self.assertEqual(ce['provider'], 'aws')
+            self.assertEqual(ce['instances_fetched'], 2)
+            self.assertEqual(ce['assets_enriched'], 1)
+        finally:
+            os.unlink(path)
+
+    def test_inventory_assets_have_cloud_keys_in_json_report(self):
+        """When inventory assets are present, cloud fields are serialised to JSON."""
+        import json
+        import tempfile
+        import os
+        import hashlib
+        from vultron import ReportGenerator
+        from plugins.inventory import AssetRecord
+        from plugins.cloud.base import CloudInstance
+        from plugins.cloud.correlator import CloudCorrelator
+
+        inst = CloudInstance(
+            instance_id='i-report-test',
+            provider='aws',
+            region='us-west-2',
+            state='running',
+            private_ips=['10.0.5.5'],
+            tags={'Name': 'report-host'},
+            vpc_id='vpc-report',
+            subnet_id='subnet-report',
+            security_group_ids=['sg-report'],
+            instance_type='t2.micro',
+        )
+        asset = AssetRecord(
+            asset_id=hashlib.sha256(b'10.0.5.5').hexdigest(),
+            ip='10.0.5.5',
+        )
+        CloudCorrelator([inst]).enrich_asset(asset)
+
+        results = self._make_results()
+        results['inventory'] = {
+            'snapshot_id': 'snap-001',
+            'schema_version': '1.0',
+            'generated_at': '2026-01-01T00:00:00',
+            'asset_count': 1,
+            'assets': [asset.to_dict()],
+        }
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            a = data['inventory']['assets'][0]
+            self.assertEqual(a['cloud_provider'], 'aws')
+            self.assertEqual(a['cloud_instance_id'], 'i-report-test')
+            self.assertEqual(a['cloud_region'], 'us-west-2')
+            self.assertEqual(a['cloud_vpc_id'], 'vpc-report')
+            self.assertEqual(a['cloud_tags']['Name'], 'report-host')
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 64. PR7 — HTML report renders cloud columns when cloud data present
+# ---------------------------------------------------------------------------
+
+class TestHTMLReportCloudColumns(unittest.TestCase):
+    """HTML report asset inventory section includes cloud columns when enriched."""
+
+    def _make_results_with_cloud_asset(self):
+        import hashlib
+        from plugins.inventory import AssetRecord
+        from plugins.cloud.base import CloudInstance
+        from plugins.cloud.correlator import CloudCorrelator
+
+        inst = CloudInstance(
+            instance_id='i-html-test',
+            provider='aws',
+            region='us-east-1',
+            state='running',
+            private_ips=['10.0.0.77'],
+            tags={'Name': 'html-host'},
+            vpc_id='vpc-html',
+            subnet_id='subnet-html',
+            security_group_ids=['sg-html'],
+            instance_type='t3.small',
+        )
+        asset = AssetRecord(
+            asset_id=hashlib.sha256(b'10.0.0.77').hexdigest(),
+            ip='10.0.0.77',
+        )
+        CloudCorrelator([inst]).enrich_asset(asset)
+
+        return {
+            'target': '10.0.0.77',
+            'timestamp': '2026-01-01T00:00:00',
+            'scanner_version': '7.1.0',
+            'scan_mode': 'common',
+            'scan_protocol': 'tcp',
+            'cve_lookback_days': 120,
+            'open_ports': [],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'nvd_intelligence': {},
+            'compliance': {},
+            'auth_scan': {},
+            'tls_scan': {},
+            'cloud_enrichment': {},
+            'inventory': {
+                'snapshot_id': 'snap-html',
+                'schema_version': '1.0',
+                'generated_at': '2026-01-01T00:00:00',
+                'asset_count': 1,
+                'assets': [asset.to_dict()],
+            },
+        }
+
+    def test_html_includes_instance_id_column_header(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        results = self._make_results_with_cloud_asset()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('Instance ID', html)
+        finally:
+            os.unlink(path)
+
+    def test_html_includes_instance_id_value(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        results = self._make_results_with_cloud_asset()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('i-html-test', html)
+        finally:
+            os.unlink(path)
+
+    def test_html_includes_vpc_id(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        results = self._make_results_with_cloud_asset()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('vpc-html', html)
+        finally:
+            os.unlink(path)
+
+    def test_html_no_cloud_columns_when_no_cloud_data(self):
+        """When no cloud metadata is present, Instance ID column should not appear."""
+        import hashlib
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        from plugins.inventory import AssetRecord
+        asset = AssetRecord(
+            asset_id=hashlib.sha256(b'10.0.0.1').hexdigest(),
+            ip='10.0.0.1',
+        )
+        results = {
+            'target': '10.0.0.1',
+            'timestamp': '2026-01-01T00:00:00',
+            'scanner_version': '7.1.0',
+            'scan_mode': 'common',
+            'scan_protocol': 'tcp',
+            'cve_lookback_days': 120,
+            'open_ports': [],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'nvd_intelligence': {},
+            'compliance': {},
+            'auth_scan': {},
+            'tls_scan': {},
+            'cloud_enrichment': {},
+            'inventory': {
+                'snapshot_id': 'snap-nocloud',
+                'schema_version': '1.0',
+                'generated_at': '2026-01-01T00:00:00',
+                'asset_count': 1,
+                'assets': [asset.to_dict()],
+            },
+        }
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertNotIn('Instance ID', html)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
 

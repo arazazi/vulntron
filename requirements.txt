@@ -10,6 +10,10 @@ requests>=2.31.0
 # System and process utilities (optional, fallback to wmic if not available)
 psutil>=5.9.0
 
+# AWS SDK — required for cloud metadata enrichment (PR7, optional feature)
+# Install with: pip install boto3
+# boto3>=1.34
+
 # Standard library packages (included with Python 3.12+)
 # - platform
 # - subprocess
