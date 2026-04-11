@@ -181,6 +181,18 @@ class AssetRecord:
     role:           Inferred host role label (see :func:`_derive_role`).
     role_evidence:  Ports/signals that led to the role inference.
     exposure_summary: Plain-text exposure summary string.
+
+    Cloud metadata fields (populated by cloud enrichment phase, PR7)
+    ----------------------------------------------------------------
+    cloud_provider:           Cloud provider label (e.g. ``'aws'``), or ``None``.
+    cloud_instance_id:        Provider instance identifier (e.g. ``i-0abc1234``).
+    cloud_region:             Provider region (e.g. ``us-east-1``), or ``None``.
+    cloud_instance_state:     Instance lifecycle state (e.g. ``running``).
+    cloud_instance_type:      Machine type (e.g. ``t3.micro``), or ``None``.
+    cloud_tags:               Key/value tag dict attached to the instance.
+    cloud_vpc_id:             VPC identifier, or ``None``.
+    cloud_subnet_id:          Subnet identifier, or ``None``.
+    cloud_security_group_ids: List of security group identifiers.
     """
 
     asset_id: str
@@ -197,6 +209,16 @@ class AssetRecord:
     role: str = "unknown"
     role_evidence: List[str] = field(default_factory=list)
     exposure_summary: str = ""
+    # Cloud metadata (PR7) — all optional, populated by CloudCorrelator
+    cloud_provider: Optional[str] = None
+    cloud_instance_id: Optional[str] = None
+    cloud_region: Optional[str] = None
+    cloud_instance_state: Optional[str] = None
+    cloud_instance_type: Optional[str] = None
+    cloud_tags: Dict[str, str] = field(default_factory=dict)
+    cloud_vpc_id: Optional[str] = None
+    cloud_subnet_id: Optional[str] = None
+    cloud_security_group_ids: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Merge helpers
@@ -270,6 +292,16 @@ class AssetRecord:
             "role": self.role,
             "role_evidence": list(self.role_evidence),
             "exposure_summary": self.exposure_summary,
+            # Cloud metadata (PR7)
+            "cloud_provider": self.cloud_provider,
+            "cloud_instance_id": self.cloud_instance_id,
+            "cloud_region": self.cloud_region,
+            "cloud_instance_state": self.cloud_instance_state,
+            "cloud_instance_type": self.cloud_instance_type,
+            "cloud_tags": dict(self.cloud_tags),
+            "cloud_vpc_id": self.cloud_vpc_id,
+            "cloud_subnet_id": self.cloud_subnet_id,
+            "cloud_security_group_ids": list(self.cloud_security_group_ids),
         }
 
 

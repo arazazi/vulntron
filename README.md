@@ -15,7 +15,7 @@
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, **baseline compliance & configuration posture checks**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, **baseline compliance & configuration posture checks**, **cloud metadata enrichment (AWS)**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -31,17 +31,18 @@
 6. [TLS Deep Inspection](#-tls-deep-inspection)
 7. [Asset Inventory and Host Profiling](#-asset-inventory-and-host-profiling)
 8. [Compliance & Configuration Baseline](#-compliance--configuration-baseline)
-9. [Installation](#-installation)
-10. [Quick Start](#-quick-start)
-11. [CLI Reference](#-cli-reference)
-12. [Understanding Results](#-understanding-results)
-13. [Report Formats](#-report-formats)
-14. [Examples](#-examples)
-15. [Troubleshooting](#-troubleshooting)
-16. [Development](#-development)
-17. [Known Limitations](#-known-limitations)
-18. [Roadmap](#-roadmap)
-19. [License](#-license)
+9. [AWS Cloud Metadata Enrichment](#-aws-cloud-metadata-enrichment)
+10. [Installation](#-installation)
+11. [Quick Start](#-quick-start)
+12. [CLI Reference](#-cli-reference)
+13. [Understanding Results](#-understanding-results)
+14. [Report Formats](#-report-formats)
+15. [Examples](#-examples)
+16. [Troubleshooting](#-troubleshooting)
+17. [Development](#-development)
+18. [Known Limitations](#-known-limitations)
+19. [Roadmap](#-roadmap)
+20. [License](#-license)
 
 ---
 
@@ -216,6 +217,14 @@ User supplies target + options (--protocol tcp|udp|both)
          │  inventory snapshot (embedded in results)
          ▼
 ┌───────────────────┐
+│  PHASE 3c         │  Cloud metadata enrichment (optional, disabled by default)
+│  Cloud Enrichment │  → Fetches EC2 instance list from AWS (boto3, safe APIs only)
+│  (PR7)            │  → Correlates instances to assets by IP (private first, then public)
+│                   │  → Attaches instance ID, region, state, type, tags, VPC/subnet/SG
+└────────┬──────────┘
+         │  enriched inventory snapshot + cloud_enrichment summary
+         ▼
+┌───────────────────┐
 │  PHASE 4          │  PCI DSS 3.2.1 evaluation (optional, --skip-compliance)
 │  Compliance       │  → Pass / Fail score + issue list
 └────────┬──────────┘
@@ -243,6 +252,12 @@ plugins/
 ├── fingerprint.py    # Service fingerprinting: banner parsing, normalisation, confidence
 ├── tls_inspector.py  # TLSInspector: TLS handshake inspection, cert/cipher analysis
 ├── inventory.py      # PR4: AssetRecord, InventoryBuilder, HostProfiler, persist_inventory
+├── compliance.py     # PR5: BaselineComplianceChecker, compliance controls, profiles
+├── cloud/            # PR7: Cloud metadata provider framework
+│   ├── __init__.py   # Public API: CloudInstance, CloudProvider, AWSProvider, CloudCorrelator
+│   ├── base.py       # CloudProvider ABC + CloudInstance dataclass
+│   ├── aws.py        # AWSProvider: EC2 instance list via boto3 (graceful fallback)
+│   └── correlator.py # CloudCorrelator: IP-based asset/instance matching + enrichment
 └── checks/
     ├── __init__.py   # Auto-imports smb and network to register all built-in checks
     ├── smb.py        # EternalBlueCheck, SMBGhostCheck
@@ -964,6 +979,189 @@ Console summary example:
 
 ---
 
+## ☁️ AWS Cloud Metadata Enrichment
+
+> **PR7 feature** — available in Vulntron v7.1.0+.
+> **⚠️ Authorized use only.** Cloud enrichment is a read-only metadata operation. Only query AWS accounts you own or are explicitly authorized to access.
+
+Vulntron v7.1 adds **optional cloud metadata enrichment** (starting with AWS) that correlates discovered assets with EC2 instance metadata.  This improves inventory accuracy and reporting by attaching instance IDs, tags, VPC/subnet context, and network identifiers to asset records.
+
+Cloud enrichment is **disabled by default**.  Activate it with `--cloud-provider aws`.
+
+### What Is Collected
+
+Enrichment calls only safe, read-only AWS APIs (`ec2:DescribeInstances`):
+
+| Field | AWS Source |
+|-------|-----------|
+| Instance ID | `InstanceId` |
+| Region | Derived from `Placement.AvailabilityZone` |
+| Instance state | `State.Name` (e.g. `running`, `stopped`) |
+| Instance type | `InstanceType` (e.g. `t3.micro`) |
+| Private IPs | `NetworkInterfaces[*].PrivateIpAddresses` |
+| Public IPs | `NetworkInterfaces[*].Association.PublicIp` |
+| Tags | `Tags[*]` key/value pairs |
+| VPC ID | `VpcId` |
+| Subnet ID | `SubnetId` |
+| Security group IDs | `SecurityGroups[*].GroupId` |
+
+No write operations, no instance actions, no console/session access.
+
+### Correlation Logic
+
+Matching is performed by IP address:
+
+1. Asset `ip` → instance **private IPs** (checked first — most reliable for internal scans)
+2. Asset `ip` → instance **public IPs** (useful for internet-facing or edge-network scans)
+
+When a match is found, cloud metadata is **merged non-destructively** into the asset record:
+- Existing scan-derived hostnames and labels are never overwritten.
+- The source `cloud-aws` is appended to `scan_sources` to indicate provenance.
+
+### Required AWS IAM Permissions
+
+The IAM user or role used for enrichment requires only:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Apply the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege): grant only `ec2:DescribeInstances` and optionally scope by region using a `Condition` block.
+
+### Credential Chain
+
+Vulntron delegates credential resolution entirely to boto3.  Credentials are resolved in this order (standard AWS SDK chain):
+
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
+2. `~/.aws/credentials` / `~/.aws/config` (named profiles)
+3. IAM instance role (when running on EC2)
+4. IAM ECS/EKS task role (when running in a container)
+
+Use `--cloud-profile` to select a named profile instead of the default chain.
+
+No AWS credentials are written to reports, logs, or the console.  If boto3 is not installed or credentials are absent, enrichment is silently skipped.
+
+### Installation
+
+Install [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) (the official AWS SDK for Python):
+
+```bash
+pip install boto3
+```
+
+Add it to `requirements.txt` for your deployment if needed.
+
+### Quick Start — Cloud Enrichment
+
+**Enrich with default credentials (env vars / profile / IAM role):**
+
+```bash
+python3 vultron.py -t 10.0.0.5 --cloud-provider aws
+```
+
+**Specify region and named profile:**
+
+```bash
+python3 vultron.py -t 10.0.0.5 --cloud-provider aws --cloud-region us-east-1 --cloud-profile prod-readonly
+```
+
+**Only include instances tagged `Env=prod`:**
+
+```bash
+python3 vultron.py -t 10.0.0.5 --cloud-provider aws --cloud-tag-include Env=prod
+```
+
+**Multiple include filters (AND logic — all tags must match):**
+
+```bash
+python3 vultron.py -t 10.0.0.5 --cloud-provider aws \
+  --cloud-tag-include Env=prod Owner=ops
+```
+
+**Exclude dev instances:**
+
+```bash
+python3 vultron.py -t 10.0.0.5 --cloud-provider aws --cloud-tag-exclude Env=dev
+```
+
+**Combined with credentialed scan and inventory file:**
+
+```bash
+python3 vultron.py -t 10.0.0.5 \
+  --cloud-provider aws --cloud-region eu-west-1 \
+  --inventory-output inventory_enriched.json \
+  --ssh-user scanuser --ssh-key ~/.ssh/id_rsa
+```
+
+### Cloud Enrichment Output
+
+Cloud metadata is embedded in the asset records inside the `inventory` key of the JSON report, and a `cloud_enrichment` summary key is added at the top level:
+
+```json
+{
+  "cloud_enrichment": {
+    "provider": "aws",
+    "region": "us-east-1",
+    "instances_fetched": 12,
+    "assets_enriched": 1,
+    "instances": [ ... ]
+  },
+  "inventory": {
+    "assets": [
+      {
+        "ip": "10.0.1.5",
+        "cloud_provider": "aws",
+        "cloud_instance_id": "i-0abc1234def567890",
+        "cloud_region": "us-east-1",
+        "cloud_instance_state": "running",
+        "cloud_instance_type": "t3.medium",
+        "cloud_tags": { "Name": "web-prod-01", "Env": "prod" },
+        "cloud_vpc_id": "vpc-12345678",
+        "cloud_subnet_id": "subnet-87654321",
+        "cloud_security_group_ids": ["sg-aabbccdd"],
+        "scan_sources": ["tcp-scan", "tls-inspect", "cloud-aws"]
+      }
+    ]
+  }
+}
+```
+
+When cloud data is present, the HTML report's **Asset Inventory** table gains extra columns:
+
+| Instance ID | Region | State | Type | VPC | Tags |
+|-------------|--------|-------|------|-----|------|
+| i-0abc1234… | us-east-1 | running | t3.medium | vpc-12345678 | Name=web-prod-01, Env=prod |
+
+### Tag Filtering
+
+Use `--cloud-tag-include` and `--cloud-tag-exclude` to control which instances are returned from the AWS API.  Filters are applied **after** the API call (client-side).
+
+| Flag | Logic | Example |
+|------|-------|---------|
+| `--cloud-tag-include KEY=VALUE ...` | All specified tags must match (AND) | `--cloud-tag-include Env=prod` |
+| `--cloud-tag-exclude KEY=VALUE ...` | Any matching tag excludes the instance (OR) | `--cloud-tag-exclude Env=dev` |
+
+### Caveats and Constraints
+
+- **Read-only / enrichment only**: No active scanning is performed via cloud APIs.  No instance actions or console access are used.
+- **No cross-account support**: The current implementation queries one AWS account at a time (the account associated with the provided credentials).
+- **Region scope**: Without `--cloud-region`, boto3 uses the region from your active profile or `AWS_DEFAULT_REGION`.  To query all regions, run Vulntron once per region.
+- **boto3 optional**: If boto3 is not installed, enrichment is silently skipped.  All other scan phases run normally.
+- **No credentials in reports**: AWS credentials are never written to reports, logs, or console output.
+- **Instance count**: For accounts with thousands of instances, `DescribeInstances` may be slow.  Use tag filters to reduce the response size.
+- **Multi-provider**: The cloud provider framework is designed for extensibility.  Azure and GCP providers can be added as additional `CloudProvider` subclasses in `plugins/cloud/`.
+
+---
+
 ## 📥 Installation
 
 ### Prerequisites
@@ -1120,6 +1318,16 @@ python3 vultron.py -t <target> [options]
 |------|------|---------|-------------|
 | `--no-inventory` | flag | `False` | Disable asset inventory generation (inventory is built by default) |
 | `--inventory-output` | path | — | Save a standalone inventory JSON snapshot to this path (also embedded in main JSON report) |
+
+### Cloud Metadata Enrichment Options (PR7)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--cloud-provider` | choice | disabled | Enable cloud enrichment: `aws`. Requires boto3. Disabled by default. |
+| `--cloud-region` | string | — | AWS region to query (e.g. `us-east-1`). Defaults to active profile / `AWS_DEFAULT_REGION`. |
+| `--cloud-profile` | string | — | Named AWS credential profile from `~/.aws/config`. Uses standard boto3 chain when not specified. |
+| `--cloud-tag-include` | `KEY=VALUE …` | — | Only include instances matching **all** specified tags (AND logic). |
+| `--cloud-tag-exclude` | `KEY=VALUE …` | — | Exclude instances matching **any** specified tag (OR logic). |
 
 ### Compliance Options (PR5)
 
@@ -1412,6 +1620,14 @@ Test coverage includes:
 - **PR1 — CLI credential argument parsing** (`TestCLICredentialParsing`)
 - **PR1 — HybridScanner credentialed mode integration** (`TestHybridScannerCredentialedMode`)
 - **PR1 — BaseCheck credential attributes** (`TestBaseCheckCredentialAttributes`)
+- **PR7 — CloudInstance dataclass** (`TestCloudInstance`)
+- **PR7 — CloudProvider interface** (`TestCloudProviderInterface`)
+- **PR7 — AWSProvider unit tests** (`TestAWSProvider`)
+- **PR7 — CloudCorrelator** (`TestCloudCorrelator`)
+- **PR7 — AssetRecord cloud fields serialisation** (`TestAssetRecordCloudFields`)
+- **PR7 — CLI cloud option parsing** (`TestCLICloudParsing`)
+- **PR7 — JSON report cloud_enrichment key** (`TestCloudEnrichmentReportKey`)
+- **PR7 — HTML report cloud columns** (`TestHTMLReportCloudColumns`)
 
 ### Syntax Check
 
@@ -1461,11 +1677,12 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [x] **PR4: Asset inventory + host profiling** — normalised asset records, deterministic fingerprint, host role/risk/exposure inference, JSON persistence
 - [x] **PR5: Compliance & configuration baseline** — baseline posture controls (TLS, service exposure, auth), profile selection, credential-aware skip/unknown, HTML/JSON report integration
 - [ ] PR6: Patch detection (OS/package mapping via credentialed checks)
-- [ ] PR7: Web application scanner (safe, non-exploit checks)
-- [ ] PR8: Database security audits (read-only checks)
-- [ ] PR9: Network device audits (Cisco/Juniper baseline)
-- [ ] PR10: Cloud posture checks (AWS/Azure/GCP read-only)
-- [ ] PR11: Scalable CVE check-pack architecture
+- [x] **PR7: Cloud metadata integration (AWS baseline + tagging)** — `plugins/cloud/` framework, AWSProvider (boto3, safe EC2 APIs), CloudCorrelator (IP matching), CLI options, enriched HTML/JSON reports
+- [ ] PR8: Web application scanner (safe, non-exploit checks)
+- [ ] PR9: Database security audits (read-only checks)
+- [ ] PR10: Network device audits (Cisco/Juniper baseline)
+- [ ] PR11: Cloud posture checks extended (Azure/GCP)
+- [ ] PR12: Scalable CVE check-pack architecture
 - [ ] Phase C: Scheduled / continuous scanning
 - [ ] Phase D: Web UI
 - [ ] Machine-readable SARIF output for integration with GitHub Code Scanning

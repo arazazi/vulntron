@@ -83,6 +83,7 @@ try:
         ControlStatus,
         ALL_PROFILES,
     )
+    from plugins.cloud import AWSProvider, CloudCorrelator
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -90,10 +91,10 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "7.0.0"
+VERSION = "7.1.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦7.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦7.1
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
@@ -1821,6 +1822,8 @@ class ReportGenerator:
         # Asset inventory section (only rendered when inventory data is present)
         inv_assets = inventory.get('assets', [])
         if inv_assets:
+            # Determine if any asset has cloud metadata
+            _has_cloud = any(_a.get('cloud_provider') for _a in inv_assets)
             _inv_rows = ''
             for _a in inv_assets:
                 _tcp_count = len(_a.get('tcp_services', {}))
@@ -1833,6 +1836,24 @@ class ReportGenerator:
                 }.get(_risk, 'info')
                 _exposure = _a.get('exposure_summary', '')
                 _ip = _a.get('ip') or _a.get('hostname') or target
+                _cloud_cells = ''
+                if _has_cloud:
+                    _inst_id = _a.get('cloud_instance_id') or '—'
+                    _region = _a.get('cloud_region') or '—'
+                    _c_state = _a.get('cloud_instance_state') or '—'
+                    _c_type = _a.get('cloud_instance_type') or '—'
+                    _vpc = _a.get('cloud_vpc_id') or '—'
+                    _tags_str = ', '.join(
+                        f"{k}={v}" for k, v in (_a.get('cloud_tags') or {}).items()
+                    ) or '—'
+                    _cloud_cells = (
+                        f'<td style="font-size:12px">{_inst_id}</td>'
+                        f'<td style="font-size:12px">{_region}</td>'
+                        f'<td style="font-size:12px">{_c_state}</td>'
+                        f'<td style="font-size:12px">{_c_type}</td>'
+                        f'<td style="font-size:12px">{_vpc}</td>'
+                        f'<td style="font-size:12px">{_tags_str}</td>'
+                    )
                 _inv_rows += f'''
                 <tr>
                     <td><strong>{_ip}</strong></td>
@@ -1842,7 +1863,18 @@ class ReportGenerator:
                     <td>{_tcp_count}</td>
                     <td>{_udp_count}</td>
                     <td style="font-size:12px">{_exposure}</td>
+                    {_cloud_cells}
                 </tr>'''
+            _cloud_headers = ''
+            if _has_cloud:
+                _cloud_headers = (
+                    '<th>Instance ID</th>'
+                    '<th>Region</th>'
+                    '<th>State</th>'
+                    '<th>Type</th>'
+                    '<th>VPC</th>'
+                    '<th>Tags</th>'
+                )
             html += f'''
         <div class="section">
             <div class="section-header">Asset Inventory</div>
@@ -1860,6 +1892,7 @@ class ReportGenerator:
                             <th>TCP Ports</th>
                             <th>UDP Ports</th>
                             <th>Exposure</th>
+                            {_cloud_headers}
                         </tr>
                     </thead>
                     <tbody>{_inv_rows}
@@ -1871,7 +1904,7 @@ class ReportGenerator:
 
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v7.0 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v7.1 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -1915,6 +1948,7 @@ class HybridScanner:
             'auth_scan': {},
             'tls_scan': {},
             'inventory': {},
+            'cloud_enrichment': {},
         }
 
     def _build_credential_set(self):
@@ -2214,6 +2248,53 @@ class HybridScanner:
                     print(Colors.warning(f"  Inventory save failed: {_e}"))
             print()
 
+        # [PHASE 3c] Cloud Metadata Enrichment (optional, disabled by default)
+        _cloud_provider = getattr(args, 'cloud_provider', None)
+        if _HAS_PLUGINS and _cloud_provider == 'aws':
+            print(Colors.header("[PHASE 3c] CLOUD METADATA ENRICHMENT (AWS)"))
+            _aws_region = getattr(args, 'cloud_region', None)
+            _aws_profile = getattr(args, 'cloud_profile', None)
+            _tag_include = getattr(args, 'cloud_tag_include', None) or []
+            _tag_exclude = getattr(args, 'cloud_tag_exclude', None) or []
+            _aws = AWSProvider(
+                region=_aws_region,
+                profile=_aws_profile,
+                tag_include=_tag_include,
+                tag_exclude=_tag_exclude,
+            )
+            if not _aws.is_available():
+                print(Colors.warning("  boto3 is not installed — skipping AWS enrichment"))
+                print(Colors.warning("  Install with: pip install boto3"))
+            else:
+                _cloud_instances = _aws.list_instances()
+                _correlator = CloudCorrelator(_cloud_instances)
+                print(Colors.info(
+                    f"  AWS instances fetched: {_correlator.instance_count}"
+                    + (f" (region: {_aws_region})" if _aws_region else "")
+                ))
+                _enriched = 0
+                # Enrich in-memory snapshot assets (if inventory was built)
+                if _HAS_PLUGINS and not getattr(args, 'no_inventory', False):
+                    for _asset in (_snapshot.assets if '_snapshot' in dir() else []):
+                        if _correlator.enrich_asset(_asset):
+                            _enriched += 1
+                    # Refresh the results dict so reports include cloud fields
+                    if '_snapshot' in dir():
+                        self.results['inventory'] = _snapshot.to_dict()
+                _cloud_summary = {
+                    "provider": "aws",
+                    "region": _aws_region,
+                    "instances_fetched": _correlator.instance_count,
+                    "assets_enriched": _enriched,
+                    "instances": [i.to_dict() for i in _cloud_instances],
+                }
+                self.results['cloud_enrichment'] = _cloud_summary
+                if _enriched:
+                    print(Colors.success(f"  Assets enriched with cloud metadata: {_enriched}"))
+                else:
+                    print(Colors.info("  No asset/instance IP matches found"))
+            print()
+
         # [PHASE 4] Report Generation
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2276,13 +2357,19 @@ class HybridScanner:
             print(Colors.info(f"Asset Inventory: {inv_assets} asset(s) recorded (included in JSON report)"))
             if _inventory_output:
                 print(Colors.success(f"Standalone inventory: {_inventory_output}"))
+        _ce = self.results.get('cloud_enrichment', {})
+        if _ce:
+            print(Colors.info(
+                f"Cloud Enrichment [AWS]: {_ce.get('instances_fetched', 0)} instance(s) fetched, "
+                f"{_ce.get('assets_enriched', 0)} asset(s) enriched"
+            ))
         report_files = f"{html_file}, {json_file}"
         print(Colors.success(f"\nReports: {report_files}\n"))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v7.0 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v7.1 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2480,6 +2567,53 @@ Compliance notes:
         help='Path for standalone inventory JSON snapshot '
              '(e.g. inventory_192_168_1_1.json). '
              'The inventory is also embedded in the main JSON report when not disabled.',
+    )
+
+    # -- Cloud metadata enrichment options (PR7) ------------------------------
+    cloud_group = parser.add_argument_group(
+        'Cloud metadata enrichment (PR7)',
+        'Optional enrichment of asset inventory with cloud provider metadata. '
+        'Disabled by default.  Enrichment is read-only; no active scanning is performed.',
+    )
+    cloud_group.add_argument(
+        '--cloud-provider',
+        choices=['aws'],
+        default=None,
+        metavar='PROVIDER',
+        help=(
+            'Enable cloud metadata enrichment for the specified provider. '
+            'Currently supported: aws.  Requires boto3 for AWS.  Default: disabled.'
+        ),
+    )
+    cloud_group.add_argument(
+        '--cloud-region',
+        metavar='REGION',
+        default=None,
+        help='Cloud provider region to query (e.g. us-east-1). '
+             'Defaults to the value from the active credential profile or environment.',
+    )
+    cloud_group.add_argument(
+        '--cloud-profile',
+        metavar='PROFILE',
+        default=None,
+        help='Named AWS credential profile from ~/.aws/config (optional). '
+             'Defaults to the standard boto3 credential chain.',
+    )
+    cloud_group.add_argument(
+        '--cloud-tag-include',
+        metavar='KEY=VALUE',
+        nargs='+',
+        default=None,
+        help='Only include cloud instances that match ALL of the specified key=value '
+             'tag pairs (e.g. --cloud-tag-include Environment=prod Owner=ops).',
+    )
+    cloud_group.add_argument(
+        '--cloud-tag-exclude',
+        metavar='KEY=VALUE',
+        nargs='+',
+        default=None,
+        help='Exclude cloud instances that match ANY of the specified key=value '
+             'tag pairs (e.g. --cloud-tag-exclude Environment=dev).',
     )
 
     # -- Compliance options (PR5) ---------------------------------------------

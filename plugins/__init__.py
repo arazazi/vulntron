@@ -108,6 +108,12 @@ from .inventory import (
     TLSServiceRecord,
     persist_inventory,
 )
+from .cloud import (
+    CloudInstance,
+    CloudProvider,
+    AWSProvider,
+    CloudCorrelator,
+)
 
 __all__ = [
     # Phase A
@@ -148,4 +154,9 @@ __all__ = [
     "ServiceRecord",
     "TLSServiceRecord",
     "persist_inventory",
+    # PR7 — cloud metadata
+    "CloudInstance",
+    "CloudProvider",
+    "AWSProvider",
+    "CloudCorrelator",
 ]
