@@ -32,17 +32,18 @@
 7. [Asset Inventory and Host Profiling](#-asset-inventory-and-host-profiling)
 8. [Compliance & Configuration Baseline](#-compliance--configuration-baseline)
 9. [Exposure & Patch Risk Detection](#-exposure--patch-risk-detection)
-10. [Installation](#-installation)
-11. [Quick Start](#-quick-start)
-12. [CLI Reference](#-cli-reference)
-13. [Understanding Results](#-understanding-results)
-14. [Report Formats](#-report-formats)
-15. [Examples](#-examples)
-16. [Troubleshooting](#-troubleshooting)
-17. [Development](#-development)
-18. [Known Limitations](#-known-limitations)
-19. [Roadmap](#-roadmap)
-20. [License](#-license)
+10. [Web Application Posture Scanner (P8)](#-web-application-posture-scanner-p8)
+11. [Installation](#-installation)
+12. [Quick Start](#-quick-start)
+13. [CLI Reference](#-cli-reference)
+14. [Understanding Results](#-understanding-results)
+15. [Report Formats](#-report-formats)
+16. [Examples](#-examples)
+17. [Troubleshooting](#-troubleshooting)
+18. [Development](#-development)
+19. [Known Limitations](#-known-limitations)
+20. [Roadmap](#-roadmap)
+21. [License](#-license)
 
 ---
 
@@ -113,6 +114,10 @@ Controls currently implemented:
 ### 🔍 Exposure & Patch Risk Detection
 
 Vulntron v8.0 adds a **heuristic, non-intrusive exposure engine** (`plugins/exposure.py`) that derives patch-risk and exposure signals from scan data without any additional network probes.  Signal types include risky services, management interface exposure, weak TLS, certificate issues, EOL software versions, and database exposure.  All version-based signals are clearly labelled as heuristic with confidence scores.
+
+### 🌐 Web Application Posture Scanner (P8)
+
+Vulntron v8.0 adds an optional **safe, non-exploit web application scanner** (`plugins/web_scanner.py`) activated with `--web-scan`.  It performs read-only HTTP/HTTPS checks including security header analysis (CSP, HSTS, X-Frame-Options, etc.), cookie flag inspection, HTTP→HTTPS redirect verification, CORS misconfiguration heuristics, directory listing detection, robots.txt/sitemap presence, server banner disclosure, basic auth detection, and cache-control posture.  All authentication material is redacted from evidence before storage.
 
 ### 📦 Asset Inventory and Host Profiling
 
@@ -1108,7 +1113,140 @@ The full exposure report is embedded in both the JSON report (`exposure` key) an
 
 ---
 
-## 📥 Installation
+## 🌐 Web Application Posture Scanner (P8)
+
+> **P8 feature** — available in Vulntron v8.0.0+.
+
+Vulntron v8.0 includes an optional **web application posture scanner** (`plugins/web_scanner.py`) that performs safe, non-exploit, non-destructive checks against HTTP/HTTPS services.  It is disabled by default and activated with `--web-scan`.
+
+> ⚠️ **Safety guarantee:** The web scanner never sends exploit payloads, never attempts brute-force or credential stuffing, and never modifies server state.  All checks are read-only HTTP requests.
+
+### How It Works
+
+The web scanner discovers HTTP/HTTPS targets from open ports already found in the TCP scan phase (ports 80, 443, 8080, 8443, etc.) and optionally from user-supplied URLs (`--url` / `--urls-file`).  Each target is checked with a configurable concurrency limit to keep request volume low.
+
+### Checks Performed
+
+| Check | Finding ID | Severity |
+|-------|------------|----------|
+| Missing Content-Security-Policy | `WEB-HEADER-CSP` | MEDIUM |
+| Missing HTTP Strict Transport Security | `WEB-HEADER-HSTS` | MEDIUM |
+| Missing X-Frame-Options | `WEB-HEADER-XFO` | MEDIUM |
+| Missing X-Content-Type-Options | `WEB-HEADER-XCTO` | MEDIUM |
+| Missing Referrer-Policy | `WEB-HEADER-RP` | MEDIUM |
+| Missing Permissions-Policy | `WEB-HEADER-PP` | MEDIUM |
+| Permissive CSP (unsafe-inline / wildcard) | `WEB-HEADER-CSP-WEAK` | LOW |
+| Cookie missing Secure / HttpOnly / SameSite | `WEB-COOKIE-FLAGS` | LOW |
+| HTTP → HTTPS redirect absent | `WEB-REDIRECT-NO-HTTPS` | MEDIUM |
+| CORS wildcard + credentials | `WEB-CORS-WILDCARD-CREDS` | MEDIUM |
+| CORS reflected arbitrary origin | `WEB-CORS-REFLECT-ORIGIN` | MEDIUM |
+| Directory listing (autoindex) heuristic | `WEB-DIRLIST` | LOW |
+| robots.txt present (informational) | `WEB-ROBOTS-INFO` | INFO |
+| sitemap.xml present (informational) | `WEB-SITEMAP-INFO` | INFO |
+| Server/technology banner disclosed | `WEB-BANNER-INFO` | INFO |
+| HTTP Basic Auth endpoint (HTTP cleartext) | `WEB-BASICAUTH-INFO` | MEDIUM/INFO |
+| Cache-Control absent on sensitive paths | `WEB-CACHE-MISSING` | LOW |
+
+### Evidence Redaction
+
+All authentication material (cookies, `Set-Cookie` values, `Authorization`, `WWW-Authenticate`) is **redacted** before being stored in findings.  Raw auth tokens are never written to reports or logs.
+
+### Quick Start — Web Scanner
+
+```bash
+# Enable web scanner for a target that has HTTP/HTTPS ports open
+python3 vultron.py -t 192.168.1.100 --web-scan
+
+# Add a specific URL (same host)
+python3 vultron.py -t 192.168.1.100 --web-scan --url https://192.168.1.100:8443
+
+# Read URLs from a file
+python3 vultron.py -t 192.168.1.100 --web-scan --urls-file targets.txt
+
+# Allow scanning URLs from different hosts (scope override)
+python3 vultron.py -t 192.168.1.100 --web-scan \
+    --url https://webapp.example.com \
+    --web-allow-non-inventory-targets
+
+# Custom concurrency and timeout
+python3 vultron.py -t 192.168.1.100 --web-scan \
+    --web-concurrency 3 --web-timeout 15
+
+# Custom User-Agent
+python3 vultron.py -t 192.168.1.100 --web-scan \
+    --web-user-agent "InternalScanner/1.0 (authorized)"
+```
+
+### Web Scanner CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--web-scan` | disabled | Enable web application posture scan |
+| `--url URL` | — | Additional URL to scan |
+| `--urls-file FILE` | — | Text file with URLs (one per line; `#` comments allowed) |
+| `--web-concurrency N` | 5 | Maximum concurrent web check workers |
+| `--web-timeout SECONDS` | 10.0 | Per-request HTTP timeout |
+| `--web-max-paths N` | 3 | Maximum paths probed for directory-listing checks |
+| `--web-user-agent UA` | built-in | Custom User-Agent for web requests |
+| `--web-allow-non-inventory-targets` | false | Allow scanning URLs not matching the scan target host |
+| `--web-auth-profile PROFILE` | — | Credential profile name for authenticated checks (still non-exploit) |
+
+### Scope Controls
+
+By default the web scanner only scans:
+1. URLs derived from the TCP port scan (open web ports on the scan target), and
+2. User-supplied `--url` / `--urls-file` entries whose hostname matches the scan target.
+
+Use `--web-allow-non-inventory-targets` to scan out-of-scope user-supplied URLs.  Use this option only on systems you are authorised to test.
+
+### JSON Report Structure
+
+```json
+{
+  "web_posture": {
+    "target_count": 2,
+    "total_findings": 8,
+    "summary": {
+      "critical": 0,
+      "high": 0,
+      "medium": 4,
+      "low": 2,
+      "info": 2
+    },
+    "targets": [
+      {
+        "url": "http://192.168.1.100",
+        "finding_count": 5,
+        "error": null,
+        "findings": [
+          {
+            "finding_id": "WEB-HEADER-CSP",
+            "title": "Missing security header: Content-Security-Policy (CSP)",
+            "description": "...",
+            "severity": "MEDIUM",
+            "confidence": 0.9,
+            "confidence_label": "HIGH",
+            "target_url": "http://192.168.1.100",
+            "evidence": ["HTTP 200 from http://192.168.1.100/", "Header absent: Content-Security-Policy"],
+            "remediation": "Configure your web server or application to set the Content-Security-Policy header in all responses."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Safety Notes
+
+- **No exploit payloads** are ever sent.  Every request is a normal GET with a descriptive User-Agent.
+- **No brute-force** login or credential stuffing.
+- **Request volume is low** by design (configurable via `--web-concurrency` and `--web-max-paths`).
+- The User-Agent identifies the scanner as an authorized security assessment tool.
+- Cookie values are never stored in findings (redacted to `***REDACTED***`).
+- Only use on systems and applications you are authorised to test.
+
+---
 
 ### Prerequisites
 

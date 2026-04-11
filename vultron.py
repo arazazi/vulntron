@@ -85,6 +85,7 @@ try:
         ALL_PROFILES,
     )
     from plugins.exposure import ExposureEngine, ExposureReport
+    from plugins.web_scanner import WebScanner, WebPostureReport, load_urls_file
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -1927,6 +1928,72 @@ class ReportGenerator:
         </div>
 '''
 
+        # Web Posture section
+        web_posture = self.results.get('web_posture', {})
+        _web_targets = web_posture.get('targets', [])
+        if _web_targets:
+            _web_total    = web_posture.get('total_findings', 0)
+            _web_summary  = web_posture.get('summary', {})
+            _web_crit     = _web_summary.get('critical', 0)
+            _web_high     = _web_summary.get('high', 0)
+            _web_med      = _web_summary.get('medium', 0)
+            _web_low      = _web_summary.get('low', 0)
+            _web_info     = _web_summary.get('info', 0)
+            _web_colour   = (
+                'var(--accent-orange)' if _web_crit or _web_high else 'var(--accent-yellow)'
+            )
+            _web_rows = ''
+            for _wt in _web_targets:
+                _target_url = _wt.get('url', '')
+                if _wt.get('error'):
+                    _web_rows += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span style="font-family:monospace;color:var(--text-secondary);">{_target_url}</span>
+                        <span class="badge badge-low">ERROR</span>
+                    </div>
+                    <div style="color:var(--text-secondary);font-size:13px;">{_wt.get('error','')}</div>
+                </div>'''
+                    continue
+                for _wf in _wt.get('findings', []):
+                    _sev = (_wf.get('severity') or 'INFO').lower()
+                    _conf_label = _wf.get('confidence_label', 'MEDIUM')
+                    _ev_items = ''.join(
+                        f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                        for e in (_wf.get('evidence') or [])
+                    )
+                    _rem = _wf.get('remediation', '')
+                    _web_rows += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_wf.get('finding_id','')}</span>
+                        <span class="badge badge-{_sev}">{_wf.get('severity','INFO')}</span>
+                        <span style="font-size:11px;color:var(--text-secondary);margin-left:8px;">confidence: {_conf_label}</span>
+                    </div>
+                    <div style="font-weight:500;margin-bottom:4px;">{_wf.get('title','')}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:4px;">{_wf.get('description','')}</div>
+                    <ul style="padding-left:16px;">{_ev_items}</ul>
+                    {f'<div style="font-size:12px;margin-top:4px;color:var(--accent-green);">Remediation: {_rem}</div>' if _rem else ''}
+                    <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">Target: {_target_url}</div>
+                </div>'''
+            html += f'''
+        <div class="section">
+            <div class="section-header">Web Application Posture</div>
+            <div style="padding: 20px;">
+                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
+                    {_web_total} web finding(s) across {len(_web_targets)} target(s) ·
+                    <span style="color:{_web_colour};">critical={_web_crit}</span> ·
+                    high={_web_high} · medium={_web_med} · low={_web_low} · info={_web_info}
+                </p>
+                <p style="margin-bottom:16px; color: var(--text-secondary); font-size:12px; font-style:italic;">
+                    All checks are safe, non-exploit, and non-destructive.  Evidence is
+                    redacted — no authentication material is stored.
+                </p>
+                {_web_rows}
+            </div>
+        </div>
+'''
+
         html += f'''
         <div class="footer">
             <div style="font-size: 14px; margin-bottom: 8px;">Vultron v8.0 - Security Assessment</div>
@@ -1974,6 +2041,7 @@ class HybridScanner:
             'auth_scan': {},
             'tls_scan': {},
             'inventory': {},
+            'web_posture': {},
         }
 
     def _build_credential_set(self):
@@ -2294,6 +2362,40 @@ class HybridScanner:
                 print(Colors.warning(
                     f"  [{_sig.severity.value}] {_sig.title}{_heur}"
                 ))
+            print()
+
+        # [PHASE 3d] Web Application Posture Scan
+        _web_scan_enabled = getattr(args, 'web_scan', False)
+        if _HAS_PLUGINS and _web_scan_enabled:
+            print(Colors.header("[PHASE 3d] WEB APPLICATION POSTURE SCAN"))
+            _web_extra_urls: List[str] = []
+            _web_url = getattr(args, 'url', None)
+            _web_urls_file = getattr(args, 'urls_file', None)
+            if _web_url:
+                _web_extra_urls.append(_web_url)
+            if _web_urls_file:
+                _web_extra_urls.extend(load_urls_file(_web_urls_file))
+
+            _web_scanner = WebScanner(
+                scan_results=self.results,
+                extra_urls=_web_extra_urls,
+                allow_non_inventory=getattr(args, 'web_allow_non_inventory_targets', False),
+                user_agent=getattr(args, 'web_user_agent', None) or "Vultron-WebScanner/8.0 (authorized security assessment; non-exploit)",
+                timeout=getattr(args, 'web_timeout', 10.0),
+                concurrency=getattr(args, 'web_concurrency', 5),
+                max_paths=getattr(args, 'web_max_paths', 3),
+            )
+            _web_report = _web_scanner.run()
+            self.results['web_posture'] = _web_report.to_dict()
+            _web_summary = _web_report.summary
+            print(Colors.info(
+                f"Web targets scanned: {_web_report.to_dict()['target_count']} · "
+                f"findings: {_web_report.total_findings} "
+                f"(high={_web_summary.get('high', 0)} "
+                f"medium={_web_summary.get('medium', 0)} "
+                f"low={_web_summary.get('low', 0)} "
+                f"info={_web_summary.get('info', 0)})"
+            ))
             print()
 
         # [PHASE 4] Report Generation
@@ -2683,6 +2785,65 @@ Exposure & patch-risk detection notes:
                             help='WMI password')
     cred_group.add_argument('--wmi-domain', metavar='DOMAIN',
                             help='Active Directory domain for WMI authentication')
+
+    # -- Web application scanner options (P8) ---------------------------------
+    web_group = parser.add_argument_group(
+        'Web application scanner (P8 — authorized use only)',
+        'Safe, non-exploit HTTP/HTTPS posture checks.  Disabled by default; '
+        'enable with --web-scan.  Only performs read-only, non-destructive checks.',
+    )
+    web_group.add_argument(
+        '--web-scan',
+        action='store_true',
+        help='Enable web application posture scan (disabled by default)',
+    )
+    web_group.add_argument(
+        '--url',
+        metavar='URL',
+        help='Additional URL to include in the web scan (e.g. https://app.example.com)',
+    )
+    web_group.add_argument(
+        '--urls-file',
+        metavar='FILE',
+        help='Path to a text file containing URLs to scan (one per line; # comments allowed)',
+    )
+    web_group.add_argument(
+        '--web-concurrency',
+        type=int, default=5, metavar='N',
+        help='Maximum concurrent web scan workers (default: 5)',
+    )
+    web_group.add_argument(
+        '--web-timeout',
+        type=float, default=10.0, metavar='SECONDS',
+        help='Per-request HTTP timeout for web checks in seconds (default: 10.0)',
+    )
+    web_group.add_argument(
+        '--web-max-paths',
+        type=int, default=3, metavar='N',
+        help='Maximum path probes per target for directory-listing checks (default: 3)',
+    )
+    web_group.add_argument(
+        '--web-user-agent',
+        metavar='UA',
+        help='Custom User-Agent string for web scan requests '
+             '(default: Vultron-WebScanner/8.0 ...)',
+    )
+    web_group.add_argument(
+        '--web-allow-non-inventory-targets',
+        action='store_true',
+        help=(
+            'Allow scanning user-supplied URLs whose host does not match the scan '
+            'target.  Disabled by default for scope safety.'
+        ),
+    )
+    web_group.add_argument(
+        '--web-auth-profile',
+        metavar='PROFILE',
+        help=(
+            'Name of a credential profile from --cred-file to use for '
+            'authenticated web checks (optional; still non-exploit).'
+        ),
+    )
 
     args = parser.parse_args()
 
