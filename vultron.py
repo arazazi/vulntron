@@ -77,6 +77,12 @@ try:
     from plugins.fingerprint import fingerprint_banner, normalize_service_name, ServiceFingerprint
     from plugins.tls_inspector import TLSInspector, is_tls_port
     from plugins.inventory import InventoryBuilder, HostProfiler, persist_inventory
+    from plugins.compliance import (
+        BaselineComplianceChecker,
+        ComplianceReport,
+        ControlStatus,
+        ALL_PROFILES,
+    )
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -84,10 +90,10 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "6.0.0"
+VERSION = "7.0.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦6.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦7.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
@@ -1101,30 +1107,123 @@ class NVDIntelligence:
 
 
 class ComplianceChecker:
-    """Compliance assessment"""
-    
-    def __init__(self, scan_results: Dict):
-        self.results = scan_results
-    
+    """Compliance assessment — baseline posture + legacy PCI DSS summary."""
+
+    def __init__(self, scan_results: Dict, profile: str = "baseline",
+                 has_credentials: bool = False):
+        self.results         = scan_results
+        self.profile         = profile
+        self.has_credentials = has_credentials
+
+    def run_baseline(self) -> Dict:
+        """Run the baseline compliance profile and return a serialisable dict.
+
+        Falls back to a lightweight in-process evaluation when the plugins
+        package is not available (e.g. during unit tests without the full
+        plugin tree).
+        """
+        print(Colors.header("[PHASE 3] COMPLIANCE ASSESSMENT"))
+        print(Colors.info(f"Running compliance profile: {self.profile}\n"))
+
+        if _HAS_PLUGINS:
+            checker = BaselineComplianceChecker(
+                scan_results=self.results,
+                profile=self.profile,
+                has_credentials=self.has_credentials,
+            )
+            report = checker.run()
+        else:
+            # Minimal fallback — mirrors the old PCI DSS logic
+            report = self._legacy_pci_fallback()
+
+        counts = report.summary_counts() if hasattr(report, 'summary_counts') else {}
+        failed = report.failed if hasattr(report, 'failed') else []
+        passed = report.passed if hasattr(report, 'passed') else []
+
+        print(Colors.info(
+            f"Compliance status: {report.to_dict()['status']} | "
+            f"Pass: {counts.get('pass', 0)} | "
+            f"Fail: {counts.get('fail', 0)} | "
+            f"Skip/Unknown: {counts.get('skip', 0) + counts.get('unknown', 0)}\n"
+        ))
+        for ctrl in failed:
+            print(Colors.warning(
+                f"  FAIL [{ctrl.severity.value}] {ctrl.control_id}: {ctrl.title}"
+            ))
+        if not failed and passed:
+            print(Colors.success("  All evaluated controls passed.\n"))
+
+        return report.to_dict()
+
+    # ------------------------------------------------------------------
+    # Legacy fallback (no plugins)
+    # ------------------------------------------------------------------
+
+    def _legacy_pci_fallback(self):
+        """Return a minimal ComplianceReport-like object when plugins are absent."""
+        # Lazy import to avoid circular references
+        from types import SimpleNamespace
+        issues = []
+        if any(p.get('port') == 23 for p in self.results.get('open_ports', [])):
+            issues.append("Telnet (insecure protocol) detected")
+        critical_confirmed = [
+            v for v in self.results.get('vulnerabilities', [])
+            if v.get('severity') == 'CRITICAL' and v.get('status') == 'CONFIRMED'
+        ]
+        if critical_confirmed:
+            issues.append(
+                f"{len(critical_confirmed)} confirmed critical vulnerabilities present"
+            )
+        status = 'PASS' if not issues else 'FAIL'
+        score  = max(0, 100 - len(issues) * 15)
+
+        # Build a duck-typed object compatible with the caller
+        ns               = SimpleNamespace()
+        ns.failed        = []
+        ns.passed        = []
+        ns.skipped       = []
+        ns.unknown       = []
+        ns.summary_counts = lambda: {
+            'total': 0, 'pass': 0 if issues else 1,
+            'fail': len(issues), 'unknown': 0, 'skip': 0,
+        }
+        ns.to_dict = lambda: {
+            'profile':  'baseline',
+            'target':   self.results.get('target', 'unknown'),
+            'standard': 'PCI DSS 3.2.1',
+            'status':   status,
+            'score':    score,
+            'issues':   issues,
+            'summary':  ns.summary_counts(),
+            'controls': [],
+        }
+        return ns
+
+    # ------------------------------------------------------------------
+    # Legacy shim — kept for backward compatibility with tests
+    # ------------------------------------------------------------------
+
     def check_pci_dss(self) -> Dict:
-        """Check PCI DSS compliance"""
+        """Legacy PCI DSS check (kept for backward compatibility).
+
+        New code should call :meth:`run_baseline` instead.
+        """
         print(Colors.header("[PHASE 3] COMPLIANCE ASSESSMENT"))
         print(Colors.info("Checking PCI DSS 3.2.1...\n"))
 
         issues = []
-
-        # Check for insecure protocols
         if any(p['port'] == 23 for p in self.results.get('open_ports', [])):
             issues.append("Telnet (insecure protocol) detected")
-
-        # Count only CONFIRMED critical findings to avoid false compliance failures
-        critical_confirmed = [v for v in self.results.get('vulnerabilities', [])
-                               if v.get('severity') == 'CRITICAL' and v.get('status') == 'CONFIRMED']
+        critical_confirmed = [
+            v for v in self.results.get('vulnerabilities', [])
+            if v.get('severity') == 'CRITICAL' and v.get('status') == 'CONFIRMED'
+        ]
         if critical_confirmed:
-            issues.append(f"{len(critical_confirmed)} confirmed critical vulnerabilities present")
-
+            issues.append(
+                f"{len(critical_confirmed)} confirmed critical vulnerabilities present"
+            )
         status = 'PASS' if not issues else 'FAIL'
-        score = max(0, 100 - (len(issues) * 15))
+        score  = max(0, 100 - len(issues) * 15)
 
         print(Colors.info(f"PCI DSS Status: {status}"))
         print(Colors.info(f"Compliance Score: {score}%"))
@@ -1132,9 +1231,9 @@ class ComplianceChecker:
 
         return {
             'standard': 'PCI DSS 3.2.1',
-            'status': status,
-            'score': score,
-            'issues': issues
+            'status':   status,
+            'score':    score,
+            'issues':   issues,
         }
 
 
@@ -1653,30 +1752,68 @@ class ReportGenerator:
 
         # --- Compliance section ---
         if compliance:
+            _comp_summary = compliance.get('summary', {})
+            _comp_status  = compliance.get('status', 'UNKNOWN')
+            _comp_profile = compliance.get('profile', 'baseline')
+            _comp_controls = compliance.get('controls', [])
+            _fail_count  = _comp_summary.get('fail', len(compliance.get('issues', [])))
+            _pass_count  = _comp_summary.get('pass', 0)
+            _skip_count  = _comp_summary.get('skip', 0)
+            _unk_count   = _comp_summary.get('unknown', 0)
+            _stat_colour = 'var(--accent-orange)' if _comp_status == 'FAIL' else 'var(--accent-green)'
+            _failed_controls = [c for c in _comp_controls if c.get('status') == 'FAIL']
+            _failed_rows = ''
+            for _fc in _failed_controls:
+                _sev = (_fc.get('severity') or 'MEDIUM').lower()
+                _ev_items = ''.join(
+                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                    for e in (_fc.get('evidence') or [])
+                )
+                _failed_rows += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_fc.get('control_id','')}</span>
+                        <span class="badge badge-{_sev}">{_fc.get('severity','MEDIUM')}</span>
+                    </div>
+                    <div style="font-weight:500;margin-bottom:6px;">{_fc.get('title','')}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:6px;">{_fc.get('description','')}</div>
+                    <ul style="padding-left:16px;">{_ev_items}</ul>
+                </div>'''
             html += f'''
         <div class="card">
             <div class="card-header">
-                <h3 class="card-title">✓ Compliance Status</h3>
+                <h3 class="card-title">🛡 Compliance Posture — Profile: {_comp_profile}</h3>
             </div>
             <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Standard</th>
-                            <th>Status</th>
-                            <th>Score</th>
-                            <th>Issues</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td><strong>{compliance.get('standard', 'N/A')}</strong></td>
-                            <td><span class="badge badge-{'critical' if compliance.get('status') == 'FAIL' else 'medium'}">{compliance.get('status', 'UNKNOWN')}</span></td>
-                            <td>{compliance.get('score', 0)}%</td>
-                            <td>{len(compliance.get('issues', []))}</td>
-                        </tr>
-                    </tbody>
-                </table>
+                <div style="display:flex;gap:24px;margin-bottom:20px;flex-wrap:wrap;">
+                    <div class="stat-card" style="flex:1;min-width:120px;">
+                        <div class="stat-label">Overall Status</div>
+                        <div class="stat-value" style="color:{_stat_colour};font-size:28px;">{_comp_status}</div>
+                    </div>
+                    <div class="stat-card" style="flex:1;min-width:100px;">
+                        <div class="stat-label">Pass</div>
+                        <div class="stat-value" style="color:var(--accent-green);font-size:28px;">{_pass_count}</div>
+                    </div>
+                    <div class="stat-card" style="flex:1;min-width:100px;">
+                        <div class="stat-label">Fail</div>
+                        <div class="stat-value" style="color:var(--accent-orange);font-size:28px;">{_fail_count}</div>
+                    </div>
+                    <div class="stat-card" style="flex:1;min-width:100px;">
+                        <div class="stat-label">Skip / Unknown</div>
+                        <div class="stat-value" style="color:var(--text-secondary);font-size:28px;">{_skip_count + _unk_count}</div>
+                    </div>
+                </div>
+'''
+            if _failed_controls:
+                html += '''
+                <div style="margin-top:12px;">
+                    <div style="font-weight:600;margin-bottom:10px;">Failed Controls</div>
+'''
+                html += _failed_rows
+                html += '</div>'
+            else:
+                html += '<div style="color:var(--accent-green);">All evaluated compliance controls passed.</div>'
+            html += '''
             </div>
         </div>
 '''
@@ -1734,7 +1871,7 @@ class ReportGenerator:
 
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v6.0 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v7.0 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -2034,8 +2171,13 @@ class HybridScanner:
 
         # [PHASE 3] Compliance
         if not getattr(args, 'skip_compliance', False):
-            compliance_checker = ComplianceChecker(self.results)
-            self.results['compliance'] = compliance_checker.check_pci_dss()
+            _compliance_profile = getattr(args, 'compliance_profile', 'baseline') or 'baseline'
+            compliance_checker = ComplianceChecker(
+                self.results,
+                profile=_compliance_profile,
+                has_credentials=credentialed_mode,
+            )
+            self.results['compliance'] = compliance_checker.run_baseline()
 
         # Finalise scan metadata
         if _HAS_PLUGINS:
@@ -2112,6 +2254,22 @@ class HybridScanner:
             print(Colors.info(f"Authenticated Scan: attempted — succeeded: {auth_status}"))
         else:
             print(Colors.info("Authenticated Scan: not attempted (no credentials provided)"))
+        _comp = self.results.get('compliance', {})
+        if _comp and not getattr(args, 'skip_compliance', False):
+            _comp_summary = _comp.get('summary', {})
+            _comp_status  = _comp.get('status', 'UNKNOWN')
+            _comp_profile = _comp.get('profile', 'baseline')
+            _fail_count   = _comp_summary.get('fail', 0)
+            _pass_count   = _comp_summary.get('pass', 0)
+            _skip_count   = _comp_summary.get('skip', 0) + _comp_summary.get('unknown', 0)
+            _comp_line = (
+                f"Compliance [{_comp_profile}]: {_comp_status} "
+                f"| pass={_pass_count} fail={_fail_count} skip/unknown={_skip_count}"
+            )
+            if _comp_status == 'FAIL':
+                print(Colors.warning(_comp_line))
+            else:
+                print(Colors.success(_comp_line))
         inv = self.results.get('inventory', {})
         if inv and not getattr(args, 'no_inventory', False):
             inv_assets = inv.get('asset_count', 0)
@@ -2124,7 +2282,7 @@ class HybridScanner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v6.0 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v7.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2135,6 +2293,13 @@ Examples:
   python vultron.py -t server.local --skip-nvd
   python vultron.py -t 10.0.0.50 --skip-compliance
   python vultron.py -t 192.168.1.100 --cve-lookback-days 30
+
+  # Compliance baseline checks (PR5):
+  python vultron.py -t 192.168.1.100                             # baseline profile (default)
+  python vultron.py -t 192.168.1.100 --compliance-profile server
+  python vultron.py -t 192.168.1.100 --compliance-profile workstation
+  python vultron.py -t 192.168.1.100 --compliance-only          # show compliance summary
+  python vultron.py -t 192.168.1.100 --skip-compliance          # skip compliance entirely
 
   # UDP scanning (authorized use only):
   python vultron.py -t 192.168.1.100 --protocol udp
@@ -2212,8 +2377,19 @@ Capabilities:
   TCP and UDP port discovery, service fingerprinting with version hints and
   confidence scores, and active vulnerability checks.
   SSL/TLS deep inspection with cert, cipher, and protocol posture analysis.
-  CVE enrichment via NVD API, CISA KEV detection, and compliance assessment (PCI DSS).
+  CVE enrichment via NVD API, CISA KEV detection, and compliance assessment.
+  Baseline compliance posture checks: TLS posture, service exposure,
+  authentication posture, OS lifecycle placeholder.
   Outputs structured HTML and JSON reports with evidence-based, protocol-aware findings.
+
+Compliance notes:
+  Compliance checks are non-invasive — they analyse data already collected by
+  the scan phases (TCP ports, TLS inspection, UDP scan results, auth probes).
+  No additional network traffic is generated.
+  Profiles: baseline, server, workstation (select with --compliance-profile).
+  OS-001 (OS patch posture) requires credentialed access and is marked SKIP
+  when credentials are not supplied.
+  Only use on systems you are authorised to test.
         """
     )
 
@@ -2304,6 +2480,31 @@ Capabilities:
         help='Path for standalone inventory JSON snapshot '
              '(e.g. inventory_192_168_1_1.json). '
              'The inventory is also embedded in the main JSON report when not disabled.',
+    )
+
+    # -- Compliance options (PR5) ---------------------------------------------
+    compliance_group = parser.add_argument_group(
+        'Compliance & configuration checks (PR5)',
+        'Baseline compliance posture checks.  Non-invasive; uses data already collected.',
+    )
+    compliance_group.add_argument(
+        '--compliance-profile',
+        choices=['baseline', 'server', 'workstation'],
+        default='baseline',
+        metavar='PROFILE',
+        help=(
+            'Compliance profile to evaluate: baseline (default), server, or workstation. '
+            'Controls within the selected profile are run against collected scan data.'
+        ),
+    )
+    compliance_group.add_argument(
+        '--compliance-only',
+        action='store_true',
+        help=(
+            'Output a compliance-only summary after the scan completes. '
+            'Full vulnerability and port tables are still written to reports; '
+            'this flag only affects the console summary.'
+        ),
     )
 
     # -- Credentialed scanning options (PR1) --------------------------------
