@@ -5170,6 +5170,863 @@ class TestCLIComplianceParsing(unittest.TestCase):
         self.assertTrue(args.compliance_only)
 
 
+# ---------------------------------------------------------------------------
+# 57. PR6 — ExposureSignal data model
+# ---------------------------------------------------------------------------
+
+class TestExposureSignalModel(unittest.TestCase):
+    """ExposureSignal dataclass serialises correctly."""
+
+    def _make_signal(self, **kwargs):
+        from plugins.exposure import ExposureSignal, SignalSeverity
+        defaults = dict(
+            signal_id="EXP-TEST-001",
+            title="Test signal",
+            description="A test exposure signal",
+            evidence=["evidence item 1"],
+            confidence=0.80,
+            severity=SignalSeverity.HIGH,
+            affected_asset="192.168.1.1",
+            affected_service="TestService",
+            signal_type="test",
+            heuristic=False,
+        )
+        defaults.update(kwargs)
+        return ExposureSignal(**defaults)
+
+    def test_to_dict_contains_required_keys(self):
+        sig = self._make_signal()
+        d = sig.to_dict()
+        for key in (
+            'signal_id', 'title', 'description', 'evidence',
+            'confidence', 'confidence_label', 'severity',
+            'affected_asset', 'affected_service', 'signal_type', 'heuristic',
+        ):
+            self.assertIn(key, d)
+
+    def test_severity_serialised_as_string(self):
+        sig = self._make_signal()
+        d = sig.to_dict()
+        self.assertIsInstance(d['severity'], str)
+        self.assertEqual(d['severity'], 'HIGH')
+
+    def test_confidence_label_high(self):
+        sig = self._make_signal(confidence=0.90)
+        self.assertEqual(sig.confidence_label, 'HIGH')
+
+    def test_confidence_label_medium(self):
+        sig = self._make_signal(confidence=0.55)
+        self.assertEqual(sig.confidence_label, 'MEDIUM')
+
+    def test_confidence_label_low(self):
+        sig = self._make_signal(confidence=0.30)
+        self.assertEqual(sig.confidence_label, 'LOW')
+
+    def test_heuristic_flag_preserved(self):
+        sig = self._make_signal(heuristic=True)
+        self.assertTrue(sig.to_dict()['heuristic'])
+
+    def test_evidence_is_list(self):
+        sig = self._make_signal(evidence=["a", "b"])
+        self.assertIsInstance(sig.to_dict()['evidence'], list)
+        self.assertEqual(sig.to_dict()['evidence'], ["a", "b"])
+
+
+# ---------------------------------------------------------------------------
+# 58. PR6 — ExposureReport aggregate helpers
+# ---------------------------------------------------------------------------
+
+class TestExposureReport(unittest.TestCase):
+    """ExposureReport aggregates signals correctly."""
+
+    def _make_report(self):
+        from plugins.exposure import ExposureReport, ExposureSignal, SignalSeverity
+        report = ExposureReport(target="10.0.0.1")
+        severities = [
+            SignalSeverity.CRITICAL,
+            SignalSeverity.HIGH,
+            SignalSeverity.HIGH,
+            SignalSeverity.MEDIUM,
+            SignalSeverity.LOW,
+        ]
+        for i, sev in enumerate(severities):
+            report.signals.append(ExposureSignal(
+                signal_id=f"EXP-X-{i:03d}",
+                title=f"Signal {i}",
+                description="",
+                confidence=0.80,
+                severity=sev,
+                affected_asset="10.0.0.1",
+            ))
+        return report
+
+    def test_signal_count(self):
+        report = self._make_report()
+        self.assertEqual(report.signal_count, 5)
+
+    def test_to_dict_contains_required_keys(self):
+        report = self._make_report()
+        d = report.to_dict()
+        for key in ('target', 'signal_count', 'summary', 'top_risks', 'signals'):
+            self.assertIn(key, d)
+
+    def test_summary_counts(self):
+        report = self._make_report()
+        summary = report.to_dict()['summary']
+        self.assertEqual(summary['critical'], 1)
+        self.assertEqual(summary['high'], 2)
+        self.assertEqual(summary['medium'], 1)
+        self.assertEqual(summary['low'], 1)
+
+    def test_top_risks_ordering(self):
+        """top_risks() must return highest-severity signals first."""
+        report = self._make_report()
+        top = report.top_risks(3)
+        self.assertEqual(top[0].severity.value, 'CRITICAL')
+        self.assertIn(top[1].severity.value, ('HIGH', 'CRITICAL'))
+
+    def test_top_risks_limit(self):
+        report = self._make_report()
+        self.assertLessEqual(len(report.top_risks(2)), 2)
+
+    def test_signals_list_in_dict(self):
+        report = self._make_report()
+        d = report.to_dict()
+        self.assertEqual(len(d['signals']), 5)
+        for sig_dict in d['signals']:
+            self.assertIn('signal_id', sig_dict)
+
+
+# ---------------------------------------------------------------------------
+# 59. PR6 — ExposureEngine: risky service detection
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineRiskyServices(unittest.TestCase):
+    """ExposureEngine generates risky-service signals for dangerous open ports."""
+
+    def _engine(self, tcp_ports, udp_ports=None):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': p, 'service': 'svc', 'state': 'open'} for p in tcp_ports],
+            'udp_ports': [{'port': p, 'service': 'svc', 'state': 'open'} for p in (udp_ports or [])],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_telnet_generates_signal(self):
+        engine = self._engine([23])
+        report = engine.run()
+        signal_types = [s.signal_type for s in report.signals]
+        self.assertIn('risky_service', signal_types)
+
+    def test_ftp_generates_signal(self):
+        engine = self._engine([21])
+        report = engine.run()
+        self.assertTrue(any('FTP' in s.affected_service for s in report.signals))
+
+    def test_rsh_generates_high_severity(self):
+        engine = self._engine([514])
+        report = engine.run()
+        risky = [s for s in report.signals if s.signal_type == 'risky_service']
+        self.assertTrue(len(risky) >= 1)
+        self.assertEqual(risky[0].severity.value, 'HIGH')
+
+    def test_no_risky_ports_no_signal(self):
+        engine = self._engine([80, 443])
+        report = engine.run()
+        risky = [s for s in report.signals if s.signal_type == 'risky_service']
+        self.assertEqual(risky, [])
+
+    def test_signal_confidence_above_threshold(self):
+        engine = self._engine([23])
+        report = engine.run()
+        risky = [s for s in report.signals if s.signal_type == 'risky_service']
+        self.assertGreater(risky[0].confidence, 0.5)
+
+    def test_signal_id_format(self):
+        engine = self._engine([23])
+        report = engine.run()
+        risky = [s for s in report.signals if s.signal_type == 'risky_service']
+        self.assertTrue(risky[0].signal_id.startswith('EXP-'))
+
+    def test_evidence_not_empty(self):
+        engine = self._engine([23])
+        report = engine.run()
+        risky = [s for s in report.signals if s.signal_type == 'risky_service']
+        self.assertTrue(len(risky[0].evidence) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# 60. PR6 — ExposureEngine: management exposure detection
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineManagementExposure(unittest.TestCase):
+    """ExposureEngine generates management-exposure signals for management ports."""
+
+    def _engine(self, ports):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.2',
+            'open_ports': [{'port': p, 'service': 'svc', 'state': 'open'} for p in ports],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_rdp_generates_signal(self):
+        engine = self._engine([3389])
+        report = engine.run()
+        mgmt = [s for s in report.signals if s.signal_type == 'management_exposure']
+        self.assertTrue(len(mgmt) >= 1)
+        self.assertIn('RDP', mgmt[0].title)
+
+    def test_winrm_http_severity_high(self):
+        engine = self._engine([5985])
+        report = engine.run()
+        mgmt = [s for s in report.signals if s.signal_type == 'management_exposure']
+        self.assertTrue(any(s.severity.value == 'HIGH' for s in mgmt))
+
+    def test_redis_port_generates_signal(self):
+        engine = self._engine([6379])
+        report = engine.run()
+        signals = [s for s in report.signals if 'Redis' in s.affected_service]
+        # Redis may be caught as management_exposure OR database_exposure
+        self.assertTrue(len(signals) >= 1)
+
+    def test_no_management_on_safe_ports(self):
+        engine = self._engine([80])
+        report = engine.run()
+        mgmt = [s for s in report.signals if s.signal_type == 'management_exposure']
+        self.assertEqual(mgmt, [])
+
+
+# ---------------------------------------------------------------------------
+# 61. PR6 — ExposureEngine: EOL version heuristics
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineEOLVersions(unittest.TestCase):
+    """ExposureEngine detects EOL software version hints from banner/version fields."""
+
+    def _engine(self, banners, aggressive=False):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.3',
+            'open_ports': [
+                {'port': 80, 'service': 'http', 'banner': b, 'version': '', 'state': 'open'}
+                for b in banners
+            ],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        return ExposureEngine(results, aggressive=aggressive)
+
+    def test_openssl_1_0_detected(self):
+        engine = self._engine(["OpenSSL/1.0.2k"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertTrue(len(eol) >= 1)
+        self.assertIn('OpenSSL', eol[0].title)
+
+    def test_apache_2_2_detected(self):
+        engine = self._engine(["Apache/2.2.34 (Unix)"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertTrue(len(eol) >= 1)
+
+    def test_php_5_detected(self):
+        engine = self._engine(["PHP/5.6.40"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertTrue(len(eol) >= 1)
+
+    def test_modern_version_not_flagged(self):
+        engine = self._engine(["Apache/2.4.51 (Unix) OpenSSL/3.0.1"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertEqual(eol, [])
+
+    def test_heuristic_flag_set_true(self):
+        engine = self._engine(["OpenSSL/1.0.2k"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertTrue(eol[0].heuristic)
+
+    def test_eol_confidence_below_0_9(self):
+        """EOL version signals must carry < 0.9 confidence (heuristic, not confirmed)."""
+        engine = self._engine(["OpenSSL/1.0.2k"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        self.assertLess(eol[0].confidence, 0.90)
+
+    def test_aggressive_mode_higher_confidence(self):
+        conservative = self._engine(["OpenSSL/1.0.2k"], aggressive=False).run()
+        aggressive   = self._engine(["OpenSSL/1.0.2k"], aggressive=True).run()
+        con_eol = [s for s in conservative.signals if s.signal_type == 'eol_version']
+        agg_eol = [s for s in aggressive.signals    if s.signal_type == 'eol_version']
+        if con_eol and agg_eol:
+            self.assertGreaterEqual(agg_eol[0].confidence, con_eol[0].confidence)
+
+    def test_evidence_contains_version_hint(self):
+        engine = self._engine(["OpenSSL/1.0.2k"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version']
+        evidence_text = ' '.join(eol[0].evidence)
+        self.assertIn('1.0.2k', evidence_text)
+
+    def test_duplicate_family_not_emitted_twice(self):
+        """Same EOL family banner appearing on multiple ports → only one signal."""
+        engine = self._engine(["OpenSSL/1.0.2k", "OpenSSL/1.0.2j"])
+        report = engine.run()
+        eol = [s for s in report.signals if s.signal_type == 'eol_version'
+               and 'OpenSSL 1.0.x' in s.title]
+        self.assertEqual(len(eol), 1)
+
+
+# ---------------------------------------------------------------------------
+# 62. PR6 — ExposureEngine: weak TLS signals
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineWeakTLS(unittest.TestCase):
+    """ExposureEngine generates weak-TLS signals from tls_scan data."""
+
+    def _engine_with_tls(self, tls_data, compliance=None):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.4',
+            'open_ports': [{'port': 443, 'service': 'https', 'state': 'open'}],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': compliance or {},
+            'tls_scan': tls_data,
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_legacy_tls_1_0_detected(self):
+        engine = self._engine_with_tls({
+            '443': {
+                'protocol_version': 'TLSv1',
+                'cipher_name': 'AES256-SHA',
+                'has_forward_secrecy': True,
+                'error': None,
+            }
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertTrue(len(weak) >= 1)
+        self.assertIn('deprecated', weak[0].description.lower())
+
+    def test_rc4_cipher_detected(self):
+        engine = self._engine_with_tls({
+            '443': {
+                'protocol_version': 'TLSv1.2',
+                'cipher_name': 'RC4-SHA',
+                'has_forward_secrecy': False,
+                'error': None,
+            }
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertTrue(any('RC4' in s.title for s in weak))
+
+    def test_no_forward_secrecy_signal(self):
+        engine = self._engine_with_tls({
+            '443': {
+                'protocol_version': 'TLSv1.2',
+                'cipher_name': 'AES256-SHA',
+                'has_forward_secrecy': False,
+                'error': None,
+            }
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertTrue(any('forward secrecy' in s.title.lower() for s in weak))
+
+    def test_tls_error_skipped(self):
+        engine = self._engine_with_tls({
+            '443': {'error': 'Connection refused', 'protocol_version': None}
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertEqual(weak, [])
+
+    def test_strong_tls_no_signal(self):
+        engine = self._engine_with_tls({
+            '443': {
+                'protocol_version': 'TLSv1.3',
+                'cipher_name': 'TLS_AES_256_GCM_SHA384',
+                'has_forward_secrecy': True,
+                'error': None,
+            }
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertEqual(weak, [])
+
+    def test_compliance_tls001_fail_generates_signal(self):
+        engine = self._engine_with_tls({}, compliance={
+            'controls': [{
+                'control_id': 'TLS-001',
+                'title': 'Deprecated TLS Protocol',
+                'description': 'TLS 1.0 in use',
+                'status': 'FAIL',
+                'evidence': ['TLSv1 negotiated on port 443'],
+            }]
+        })
+        report = engine.run()
+        weak = [s for s in report.signals if s.signal_type == 'weak_tls']
+        self.assertTrue(len(weak) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# 63. PR6 — ExposureEngine: certificate issue signals
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineCertIssues(unittest.TestCase):
+    """ExposureEngine generates cert-issue signals from compliance and tls_scan data."""
+
+    def _engine(self, compliance_controls=None, tls_scan=None):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.5',
+            'open_ports': [{'port': 443, 'service': 'https', 'state': 'open'}],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {'controls': compliance_controls or []},
+            'tls_scan': tls_scan or {},
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_tls_003_expired_cert_generates_critical(self):
+        engine = self._engine(compliance_controls=[{
+            'control_id': 'TLS-003',
+            'title': 'Certificate Already Expired',
+            'description': 'Certificate has expired.',
+            'status': 'FAIL',
+            'evidence': ['Expiry: 2020-01-01'],
+        }])
+        report = engine.run()
+        cert = [s for s in report.signals if s.signal_type == 'cert_issue']
+        self.assertTrue(len(cert) >= 1)
+        self.assertEqual(cert[0].severity.value, 'CRITICAL')
+
+    def test_tls_004_self_signed_generates_signal(self):
+        engine = self._engine(compliance_controls=[{
+            'control_id': 'TLS-004',
+            'title': 'Self-Signed Certificate',
+            'description': 'Certificate is self-signed.',
+            'status': 'FAIL',
+            'evidence': ['Issuer = Subject'],
+        }])
+        report = engine.run()
+        cert = [s for s in report.signals if s.signal_type == 'cert_issue']
+        self.assertTrue(len(cert) >= 1)
+
+    def test_passed_tls_controls_no_cert_signal(self):
+        engine = self._engine(compliance_controls=[{
+            'control_id': 'TLS-003',
+            'title': 'Certificate Already Expired',
+            'description': '',
+            'status': 'PASS',
+            'evidence': [],
+        }])
+        report = engine.run()
+        cert = [s for s in report.signals if s.signal_type == 'cert_issue']
+        self.assertEqual(cert, [])
+
+    def test_tls_scan_self_signed_generates_signal(self):
+        engine = self._engine(tls_scan={
+            '443': {
+                'cert_info': {
+                    'self_signed': True,
+                    'issuer_cn': 'localhost',
+                    'subject_cn': 'localhost',
+                },
+                'error': None,
+            }
+        })
+        report = engine.run()
+        cert = [s for s in report.signals if s.signal_type == 'cert_issue']
+        self.assertTrue(len(cert) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# 64. PR6 — ExposureEngine: SNMP and anonymous service signals
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineAnonSNMP(unittest.TestCase):
+    """ExposureEngine generates signals from compliance SVC-003/AUTH controls."""
+
+    def _engine(self, compliance_controls=None, vulns=None):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.6',
+            'open_ports': [{'port': 161, 'service': 'snmp', 'state': 'open'}],
+            'udp_ports': [],
+            'vulnerabilities': vulns or [],
+            'compliance': {'controls': compliance_controls or []},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_svc_003_fail_generates_snmp_signal(self):
+        engine = self._engine(compliance_controls=[{
+            'control_id': 'SVC-003',
+            'title': 'SNMP Default Community',
+            'description': 'SNMP community string accepted.',
+            'status': 'FAIL',
+            'evidence': ['Community "public" accepted'],
+        }])
+        report = engine.run()
+        snmp = [s for s in report.signals if s.affected_service == 'SNMP']
+        self.assertTrue(len(snmp) >= 1)
+
+    def test_auth_001_fail_generates_anon_signal(self):
+        engine = self._engine(compliance_controls=[{
+            'control_id': 'AUTH-001',
+            'title': 'Anonymous FTP Login Accepted',
+            'description': 'FTP allows anonymous login.',
+            'status': 'FAIL',
+            'evidence': ['230 Anonymous login accepted'],
+        }])
+        report = engine.run()
+        anon = [s for s in report.signals if s.signal_type == 'unauthenticated_service']
+        self.assertTrue(len(anon) >= 1)
+
+    def test_snmp_vuln_finding_generates_signal(self):
+        engine = self._engine(vulns=[{
+            'id': 'SNMP-COMMUNITY-161',
+            'name': 'SNMP Default Community String',
+            'title': 'SNMP default community string accepted on port 161',
+            'status': 'CONFIRMED',
+            'severity': 'HIGH',
+            'affected_service': 'SNMP',
+            'evidence': [],
+        }])
+        report = engine.run()
+        snmp = [s for s in report.signals if 'SNMP' in s.affected_service]
+        self.assertTrue(len(snmp) >= 1)
+
+    def test_anon_ftp_vuln_generates_signal(self):
+        engine = self._engine(vulns=[{
+            'id': 'FTP-ANON-21',
+            'name': 'FTP Anonymous Login Enabled',
+            'title': 'FTP anonymous login accepted on port 21',
+            'status': 'CONFIRMED',
+            'severity': 'HIGH',
+            'affected_service': 'FTP',
+            'evidence': [],
+        }])
+        report = engine.run()
+        anon = [s for s in report.signals if s.signal_type == 'unauthenticated_service']
+        self.assertTrue(len(anon) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# 65. PR6 — ExposureEngine: database exposure signals
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineDatabaseExposure(unittest.TestCase):
+    """ExposureEngine detects database services on default ports."""
+
+    def _engine(self, ports):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.7',
+            'open_ports': [{'port': p, 'service': 'db', 'state': 'open'} for p in ports],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        return ExposureEngine(results)
+
+    def test_mysql_port_generates_signal(self):
+        engine = self._engine([3306])
+        report = engine.run()
+        db = [s for s in report.signals if s.signal_type == 'database_exposure']
+        self.assertTrue(len(db) >= 1)
+
+    def test_mongodb_generates_critical(self):
+        engine = self._engine([27017])
+        report = engine.run()
+        db = [s for s in report.signals if s.signal_type == 'database_exposure'
+              and 'MongoDB' in s.affected_service]
+        self.assertTrue(len(db) >= 1)
+        self.assertEqual(db[0].severity.value, 'CRITICAL')
+
+    def test_redis_generates_critical(self):
+        engine = self._engine([6379])
+        report = engine.run()
+        # Redis is in both management and database tables; severity should be CRITICAL
+        sigs = [s for s in report.signals if 'Redis' in s.affected_service]
+        self.assertTrue(len(sigs) >= 1)
+        self.assertTrue(any(s.severity.value == 'CRITICAL' for s in sigs))
+
+    def test_no_db_on_safe_ports(self):
+        engine = self._engine([80, 443])
+        report = engine.run()
+        db = [s for s in report.signals if s.signal_type == 'database_exposure']
+        self.assertEqual(db, [])
+
+
+# ---------------------------------------------------------------------------
+# 66. PR6 — ExposureEngine: combined scenario
+# ---------------------------------------------------------------------------
+
+class TestExposureEngineCombined(unittest.TestCase):
+    """ExposureEngine generates multiple signal types from combined input data."""
+
+    def test_combined_scenario(self):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.10',
+            'open_ports': [
+                {'port': 23,   'service': 'telnet', 'banner': '', 'state': 'open'},
+                {'port': 3306, 'service': 'mysql',  'banner': '', 'state': 'open'},
+                {'port': 443,  'service': 'https',  'banner': 'Apache/2.2.34', 'state': 'open'},
+            ],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {
+                'controls': [
+                    {
+                        'control_id': 'TLS-001',
+                        'title': 'Deprecated TLS',
+                        'description': 'TLS 1.0 in use',
+                        'status': 'FAIL',
+                        'evidence': ['TLSv1 on port 443'],
+                    },
+                ]
+            },
+            'tls_scan': {
+                '443': {
+                    'protocol_version': 'TLSv1',
+                    'cipher_name': 'AES256-SHA',
+                    'has_forward_secrecy': False,
+                    'error': None,
+                }
+            },
+            'inventory': {},
+        }
+        engine = ExposureEngine(results)
+        report = engine.run()
+
+        signal_types = {s.signal_type for s in report.signals}
+        self.assertIn('risky_service',     signal_types)
+        self.assertIn('weak_tls',          signal_types)
+        self.assertIn('database_exposure', signal_types)
+        self.assertIn('eol_version',       signal_types)
+        self.assertGreater(report.signal_count, 3)
+
+    def test_empty_results_no_crash(self):
+        from plugins.exposure import ExposureEngine
+        results = {
+            'target': '10.0.0.11',
+            'open_ports': [],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        report = ExposureEngine(results).run()
+        self.assertEqual(report.signal_count, 0)
+
+
+# ---------------------------------------------------------------------------
+# 67. PR6 — Exposure section in JSON report
+# ---------------------------------------------------------------------------
+
+class TestExposureReportOutput(unittest.TestCase):
+    """JSON report includes a structured exposure section."""
+
+    def _scanner_with_exposure(self):
+        import types
+        from vultron import HybridScanner
+        from plugins.exposure import ExposureEngine
+
+        args = types.SimpleNamespace(
+            scan_mode='common',
+            protocol='tcp',
+            cve_lookback_days=120,
+            no_inventory=True,
+            inventory_output=None,
+            no_exposure=False,
+            exposure_aggressive=False,
+        )
+        scanner = HybridScanner.__new__(HybridScanner)
+        scanner.target = '10.0.0.20'
+        scanner.args = args
+        scanner.results = {
+            'target': '10.0.0.20',
+            'timestamp': '2026-01-01T00:00:00',
+            'scanner_version': '8.0.0',
+            'scan_mode': 'common',
+            'scan_protocol': 'tcp',
+            'cve_lookback_days': 120,
+            'open_ports': [
+                {'port': 23, 'service': 'telnet', 'state': 'open', 'protocol': 'tcp'},
+                {'port': 21, 'service': 'ftp',    'state': 'open', 'protocol': 'tcp'},
+            ],
+            'udp_ports': [],
+            'vulnerabilities': [],
+            'compliance': {},
+            'tls_scan': {},
+            'inventory': {},
+        }
+        engine = ExposureEngine(scanner.results)
+        scanner.results['exposure'] = engine.run().to_dict()
+        return scanner
+
+    def test_json_report_contains_exposure_key(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_exposure()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('exposure', data)
+        finally:
+            os.unlink(path)
+
+    def test_exposure_section_has_signals(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_exposure()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            exp = data['exposure']
+            self.assertIn('signals', exp)
+            self.assertGreater(len(exp['signals']), 0)
+        finally:
+            os.unlink(path)
+
+    def test_exposure_section_has_summary(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_exposure()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            summary = data['exposure']['summary']
+            for k in ('critical', 'high', 'medium', 'low', 'info'):
+                self.assertIn(k, summary)
+        finally:
+            os.unlink(path)
+
+    def test_exposure_signal_has_required_fields(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_exposure()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            for sig in data['exposure']['signals']:
+                for field in (
+                    'signal_id', 'title', 'description', 'evidence',
+                    'confidence', 'confidence_label', 'severity',
+                    'affected_asset', 'signal_type', 'heuristic',
+                ):
+                    self.assertIn(field, sig, f"Missing field {field!r} in signal {sig.get('signal_id')}")
+        finally:
+            os.unlink(path)
+
+    def test_html_report_contains_exposure_section(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_exposure()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('Exposure', html)
+            self.assertIn('Patch Risk', html)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 68. PR6 — CLI parsing for exposure options
+# ---------------------------------------------------------------------------
+
+class TestCLIExposureParsing(unittest.TestCase):
+    """CLI exposure flags are parsed correctly."""
+
+    def _parse(self, extra_args):
+        import sys
+        import argparse as ap
+        old_argv = sys.argv
+        sys.argv = ['vultron.py', '-t', '10.0.0.1'] + extra_args
+        try:
+            parser = ap.ArgumentParser()
+            parser.add_argument('-t', '--target', required=True)
+            parser.add_argument('--no-exposure', action='store_true')
+            parser.add_argument('--exposure-aggressive', action='store_true')
+            args, _ = parser.parse_known_args()
+            return args
+        finally:
+            sys.argv = old_argv
+
+    def test_no_exposure_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.no_exposure)
+
+    def test_no_exposure_flag_set(self):
+        args = self._parse(['--no-exposure'])
+        self.assertTrue(args.no_exposure)
+
+    def test_exposure_aggressive_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.exposure_aggressive)
+
+    def test_exposure_aggressive_flag_set(self):
+        args = self._parse(['--exposure-aggressive'])
+        self.assertTrue(args.exposure_aggressive)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

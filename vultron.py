@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦6.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦8.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 
@@ -17,10 +17,11 @@ Capabilities:
 - CVE enrichment via NVD API with configurable lookback window
 - CISA Known Exploited Vulnerabilities (KEV) detection
 - Compliance assessment (PCI DSS)
+- Exposure & patch-risk detection: heuristic, non-intrusive signals from scan data
 - HTML and JSON report generation
 
 Author: Azazi
-Version: 6.0.0
+Version: 8.0.0
 """
 
 import sys
@@ -83,6 +84,7 @@ try:
         ControlStatus,
         ALL_PROFILES,
     )
+    from plugins.exposure import ExposureEngine, ExposureReport
     _HAS_PLUGINS = True
 except ImportError:
     _HAS_PLUGINS = False
@@ -90,10 +92,10 @@ except ImportError:
 # Configuration
 NVD_API_KEY = "0cc77bb7-8bea-4758-ad90-b3ee02f8547b"  # Add your NVD API key here
 
-VERSION = "7.0.0"
+VERSION = "8.0.0"
 BANNER = f"""
 {'='*90}
-╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦7.0
+╦  ╦╦ ╦╦  ╔╦╗╦═╗╔═╗╔╗╔  ╦  ╦8.0
 ╚╗╔╝║ ║║   ║ ╠╦╝║ ║║║║  ╚╗╔╝
  ╚╝ ╚═╝╩═╝ ╩ ╩╚═╚═╝╝╚╝
 {'='*90}
@@ -1268,6 +1270,7 @@ class ReportGenerator:
         udp_ports = self.results.get('udp_ports', [])
         vulns = self.results.get('vulnerabilities', [])
         compliance = self.results.get('compliance', {})
+        exposure = self.results.get('exposure', {})
         scan_mode = self.results.get('scan_mode', 'common')
         scan_protocol = self.results.get('scan_protocol', 'tcp')
         cve_lookback_days = self.results.get('cve_lookback_days', 120)
@@ -1869,9 +1872,64 @@ class ReportGenerator:
         </div>
 '''
 
+        # Exposure & Patch Risk section
+        exp_signals = exposure.get('signals', [])
+        if exp_signals:
+            _exp_summary = exposure.get('summary', {})
+            _exp_total   = exposure.get('signal_count', len(exp_signals))
+            _exp_crit    = _exp_summary.get('critical', 0)
+            _exp_high    = _exp_summary.get('high', 0)
+            _exp_med     = _exp_summary.get('medium', 0)
+            _exp_low     = _exp_summary.get('low', 0)
+            _exp_status_colour = (
+                'var(--accent-orange)' if _exp_crit or _exp_high else 'var(--accent-yellow)'
+            )
+            _exp_rows = ''
+            for _sig in exp_signals:
+                _sev = (_sig.get('severity') or 'MEDIUM').lower()
+                _conf_label = _sig.get('confidence_label', 'MEDIUM')
+                _heur_badge = (
+                    '<span style="font-size:10px;padding:1px 5px;border-radius:3px;'
+                    'background:#30363d;color:#8b949e;margin-left:6px;">heuristic</span>'
+                    if _sig.get('heuristic') else ''
+                )
+                _ev_items = ''.join(
+                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
+                    for e in (_sig.get('evidence') or [])
+                )
+                _exp_rows += f'''
+                <div class="vuln-item">
+                    <div class="vuln-header">
+                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_sig.get('signal_id','')}</span>
+                        <span class="badge badge-{_sev}">{_sig.get('severity','MEDIUM')}</span>
+                        <span style="font-size:11px;color:var(--text-secondary);margin-left:8px;">confidence: {_conf_label}</span>
+                        {_heur_badge}
+                    </div>
+                    <div style="font-weight:500;margin-bottom:6px;">{_sig.get('title','')}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:6px;">{_sig.get('description','')}</div>
+                    <ul style="padding-left:16px;">{_ev_items}</ul>
+                </div>'''
+            html += f'''
+        <div class="section">
+            <div class="section-header">Exposure &amp; Patch Risk</div>
+            <div style="padding: 20px;">
+                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
+                    {_exp_total} exposure signal(s) detected ·
+                    <span style="color:{_exp_status_colour};">critical={_exp_crit}</span> ·
+                    high={_exp_high} · medium={_exp_med} · low={_exp_low}
+                </p>
+                <p style="margin-bottom:16px; color: var(--text-secondary); font-size:12px; font-style:italic;">
+                    Signals marked <em>heuristic</em> are derived from version string pattern
+                    matching and may not reflect the actual patch state.  Verify before acting.
+                </p>
+                {_exp_rows}
+            </div>
+        </div>
+'''
+
         html += f'''
         <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v7.0 - Security Assessment</div>
+            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v8.0 - Security Assessment</div>
             <div>Author: Azazi</div>
             <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
         </div>
@@ -1912,6 +1970,7 @@ class HybridScanner:
             'vulnerabilities': [],
             'nvd_intelligence': {},
             'compliance': {},
+            'exposure': {},
             'auth_scan': {},
             'tls_scan': {},
             'inventory': {},
@@ -2214,6 +2273,29 @@ class HybridScanner:
                     print(Colors.warning(f"  Inventory save failed: {_e}"))
             print()
 
+        # [PHASE 3c] Exposure & Patch-Risk Detection
+        _no_exposure = getattr(args, 'no_exposure', False)
+        if _HAS_PLUGINS and not _no_exposure:
+            print(Colors.header("[PHASE 3c] EXPOSURE & PATCH-RISK DETECTION"))
+            _aggressive_exposure = getattr(args, 'exposure_aggressive', False)
+            _exp_engine = ExposureEngine(self.results, aggressive=_aggressive_exposure)
+            _exp_report = _exp_engine.run()
+            self.results['exposure'] = _exp_report.to_dict()
+            _sig_count = _exp_report.signal_count
+            _sev_counts = _exp_report._count_by_severity()
+            print(Colors.info(
+                f"Exposure signals: {_sig_count} total | "
+                f"critical={_sev_counts.get('CRITICAL', 0)} "
+                f"high={_sev_counts.get('HIGH', 0)} "
+                f"medium={_sev_counts.get('MEDIUM', 0)}"
+            ))
+            for _sig in _exp_report.top_risks(3):
+                _heur = " [heuristic]" if _sig.heuristic else ""
+                print(Colors.warning(
+                    f"  [{_sig.severity.value}] {_sig.title}{_heur}"
+                ))
+            print()
+
         # [PHASE 4] Report Generation
         print(Colors.header("[PHASE 4] REPORT GENERATION"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2276,13 +2358,28 @@ class HybridScanner:
             print(Colors.info(f"Asset Inventory: {inv_assets} asset(s) recorded (included in JSON report)"))
             if _inventory_output:
                 print(Colors.success(f"Standalone inventory: {_inventory_output}"))
+        _exp = self.results.get('exposure', {})
+        if _exp and not getattr(args, 'no_exposure', False):
+            _exp_summary = _exp.get('summary', {})
+            _exp_total   = _exp.get('signal_count', 0)
+            _exp_crit    = _exp_summary.get('critical', 0)
+            _exp_high    = _exp_summary.get('high', 0)
+            _exp_med     = _exp_summary.get('medium', 0)
+            _exp_line = (
+                f"Exposure Signals: {_exp_total} total "
+                f"| critical={_exp_crit} high={_exp_high} medium={_exp_med}"
+            )
+            if _exp_crit or _exp_high:
+                print(Colors.warning(_exp_line))
+            else:
+                print(Colors.info(_exp_line))
         report_files = f"{html_file}, {json_file}"
         print(Colors.success(f"\nReports: {report_files}\n"))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vultron v7.0 - Defensive Vulnerability Assessment Tool',
+        description='Vultron v8.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -2300,6 +2397,11 @@ Examples:
   python vultron.py -t 192.168.1.100 --compliance-profile workstation
   python vultron.py -t 192.168.1.100 --compliance-only          # show compliance summary
   python vultron.py -t 192.168.1.100 --skip-compliance          # skip compliance entirely
+
+  # Exposure & patch-risk detection (PR6, enabled by default):
+  python vultron.py -t 192.168.1.100                        # exposure detection auto-runs
+  python vultron.py -t 192.168.1.100 --no-exposure          # disable exposure detection
+  python vultron.py -t 192.168.1.100 --exposure-aggressive  # include lower-confidence signals
 
   # UDP scanning (authorized use only):
   python vultron.py -t 192.168.1.100 --protocol udp
@@ -2390,6 +2492,23 @@ Compliance notes:
   OS-001 (OS patch posture) requires credentialed access and is marked SKIP
   when credentials are not supplied.
   Only use on systems you are authorised to test.
+
+Exposure & patch-risk detection notes:
+  The exposure engine is heuristic and non-intrusive — it derives signals
+  solely from data already collected by earlier scan phases.  No additional
+  network connections are made.
+  Signal types:
+    risky_service        — cleartext or legacy protocol on an open port
+    management_exposure  — management interface on default port
+    unauthenticated_service — SNMP/FTP anonymous or default-credential access
+    weak_tls             — deprecated protocol version or weak cipher suite
+    cert_issue           — expired, near-expiry, or self-signed certificate
+    eol_version          — service banner matches a known EOL version family
+    database_exposure    — database service on its default port
+  Heuristic signals (eol_version) are labelled "heuristic=true" in output
+  and carry lower confidence scores.  Always verify before acting on them.
+  Use --exposure-aggressive to include additional lower-confidence signals.
+  Use --no-exposure to disable the engine entirely.
         """
     )
 
@@ -2504,6 +2623,28 @@ Compliance notes:
             'Output a compliance-only summary after the scan completes. '
             'Full vulnerability and port tables are still written to reports; '
             'this flag only affects the console summary.'
+        ),
+    )
+
+    # -- Exposure & patch-risk detection options (PR6) ------------------------
+    exposure_group = parser.add_argument_group(
+        'Exposure & patch-risk detection (PR6)',
+        'Heuristic, non-intrusive exposure signals derived from collected scan data. '
+        'No additional network traffic is generated.  All version-based signals are '
+        'clearly labelled as heuristic.',
+    )
+    exposure_group.add_argument(
+        '--no-exposure',
+        action='store_true',
+        help='Disable exposure & patch-risk detection (enabled by default)',
+    )
+    exposure_group.add_argument(
+        '--exposure-aggressive',
+        action='store_true',
+        help=(
+            'Enable additional lower-confidence heuristic signals '
+            '(e.g. slightly older versions that may still receive back-ports). '
+            'Conservative mode is the default.'
         ),
     )
 
