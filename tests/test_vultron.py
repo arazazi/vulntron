@@ -6027,6 +6027,899 @@ class TestCLIExposureParsing(unittest.TestCase):
         self.assertTrue(args.exposure_aggressive)
 
 
+# ---------------------------------------------------------------------------
+# 69. P8 — Web scanner: URL canonicalization and deduplication
+# ---------------------------------------------------------------------------
+
+class TestWebScannerUrlCanonicalization(unittest.TestCase):
+    """canonicalize_url() and dedupe_urls() correctness."""
+
+    def setUp(self):
+        from plugins.web_scanner import canonicalize_url, dedupe_urls
+        self.canonicalize = canonicalize_url
+        self.dedupe = dedupe_urls
+
+    def test_plain_http_url(self):
+        self.assertEqual(self.canonicalize("http://example.com/path?q=1"), "http://example.com")
+
+    def test_https_url_with_path(self):
+        self.assertEqual(self.canonicalize("https://host.local/admin"), "https://host.local")
+
+    def test_non_default_port_preserved(self):
+        self.assertEqual(self.canonicalize("https://host:8443/"), "https://host:8443")
+
+    def test_default_http_port_stripped(self):
+        self.assertEqual(self.canonicalize("http://host:80/"), "http://host")
+
+    def test_default_https_port_stripped(self):
+        self.assertEqual(self.canonicalize("https://host:443/"), "https://host")
+
+    def test_no_scheme_defaults_http(self):
+        result = self.canonicalize("192.168.1.1")
+        self.assertEqual(result, "http://192.168.1.1")
+
+    def test_non_http_scheme_returns_none(self):
+        self.assertIsNone(self.canonicalize("ftp://host"))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(self.canonicalize(""))
+
+    def test_uppercase_scheme_normalised(self):
+        result = self.canonicalize("HTTP://HOST.LOCAL/")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.startswith("http://"))
+
+    def test_dedupe_removes_duplicate(self):
+        urls = ["http://host", "http://host/page", "http://host:80/"]
+        result = self.dedupe(urls)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], "http://host")
+
+    def test_dedupe_preserves_different_schemes(self):
+        urls = ["http://host", "https://host"]
+        result = self.dedupe(urls)
+        self.assertEqual(len(result), 2)
+
+    def test_dedupe_preserves_order(self):
+        urls = ["https://b.local", "https://a.local"]
+        result = self.dedupe(urls)
+        self.assertEqual(result[0], "https://b.local")
+
+    def test_dedupe_skips_invalid(self):
+        urls = ["ftp://host", "http://valid.local"]
+        result = self.dedupe(urls)
+        self.assertEqual(result, ["http://valid.local"])
+
+
+# ---------------------------------------------------------------------------
+# 70. P8 — Web scanner: header and cookie evaluation logic
+# ---------------------------------------------------------------------------
+
+class TestWebScannerHeaderEvaluation(unittest.TestCase):
+    """_check_security_headers() and _check_cookie_flags() logic."""
+
+    def _make_response(self, status=200, headers=None, cookies=None, text=""):
+        """Build a minimal mock response object."""
+        class MockResponse:
+            pass
+        resp = MockResponse()
+        resp.status_code = status
+        resp.headers = headers or {}
+        resp.cookies = cookies or []
+        resp.text = text
+        resp.url = "http://test.local/"
+        return resp
+
+    def test_missing_headers_generate_findings(self):
+        from unittest.mock import MagicMock, patch
+        from plugins.web_scanner import _check_security_headers
+
+        mock_resp = self._make_response(200, headers={})
+        session = MagicMock()
+        session.get.return_value = mock_resp
+
+        findings = _check_security_headers("http://test.local", session, timeout=5.0)
+        finding_ids = [f.finding_id for f in findings]
+        self.assertIn("WEB-HEADER-CSP", finding_ids)
+        self.assertIn("WEB-HEADER-HSTS", finding_ids)
+        self.assertIn("WEB-HEADER-XFO", finding_ids)
+        self.assertIn("WEB-HEADER-XCTO", finding_ids)
+
+    def test_present_headers_no_findings(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_security_headers
+
+        hdrs = {
+            "Content-Security-Policy": "default-src 'self'",
+            "Strict-Transport-Security": "max-age=31536000",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Permissions-Policy": "geolocation=()",
+        }
+        mock_resp = self._make_response(200, headers=hdrs)
+        session = MagicMock()
+        session.get.return_value = mock_resp
+
+        findings = _check_security_headers("https://secure.local", session, timeout=5.0)
+        header_findings = [f for f in findings if f.finding_id.startswith("WEB-HEADER-") and "WEAK" not in f.finding_id]
+        self.assertEqual(header_findings, [])
+
+    def test_weak_csp_generates_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_security_headers
+
+        hdrs = {
+            "Content-Security-Policy": "default-src * 'unsafe-inline' 'unsafe-eval'",
+            "Strict-Transport-Security": "max-age=31536000",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Permissions-Policy": "geolocation=()",
+        }
+        mock_resp = self._make_response(200, headers=hdrs)
+        session = MagicMock()
+        session.get.return_value = mock_resp
+
+        findings = _check_security_headers("https://weak.local", session, timeout=5.0)
+        weak_csp = [f for f in findings if f.finding_id == "WEB-HEADER-CSP-WEAK"]
+        self.assertTrue(len(weak_csp) >= 1)
+
+    def test_exception_returns_empty(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_security_headers
+
+        session = MagicMock()
+        session.get.side_effect = ConnectionError("refused")
+        findings = _check_security_headers("http://gone.local", session, timeout=1.0)
+        self.assertEqual(findings, [])
+
+    def test_http_to_https_redirect_missing_generates_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_http_to_https_redirect
+
+        mock_resp = self._make_response(200, headers={})
+        session = MagicMock()
+        session.get.return_value = mock_resp
+
+        findings = _check_http_to_https_redirect("http://noredirect.local", session, timeout=5.0)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].finding_id, "WEB-REDIRECT-NO-HTTPS")
+
+    def test_http_to_https_correct_redirect_no_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_http_to_https_redirect
+
+        mock_resp = self._make_response(301, headers={"Location": "https://secure.local/"})
+        session = MagicMock()
+        session.get.return_value = mock_resp
+
+        findings = _check_http_to_https_redirect("http://secure.local", session, timeout=5.0)
+        self.assertEqual(findings, [])
+
+    def test_https_target_skip_redirect_check(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_http_to_https_redirect
+
+        session = MagicMock()
+        findings = _check_http_to_https_redirect("https://secure.local", session, timeout=5.0)
+        self.assertEqual(findings, [])
+        session.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 71. P8 — Web scanner: CORS heuristic checks
+# ---------------------------------------------------------------------------
+
+class TestWebScannerCORSCheck(unittest.TestCase):
+    """_check_cors() heuristic logic."""
+
+    def _make_resp(self, acao="", acac=""):
+        class MockResp:
+            status_code = 200
+            headers = {"Access-Control-Allow-Origin": acao,
+                       "Access-Control-Allow-Credentials": acac}
+            cookies = []
+            text = ""
+        return MockResp()
+
+    def test_wildcard_with_credentials_generates_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_cors
+
+        session = MagicMock()
+        session.get.return_value = self._make_resp("*", "true")
+        findings = _check_cors("http://cors.local", session, 5.0)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].finding_id, "WEB-CORS-WILDCARD-CREDS")
+
+    def test_reflect_origin_generates_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_cors
+
+        session = MagicMock()
+        session.get.return_value = self._make_resp("https://evil.example.com", "")
+        findings = _check_cors("http://cors.local", session, 5.0)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].finding_id, "WEB-CORS-REFLECT-ORIGIN")
+
+    def test_safe_cors_no_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_cors
+
+        session = MagicMock()
+        session.get.return_value = self._make_resp("https://trusted.example.com", "")
+        findings = _check_cors("http://cors.local", session, 5.0)
+        self.assertEqual(findings, [])
+
+    def test_exception_returns_empty(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_cors
+
+        session = MagicMock()
+        session.get.side_effect = Exception("timeout")
+        findings = _check_cors("http://cors.local", session, 5.0)
+        self.assertEqual(findings, [])
+
+
+# ---------------------------------------------------------------------------
+# 72. P8 — Web scanner: directory listing detection
+# ---------------------------------------------------------------------------
+
+class TestWebScannerDirectoryListing(unittest.TestCase):
+    """_check_directory_listing() heuristic."""
+
+    def _make_resp(self, status, content_type="text/html", body=""):
+        class MockResp:
+            pass
+        r = MockResp()
+        r.status_code = status
+        r.headers = {"Content-Type": content_type}
+        r.text = body
+        return r
+
+    def test_autoindex_html_generates_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_directory_listing
+
+        body = "<html><title>Index of /</title><body>Index of /</body></html>"
+        session = MagicMock()
+        session.get.return_value = self._make_resp(200, "text/html", body)
+
+        findings = _check_directory_listing("http://dir.local", session, 5.0, max_paths=1)
+        self.assertTrue(len(findings) >= 1)
+        self.assertEqual(findings[0].finding_id, "WEB-DIRLIST")
+
+    def test_normal_page_no_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_directory_listing
+
+        body = "<html><body>Welcome</body></html>"
+        session = MagicMock()
+        session.get.return_value = self._make_resp(200, "text/html", body)
+
+        findings = _check_directory_listing("http://normal.local", session, 5.0, max_paths=1)
+        self.assertEqual(findings, [])
+
+    def test_non_200_status_skipped(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_directory_listing
+
+        session = MagicMock()
+        session.get.return_value = self._make_resp(404, "text/html", "")
+        findings = _check_directory_listing("http://notfound.local", session, 5.0, max_paths=1)
+        self.assertEqual(findings, [])
+
+
+# ---------------------------------------------------------------------------
+# 73. P8 — Web scanner: evidence redaction
+# ---------------------------------------------------------------------------
+
+class TestWebScannerRedaction(unittest.TestCase):
+    """Sensitive values are redacted in evidence."""
+
+    def test_set_cookie_header_redacted(self):
+        from plugins.web_scanner import _redact_header_value
+        result = _redact_header_value("set-cookie", "sessionid=abc123; HttpOnly; Secure")
+        from plugins.secrets import REDACTED
+        self.assertEqual(result, REDACTED)
+
+    def test_authorization_header_redacted(self):
+        from plugins.web_scanner import _redact_header_value
+        from plugins.secrets import REDACTED
+        result = _redact_header_value("authorization", "Bearer eyJhbGc....")
+        self.assertEqual(result, REDACTED)
+
+    def test_server_header_not_redacted(self):
+        from plugins.web_scanner import _redact_header_value
+        result = _redact_header_value("Server", "Apache/2.4.51")
+        self.assertEqual(result, "Apache/2.4.51")
+
+    def test_safe_headers_dict_redacts_cookie(self):
+        from plugins.web_scanner import _safe_headers_dict
+        from plugins.secrets import REDACTED
+        hdrs = {"Set-Cookie": "token=secret", "Content-Type": "text/html"}
+        result = _safe_headers_dict(hdrs)
+        self.assertEqual(result["Set-Cookie"], REDACTED)
+        self.assertEqual(result["Content-Type"], "text/html")
+
+    def test_basic_auth_evidence_redacts_realm(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_basic_auth
+        from plugins.secrets import REDACTED
+
+        class MockResp:
+            status_code = 401
+            headers = {"WWW-Authenticate": "Basic realm=\"Admin Area\""}
+            cookies = []
+
+        session = MagicMock()
+        session.get.return_value = MockResp()
+        findings = _check_basic_auth("http://auth.local", session, 5.0)
+        self.assertEqual(len(findings), 1)
+        # WWW-Authenticate value must be redacted in evidence
+        evidence_str = " ".join(findings[0].evidence)
+        self.assertNotIn("Admin Area", evidence_str)
+        self.assertIn(REDACTED, evidence_str)
+
+
+# ---------------------------------------------------------------------------
+# 74. P8 — Web scanner: robots/sitemap and server banner informational
+# ---------------------------------------------------------------------------
+
+class TestWebScannerInformationalChecks(unittest.TestCase):
+    """Informational checks (robots.txt, server banner)."""
+
+    def test_robots_txt_present(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_robots_sitemap
+
+        class MockResp:
+            status_code = 200
+            headers = {"Content-Type": "text/plain"}
+
+        session = MagicMock()
+        session.get.return_value = MockResp()
+
+        findings = _check_robots_sitemap("http://info.local", session, 5.0)
+        fids = [f.finding_id for f in findings]
+        self.assertIn("WEB-ROBOTS-INFO", fids)
+
+    def test_robots_txt_absent_no_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_robots_sitemap
+
+        class MockResp:
+            status_code = 404
+            headers = {}
+
+        session = MagicMock()
+        session.get.return_value = MockResp()
+
+        findings = _check_robots_sitemap("http://info.local", session, 5.0)
+        self.assertEqual(findings, [])
+
+    def test_server_banner_generates_info_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_server_banner
+
+        class MockResp:
+            status_code = 200
+            headers = {"Server": "Apache/2.4.51 (Unix)"}
+            cookies = []
+
+        session = MagicMock()
+        session.get.return_value = MockResp()
+
+        findings = _check_server_banner("http://banner.local", session, 5.0)
+        self.assertTrue(any(f.finding_id == "WEB-BANNER-INFO" for f in findings))
+        self.assertTrue(all(f.severity == "INFO" for f in findings))
+
+    def test_no_server_banner_no_finding(self):
+        from unittest.mock import MagicMock
+        from plugins.web_scanner import _check_server_banner
+
+        class MockResp:
+            status_code = 200
+            headers = {}
+            cookies = []
+
+        session = MagicMock()
+        session.get.return_value = MockResp()
+
+        findings = _check_server_banner("http://silent.local", session, 5.0)
+        self.assertEqual(findings, [])
+
+
+# ---------------------------------------------------------------------------
+# 75. P8 — Web scanner: WebPostureReport model and serialization
+# ---------------------------------------------------------------------------
+
+class TestWebPostureReport(unittest.TestCase):
+    """WebPostureReport data model and to_dict() correctness."""
+
+    def _make_report(self):
+        from plugins.web_scanner import WebPostureReport, WebTargetResult, WebFinding
+        f1 = WebFinding(
+            finding_id="WEB-HEADER-CSP",
+            title="Missing CSP",
+            description="desc",
+            severity="MEDIUM",
+            confidence=0.9,
+            target_url="http://t.local",
+        )
+        f2 = WebFinding(
+            finding_id="WEB-BANNER-INFO",
+            title="Server disclosed",
+            description="desc",
+            severity="INFO",
+            confidence=0.9,
+            target_url="http://t.local",
+        )
+        t = WebTargetResult(url="http://t.local", findings=[f1, f2])
+        report = WebPostureReport(targets=[t])
+        return report
+
+    def test_total_findings(self):
+        report = self._make_report()
+        self.assertEqual(report.total_findings, 2)
+
+    def test_summary_counts(self):
+        report = self._make_report()
+        s = report.summary
+        self.assertEqual(s['medium'], 1)
+        self.assertEqual(s['info'], 1)
+        self.assertEqual(s['high'], 0)
+
+    def test_to_dict_required_keys(self):
+        report = self._make_report()
+        d = report.to_dict()
+        for key in ('targets', 'target_count', 'total_findings', 'summary'):
+            self.assertIn(key, d)
+
+    def test_finding_to_dict_required_keys(self):
+        from plugins.web_scanner import WebFinding
+        f = WebFinding(
+            finding_id="WEB-TEST",
+            title="T",
+            description="D",
+            severity="LOW",
+            confidence=0.6,
+            target_url="http://x.local",
+            evidence=["ev1"],
+            remediation="fix it",
+        )
+        d = f.to_dict()
+        for key in (
+            'finding_id', 'title', 'description', 'severity',
+            'confidence', 'confidence_label', 'target_url', 'evidence', 'remediation',
+        ):
+            self.assertIn(key, d)
+
+    def test_confidence_label_high(self):
+        from plugins.web_scanner import WebFinding
+        f = WebFinding("ID", "T", "D", "HIGH", 0.9, "http://x.local")
+        self.assertEqual(f.to_dict()['confidence_label'], 'HIGH')
+
+    def test_confidence_label_medium(self):
+        from plugins.web_scanner import WebFinding
+        f = WebFinding("ID", "T", "D", "MEDIUM", 0.6, "http://x.local")
+        self.assertEqual(f.to_dict()['confidence_label'], 'MEDIUM')
+
+    def test_confidence_label_low(self):
+        from plugins.web_scanner import WebFinding
+        f = WebFinding("ID", "T", "D", "LOW", 0.3, "http://x.local")
+        self.assertEqual(f.to_dict()['confidence_label'], 'LOW')
+
+
+# ---------------------------------------------------------------------------
+# 76. P8 — Web scanner: target discovery from scan results
+# ---------------------------------------------------------------------------
+
+class TestWebScannerTargetDiscovery(unittest.TestCase):
+    """_build_targets_from_scan() discovers correct HTTP/HTTPS URLs."""
+
+    def test_http_port_80_discovered(self):
+        from plugins.web_scanner import _build_targets_from_scan
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 80, 'state': 'open', 'service': 'HTTP',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        urls = _build_targets_from_scan(results)
+        self.assertTrue(any('http://' in u and '10.0.0.1' in u for u in urls))
+
+    def test_https_port_443_discovered(self):
+        from plugins.web_scanner import _build_targets_from_scan
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 443, 'state': 'open', 'service': 'HTTPS',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        urls = _build_targets_from_scan(results)
+        self.assertTrue(any('https://' in u and '10.0.0.1' in u for u in urls))
+
+    def test_non_web_port_excluded(self):
+        from plugins.web_scanner import _build_targets_from_scan
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 22, 'state': 'open', 'service': 'SSH',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        urls = _build_targets_from_scan(results)
+        self.assertEqual(urls, [])
+
+    def test_alt_http_port_8080_discovered(self):
+        from plugins.web_scanner import _build_targets_from_scan
+        results = {
+            'target': '192.168.1.1',
+            'open_ports': [{'port': 8080, 'state': 'open', 'service': 'HTTP-Alt',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        urls = _build_targets_from_scan(results)
+        self.assertTrue(any('http://' in u and '8080' in u for u in urls))
+
+    def test_empty_ports_returns_empty(self):
+        from plugins.web_scanner import _build_targets_from_scan
+        results = {'target': '10.0.0.1', 'open_ports': []}
+        urls = _build_targets_from_scan(results)
+        self.assertEqual(urls, [])
+
+
+# ---------------------------------------------------------------------------
+# 77. P8 — Web scanner: WebScanner class target collection
+# ---------------------------------------------------------------------------
+
+class TestWebScannerCollectTargets(unittest.TestCase):
+    """WebScanner._collect_targets() scope enforcement."""
+
+    def _make_scanner(self, results, extra_urls=None, allow_non_inventory=False):
+        from plugins.web_scanner import WebScanner
+        return WebScanner(
+            scan_results=results,
+            extra_urls=extra_urls or [],
+            allow_non_inventory=allow_non_inventory,
+        )
+
+    def test_inventory_urls_included(self):
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 80, 'service': 'HTTP', 'state': 'open',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        scanner = self._make_scanner(results)
+        targets = scanner._collect_targets()
+        self.assertTrue(len(targets) >= 1)
+
+    def test_extra_url_same_host_included_by_default(self):
+        results = {'target': '10.0.0.1', 'open_ports': []}
+        scanner = self._make_scanner(results, extra_urls=['http://10.0.0.1:8080'])
+        targets = scanner._collect_targets()
+        self.assertEqual(len(targets), 1)
+
+    def test_extra_url_different_host_excluded_by_default(self):
+        results = {'target': '10.0.0.1', 'open_ports': []}
+        scanner = self._make_scanner(results, extra_urls=['http://192.168.99.99'])
+        targets = scanner._collect_targets()
+        self.assertEqual(targets, [])
+
+    def test_extra_url_different_host_allowed_when_flag_set(self):
+        results = {'target': '10.0.0.1', 'open_ports': []}
+        scanner = self._make_scanner(
+            results,
+            extra_urls=['http://192.168.99.99'],
+            allow_non_inventory=True,
+        )
+        targets = scanner._collect_targets()
+        self.assertEqual(len(targets), 1)
+
+    def test_no_duplicates(self):
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 80, 'service': 'HTTP', 'state': 'open',
+                            'banner': '', 'protocol': 'tcp'}],
+        }
+        scanner = self._make_scanner(
+            results,
+            extra_urls=['http://10.0.0.1', 'http://10.0.0.1:80/page'],
+            allow_non_inventory=False,
+        )
+        targets = scanner._collect_targets()
+        self.assertEqual(len(targets), 1)
+
+
+# ---------------------------------------------------------------------------
+# 78. P8 — Web scanner: load_urls_file helper
+# ---------------------------------------------------------------------------
+
+class TestLoadUrlsFile(unittest.TestCase):
+    """load_urls_file() reads and filters correctly."""
+
+    def test_reads_urls(self):
+        import tempfile, os
+        from plugins.web_scanner import load_urls_file
+        content = "https://a.local\nhttp://b.local\n"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(content)
+            path = f.name
+        try:
+            urls = load_urls_file(path)
+            self.assertEqual(urls, ["https://a.local", "http://b.local"])
+        finally:
+            os.unlink(path)
+
+    def test_ignores_comments(self):
+        import tempfile, os
+        from plugins.web_scanner import load_urls_file
+        content = "# comment\nhttps://valid.local\n# another comment\n"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(content)
+            path = f.name
+        try:
+            urls = load_urls_file(path)
+            self.assertEqual(urls, ["https://valid.local"])
+        finally:
+            os.unlink(path)
+
+    def test_missing_file_returns_empty(self):
+        from plugins.web_scanner import load_urls_file
+        urls = load_urls_file("/nonexistent/file.txt")
+        self.assertEqual(urls, [])
+
+    def test_blank_lines_ignored(self):
+        import tempfile, os
+        from plugins.web_scanner import load_urls_file
+        content = "\nhttps://x.local\n\n"
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(content)
+            path = f.name
+        try:
+            urls = load_urls_file(path)
+            self.assertEqual(urls, ["https://x.local"])
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 79. P8 — Web scanner: CLI parsing
+# ---------------------------------------------------------------------------
+
+class TestCLIWebScanParsing(unittest.TestCase):
+    """Web scan CLI flags are parsed correctly."""
+
+    def _parse(self, extra_args):
+        import sys
+        import argparse as ap
+        old_argv = sys.argv
+        sys.argv = ['vultron.py', '-t', '10.0.0.1'] + extra_args
+        try:
+            parser = ap.ArgumentParser()
+            parser.add_argument('-t', '--target', required=True)
+            parser.add_argument('--web-scan', action='store_true')
+            parser.add_argument('--url', metavar='URL')
+            parser.add_argument('--urls-file', metavar='FILE')
+            parser.add_argument('--web-concurrency', type=int, default=5)
+            parser.add_argument('--web-timeout', type=float, default=10.0)
+            parser.add_argument('--web-max-paths', type=int, default=3)
+            parser.add_argument('--web-user-agent', metavar='UA')
+            parser.add_argument('--web-allow-non-inventory-targets', action='store_true')
+            parser.add_argument('--web-auth-profile', metavar='PROFILE')
+            args, _ = parser.parse_known_args()
+            return args
+        finally:
+            sys.argv = old_argv
+
+    def test_web_scan_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.web_scan)
+
+    def test_web_scan_flag_enabled(self):
+        args = self._parse(['--web-scan'])
+        self.assertTrue(args.web_scan)
+
+    def test_url_parsed(self):
+        args = self._parse(['--url', 'https://target.local'])
+        self.assertEqual(args.url, 'https://target.local')
+
+    def test_urls_file_parsed(self):
+        args = self._parse(['--urls-file', '/tmp/urls.txt'])
+        self.assertEqual(args.urls_file, '/tmp/urls.txt')
+
+    def test_web_concurrency_default(self):
+        args = self._parse([])
+        self.assertEqual(args.web_concurrency, 5)
+
+    def test_web_concurrency_custom(self):
+        args = self._parse(['--web-concurrency', '10'])
+        self.assertEqual(args.web_concurrency, 10)
+
+    def test_web_timeout_default(self):
+        args = self._parse([])
+        self.assertAlmostEqual(args.web_timeout, 10.0)
+
+    def test_web_timeout_custom(self):
+        args = self._parse(['--web-timeout', '30'])
+        self.assertAlmostEqual(args.web_timeout, 30.0)
+
+    def test_web_max_paths_default(self):
+        args = self._parse([])
+        self.assertEqual(args.web_max_paths, 3)
+
+    def test_web_user_agent_custom(self):
+        args = self._parse(['--web-user-agent', 'MyScanner/1.0'])
+        self.assertEqual(args.web_user_agent, 'MyScanner/1.0')
+
+    def test_allow_non_inventory_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.web_allow_non_inventory_targets)
+
+    def test_allow_non_inventory_flag_set(self):
+        args = self._parse(['--web-allow-non-inventory-targets'])
+        self.assertTrue(args.web_allow_non_inventory_targets)
+
+    def test_web_auth_profile_parsed(self):
+        args = self._parse(['--web-auth-profile', 'prod'])
+        self.assertEqual(args.web_auth_profile, 'prod')
+
+
+# ---------------------------------------------------------------------------
+# 80. P8 — Web scanner: JSON report serialization includes web_posture key
+# ---------------------------------------------------------------------------
+
+class TestWebPostureReportSerialization(unittest.TestCase):
+    """JSON report always contains the web_posture key."""
+
+    def _scanner_with_web_posture(self):
+        """Return a minimal HybridScanner-like object with web_posture data."""
+        import sys
+        import types
+        sys.path.insert(0, '/home/runner/work/vulntron/vulntron')
+        from vultron import HybridScanner
+
+        args = types.SimpleNamespace(
+            scan_mode='common',
+            cve_lookback_days=120,
+            protocol='tcp',
+        )
+        scanner = HybridScanner('127.0.0.1', args)
+        # Inject a minimal web_posture result
+        scanner.results['web_posture'] = {
+            'targets': [
+                {
+                    'url': 'http://127.0.0.1',
+                    'findings': [
+                        {
+                            'finding_id': 'WEB-HEADER-CSP',
+                            'title': 'Missing CSP',
+                            'description': 'No CSP header',
+                            'severity': 'MEDIUM',
+                            'confidence': 0.9,
+                            'confidence_label': 'HIGH',
+                            'target_url': 'http://127.0.0.1',
+                            'evidence': ['HTTP 200 from http://127.0.0.1/'],
+                            'remediation': 'Add CSP header',
+                        }
+                    ],
+                    'finding_count': 1,
+                    'error': None,
+                }
+            ],
+            'target_count': 1,
+            'total_findings': 1,
+            'summary': {'critical': 0, 'high': 0, 'medium': 1, 'low': 0, 'info': 0},
+        }
+        return scanner
+
+    def test_json_report_contains_web_posture_key(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_web_posture()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('web_posture', data)
+        finally:
+            os.unlink(path)
+
+    def test_json_web_posture_has_required_keys(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_web_posture()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            wp = data['web_posture']
+            for key in ('targets', 'target_count', 'total_findings', 'summary'):
+                self.assertIn(key, wp)
+        finally:
+            os.unlink(path)
+
+    def test_json_web_posture_summary_has_severity_keys(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_web_posture()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            summary = data['web_posture']['summary']
+            for k in ('critical', 'high', 'medium', 'low', 'info'):
+                self.assertIn(k, summary)
+        finally:
+            os.unlink(path)
+
+    def test_html_report_contains_web_posture_section(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_web_posture()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('Web Application Posture', html)
+        finally:
+            os.unlink(path)
+
+    def test_html_report_web_posture_shows_finding(self):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_web_posture()
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('WEB-HEADER-CSP', html)
+        finally:
+            os.unlink(path)
+
+    def test_empty_web_posture_no_section_rendered(self):
+        import tempfile
+        import os
+        import types
+        from vultron import HybridScanner, ReportGenerator
+
+        args = types.SimpleNamespace(
+            scan_mode='common', cve_lookback_days=120, protocol='tcp',
+        )
+        scanner = HybridScanner('127.0.0.1', args)
+        # web_posture is empty dict by default
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                html = fh.read()
+            # Section should not appear when there are no web targets
+            self.assertNotIn('Web Application Posture', html)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
