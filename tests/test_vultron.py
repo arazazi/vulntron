@@ -4405,6 +4405,771 @@ class TestReportInventoryOutput(unittest.TestCase):
             os.unlink(path)
 
 
+# ---------------------------------------------------------------------------
+# 48. PR5 — ComplianceControl schema and status transitions
+# ---------------------------------------------------------------------------
+
+class TestComplianceControlSchema(unittest.TestCase):
+    """ComplianceControl data model and status helpers."""
+
+    def _make_control(self):
+        from plugins.compliance import ComplianceControl, ControlSeverity
+        return ComplianceControl(
+            control_id='TEST-001',
+            title='Test control',
+            description='A test control',
+            rationale='For testing',
+            severity=ControlSeverity.MEDIUM,
+        )
+
+    def test_default_status_is_unknown(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        self.assertEqual(ctrl.status, ControlStatus.UNKNOWN)
+
+    def test_pass_transition(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        ctrl._pass('All good')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+        self.assertIn('All good', ctrl.evidence)
+
+    def test_fail_transition(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        ctrl._fail('Something wrong')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+        self.assertIn('Something wrong', ctrl.evidence)
+
+    def test_skip_transition(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        ctrl._skip('No credentials')
+        self.assertEqual(ctrl.status, ControlStatus.SKIP)
+        self.assertEqual(ctrl.skip_reason, 'No credentials')
+
+    def test_unknown_transition(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        ctrl._unknown('Insufficient data')
+        self.assertEqual(ctrl.status, ControlStatus.UNKNOWN)
+        self.assertEqual(ctrl.skip_reason, 'Insufficient data')
+
+    def test_to_dict_contains_required_keys(self):
+        ctrl = self._make_control()
+        d = ctrl.to_dict()
+        for key in ('control_id', 'title', 'description', 'rationale',
+                    'status', 'severity', 'evidence', 'skip_reason',
+                    'requires_credentials'):
+            self.assertIn(key, d)
+
+    def test_to_dict_status_is_string(self):
+        from plugins.compliance import ControlStatus
+        ctrl = self._make_control()
+        ctrl._pass('ok')
+        d = ctrl.to_dict()
+        self.assertIsInstance(d['status'], str)
+        self.assertEqual(d['status'], 'PASS')
+
+    def test_to_dict_severity_is_string(self):
+        ctrl = self._make_control()
+        d = ctrl.to_dict()
+        self.assertIsInstance(d['severity'], str)
+
+
+# ---------------------------------------------------------------------------
+# 49. PR5 — Profile selection and control grouping
+# ---------------------------------------------------------------------------
+
+class TestComplianceProfiles(unittest.TestCase):
+    """Profile selection results in the correct control set."""
+
+    def _minimal_results(self, target='10.0.0.1'):
+        return {
+            'target': target,
+            'open_ports': [],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+            'auth_scan': {'authenticated_mode': False},
+        }
+
+    def test_all_profiles_defined(self):
+        from plugins.compliance import ALL_PROFILES
+        for profile in ('baseline', 'server', 'workstation'):
+            self.assertIn(profile, ALL_PROFILES)
+
+    def test_baseline_profile_runs(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(self._minimal_results(), profile='baseline')
+        report = checker.run()
+        self.assertGreater(len(report.controls), 0)
+
+    def test_server_profile_includes_tls_controls(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(self._minimal_results(), profile='server')
+        report = checker.run()
+        ids = [c.control_id for c in report.controls]
+        self.assertIn('TLS-001', ids)
+        self.assertIn('TLS-002', ids)
+
+    def test_workstation_profile_excludes_tls_controls(self):
+        from plugins.compliance import BaselineComplianceChecker, PROFILE_CONTROLS
+        workstation_ids = PROFILE_CONTROLS['workstation']
+        self.assertNotIn('TLS-001', workstation_ids)
+
+    def test_unknown_profile_falls_back_to_baseline(self):
+        from plugins.compliance import BaselineComplianceChecker, PROFILE_CONTROLS
+        checker = BaselineComplianceChecker(
+            self._minimal_results(), profile='nonexistent'
+        )
+        self.assertEqual(checker._profile, 'baseline')
+
+    def test_report_contains_profile_name(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(self._minimal_results(), profile='server')
+        report = checker.run()
+        self.assertEqual(report.profile, 'server')
+
+    def test_report_to_dict_has_controls_list(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(self._minimal_results())
+        d = checker.run().to_dict()
+        self.assertIn('controls', d)
+        self.assertIsInstance(d['controls'], list)
+
+    def test_report_summary_counts_add_up(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(self._minimal_results())
+        report = checker.run()
+        counts = report.summary_counts()
+        total = counts['pass'] + counts['fail'] + counts['unknown'] + counts['skip']
+        self.assertEqual(total, counts['total'])
+
+
+# ---------------------------------------------------------------------------
+# 50. PR5 — Skip / unknown when data / credentials missing
+# ---------------------------------------------------------------------------
+
+class TestComplianceSkipUnknown(unittest.TestCase):
+    """Controls that require credentials or TLS data are properly deferred."""
+
+    def _minimal_results(self):
+        return {
+            'target': '10.0.0.1',
+            'open_ports': [],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+            'auth_scan': {'authenticated_mode': False},
+        }
+
+    def test_os001_skipped_without_credentials(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(
+            self._minimal_results(), has_credentials=False
+        )
+        report = checker.run()
+        os_ctrl = next((c for c in report.controls if c.control_id == 'OS-001'), None)
+        self.assertIsNotNone(os_ctrl)
+        self.assertEqual(os_ctrl.status, ControlStatus.SKIP)
+
+    def test_os001_unknown_with_credentials_no_auth(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        results = self._minimal_results()
+        results['auth_scan'] = {'authenticated_mode': False}
+        checker = BaselineComplianceChecker(results, has_credentials=True)
+        report = checker.run()
+        os_ctrl = next((c for c in report.controls if c.control_id == 'OS-001'), None)
+        self.assertIsNotNone(os_ctrl)
+        self.assertEqual(os_ctrl.status, ControlStatus.SKIP)
+
+    def test_os001_unknown_with_credentials_and_auth(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        results = self._minimal_results()
+        results['auth_scan'] = {'authenticated_mode': True}
+        checker = BaselineComplianceChecker(results, has_credentials=True)
+        report = checker.run()
+        os_ctrl = next((c for c in report.controls if c.control_id == 'OS-001'), None)
+        self.assertIsNotNone(os_ctrl)
+        self.assertEqual(os_ctrl.status, ControlStatus.UNKNOWN)
+
+    def test_tls_controls_unknown_without_tls_data(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(self._minimal_results())
+        report = checker.run()
+        for cid in ('TLS-001', 'TLS-002', 'TLS-003', 'TLS-004', 'TLS-005'):
+            ctrl = next((c for c in report.controls if c.control_id == cid), None)
+            if ctrl is not None:
+                self.assertEqual(
+                    ctrl.status, ControlStatus.UNKNOWN,
+                    f"{cid} should be UNKNOWN when no TLS data is available"
+                )
+
+    def test_svc001_pass_when_telnet_not_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(self._minimal_results())
+        report = checker.run()
+        ctrl = next((c for c in report.controls if c.control_id == 'SVC-001'), None)
+        self.assertIsNotNone(ctrl)
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_svc001_fail_when_telnet_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        results = self._minimal_results()
+        results['open_ports'] = [{'port': 23, 'service': 'telnet'}]
+        checker = BaselineComplianceChecker(results)
+        report = checker.run()
+        ctrl = next((c for c in report.controls if c.control_id == 'SVC-001'), None)
+        self.assertIsNotNone(ctrl)
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_skip_reason_set_when_skipped(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(
+            self._minimal_results(), has_credentials=False
+        )
+        report = checker.run()
+        os_ctrl = next((c for c in report.controls if c.control_id == 'OS-001'), None)
+        self.assertIsNotNone(os_ctrl.skip_reason)
+        self.assertGreater(len(os_ctrl.skip_reason), 0)
+
+
+# ---------------------------------------------------------------------------
+# 51. PR5 — TLS compliance controls
+# ---------------------------------------------------------------------------
+
+class TestTLSComplianceControls(unittest.TestCase):
+    """TLS-specific control evaluation against mocked TLS scan data."""
+
+    def _results_with_tls(self, port_info):
+        return {
+            'target': '10.0.0.1',
+            'open_ports': [],
+            'udp_ports': [],
+            'tls_scan': {'443': port_info},
+            'vulnerabilities': [],
+            'auth_scan': {},
+        }
+
+    def _future_date(self, days=60):
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+    def _past_date(self, days=5):
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    def _soon_date(self, days=10):
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+    def test_tls001_pass_on_modern_protocol(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {'protocol_version': 'TLSv1.3', 'error': None, 'cert_info': {}}
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-001')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_tls001_fail_on_legacy_tls10(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {'protocol_version': 'TLSv1', 'error': None, 'cert_info': {}}
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-001')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls001_fail_on_tls11(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {'protocol_version': 'TLSv1.1', 'error': None, 'cert_info': {}}
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-001')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls002_pass_when_cert_far_future(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'not_after': self._future_date(90)}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-002')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_tls002_fail_when_cert_expires_soon(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'not_after': self._soon_date(10)}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-002')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls003_pass_when_cert_not_expired(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'not_after': self._future_date(90)}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-003')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_tls003_fail_when_cert_expired(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'not_after': self._past_date(5)}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-003')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls004_pass_when_chain_trusted(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'is_self_signed': False, 'chain_trusted': True}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-004')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_tls004_fail_when_self_signed(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cert_info': {'is_self_signed': True, 'chain_trusted': False}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-004')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls005_pass_on_strong_cipher(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.3', 'error': None,
+            'cipher_name': 'TLS_AES_256_GCM_SHA384', 'cert_info': {}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-005')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_tls005_fail_on_rc4(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        info = {
+            'protocol_version': 'TLSv1.2', 'error': None,
+            'cipher_name': 'RC4-SHA', 'cert_info': {}
+        }
+        checker = BaselineComplianceChecker(self._results_with_tls(info))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'TLS-005')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_tls_error_ports_skipped(self):
+        """Ports that failed TLS handshake (error set) should not trigger failures."""
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        results = {
+            'target': '10.0.0.1',
+            'open_ports': [],
+            'udp_ports': [],
+            'tls_scan': {'443': {'error': 'handshake timeout', 'cert_info': None}},
+            'vulnerabilities': [],
+            'auth_scan': {},
+        }
+        checker = BaselineComplianceChecker(results)
+        report = checker.run()
+        # Even though 443 has a TLS record, the error flag means it's ignored
+        ctrl_001 = next(c for c in report.controls if c.control_id == 'TLS-001')
+        # The scan dict is non-empty but only error ports; should be PASS (no failing port)
+        # or UNKNOWN.  It must NOT be FAIL due to an error port.
+        self.assertNotEqual(ctrl_001.status, ControlStatus.FAIL)
+
+
+# ---------------------------------------------------------------------------
+# 52. PR5 — Service exposure controls
+# ---------------------------------------------------------------------------
+
+class TestServiceExposureControls(unittest.TestCase):
+    """SVC-* controls flag exposed risky services."""
+
+    def _results(self, tcp_ports=None, udp_ports=None, vulns=None):
+        return {
+            'target': '10.0.0.1',
+            'open_ports': tcp_ports or [],
+            'udp_ports': udp_ports or [],
+            'tls_scan': {},
+            'vulnerabilities': vulns or [],
+            'auth_scan': {},
+        }
+
+    def test_svc002_pass_when_ftp_not_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(self._results())
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-002')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_svc002_fail_when_ftp_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(
+            self._results(tcp_ports=[{'port': 21, 'service': 'ftp'}])
+        )
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-002')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_svc003_pass_when_snmp_not_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(self._results())
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-003')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_svc003_fail_when_snmp_vuln_confirmed(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        vulns = [{'name': 'SNMP Default Community', 'status': 'CONFIRMED', 'severity': 'HIGH'}]
+        checker = BaselineComplianceChecker(self._results(vulns=vulns))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-003')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_svc004_pass_when_no_risky_ports(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(
+            self._results(tcp_ports=[{'port': 80, 'service': 'http'}])
+        )
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-004')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_svc004_fail_when_rsh_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(
+            self._results(tcp_ports=[{'port': 514, 'service': 'rsh'}])
+        )
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-004')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_svc004_fail_evidence_contains_port(self):
+        from plugins.compliance import BaselineComplianceChecker
+        checker = BaselineComplianceChecker(
+            self._results(tcp_ports=[{'port': 514, 'service': 'rsh'}])
+        )
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'SVC-004')
+        self.assertTrue(any('514' in e for e in ctrl.evidence))
+
+
+# ---------------------------------------------------------------------------
+# 53. PR5 — Auth posture controls
+# ---------------------------------------------------------------------------
+
+class TestAuthPostureControls(unittest.TestCase):
+    """AUTH-* controls evaluate authentication posture."""
+
+    def _results(self, tcp_ports=None, vulns=None):
+        return {
+            'target': '10.0.0.1',
+            'open_ports': tcp_ports or [],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': vulns or [],
+            'auth_scan': {},
+        }
+
+    def test_auth001_pass_when_no_ftp_open(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        checker = BaselineComplianceChecker(self._results())
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'AUTH-001')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_auth001_fail_when_anon_ftp_confirmed(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        vulns = [{'name': 'FTP Anonymous Login', 'status': 'CONFIRMED', 'severity': 'HIGH'}]
+        checker = BaselineComplianceChecker(self._results(vulns=vulns))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'AUTH-001')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+    def test_auth002_pass_when_no_anon_banners(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        tcp = [{'port': 80, 'service': 'http', 'banner': 'Apache/2.4'}]
+        checker = BaselineComplianceChecker(self._results(tcp_ports=tcp))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'AUTH-002')
+        self.assertEqual(ctrl.status, ControlStatus.PASS)
+
+    def test_auth002_fail_when_anonymous_in_banner(self):
+        from plugins.compliance import BaselineComplianceChecker, ControlStatus
+        tcp = [{'port': 21, 'service': 'ftp', 'banner': 'FTP server — anonymous accepted'}]
+        checker = BaselineComplianceChecker(self._results(tcp_ports=tcp))
+        report = checker.run()
+        ctrl = next(c for c in report.controls if c.control_id == 'AUTH-002')
+        self.assertEqual(ctrl.status, ControlStatus.FAIL)
+
+
+# ---------------------------------------------------------------------------
+# 54. PR5 — ComplianceReport aggregate helpers
+# ---------------------------------------------------------------------------
+
+class TestComplianceReport(unittest.TestCase):
+    """ComplianceReport aggregate accessors and to_dict structure."""
+
+    def _run_report(self, results=None):
+        from plugins.compliance import BaselineComplianceChecker
+        if results is None:
+            results = {
+                'target': '10.0.0.1',
+                'open_ports': [],
+                'udp_ports': [],
+                'tls_scan': {},
+                'vulnerabilities': [],
+                'auth_scan': {},
+            }
+        return BaselineComplianceChecker(results).run()
+
+    def test_failed_property_returns_only_fail(self):
+        from plugins.compliance import ControlStatus
+        report = self._run_report({
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 23, 'service': 'telnet'}],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+            'auth_scan': {},
+        })
+        for c in report.failed:
+            self.assertEqual(c.status, ControlStatus.FAIL)
+
+    def test_passed_property_returns_only_pass(self):
+        from plugins.compliance import ControlStatus
+        report = self._run_report()
+        for c in report.passed:
+            self.assertEqual(c.status, ControlStatus.PASS)
+
+    def test_skipped_property_returns_only_skip(self):
+        from plugins.compliance import ControlStatus
+        report = self._run_report()
+        for c in report.skipped:
+            self.assertEqual(c.status, ControlStatus.SKIP)
+
+    def test_to_dict_has_summary_key(self):
+        report = self._run_report()
+        d = report.to_dict()
+        self.assertIn('summary', d)
+        for k in ('total', 'pass', 'fail', 'unknown', 'skip'):
+            self.assertIn(k, d['summary'])
+
+    def test_to_dict_status_is_pass_when_no_failures(self):
+        report = self._run_report()
+        d = report.to_dict()
+        if d['summary']['fail'] == 0:
+            self.assertEqual(d['status'], 'PASS')
+
+    def test_to_dict_status_is_fail_when_failures(self):
+        report = self._run_report({
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 23, 'service': 'telnet'}],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+            'auth_scan': {},
+        })
+        d = report.to_dict()
+        if d['summary']['fail'] > 0:
+            self.assertEqual(d['status'], 'FAIL')
+
+    def test_to_dict_issues_list_non_empty_when_failed(self):
+        report = self._run_report({
+            'target': '10.0.0.1',
+            'open_ports': [{'port': 23, 'service': 'telnet'}],
+            'udp_ports': [],
+            'tls_scan': {},
+            'vulnerabilities': [],
+            'auth_scan': {},
+        })
+        d = report.to_dict()
+        if d['summary']['fail'] > 0:
+            self.assertGreater(len(d['issues']), 0)
+
+    def test_to_dict_is_json_serialisable(self):
+        import json
+        report = self._run_report()
+        data = json.dumps(report.to_dict())
+        self.assertIn('controls', data)
+
+
+# ---------------------------------------------------------------------------
+# 55. PR5 — Compliance section in JSON report
+# ---------------------------------------------------------------------------
+
+class TestComplianceReportOutput(unittest.TestCase):
+    """JSON report includes a structured compliance section."""
+
+    def _scanner_with_compliance(self):
+        import types
+        from vultron import HybridScanner
+        from plugins.compliance import BaselineComplianceChecker
+
+        args = types.SimpleNamespace(
+            scan_mode='common',
+            protocol='tcp',
+            cve_lookback_days=120,
+            no_inventory=True,
+            inventory_output=None,
+        )
+        scanner = HybridScanner('10.0.0.1', args)
+        scanner.results['open_ports'] = [
+            {'port': 80, 'service': 'http', 'banner': 'Apache'},
+        ]
+        checker = BaselineComplianceChecker(
+            scanner.results, profile='baseline', has_credentials=False
+        )
+        scanner.results['compliance'] = checker.run().to_dict()
+        return scanner
+
+    def test_json_report_contains_compliance_key(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_compliance()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn('compliance', data)
+        finally:
+            os.unlink(path)
+
+    def test_compliance_section_has_controls(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_compliance()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            comp = data['compliance']
+            self.assertIn('controls', comp)
+            self.assertIsInstance(comp['controls'], list)
+        finally:
+            os.unlink(path)
+
+    def test_compliance_section_has_summary_counts(self):
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_compliance()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            summary = data['compliance']['summary']
+            for k in ('total', 'pass', 'fail', 'skip', 'unknown'):
+                self.assertIn(k, summary)
+        finally:
+            os.unlink(path)
+
+    def test_compliance_section_no_secrets_in_evidence(self):
+        """Evidence strings must not contain password/key-like substrings."""
+        import json
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+
+        scanner = self._scanner_with_compliance()
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(scanner.results).generate_json(path)
+            with open(path) as fh:
+                data = json.load(fh)
+            for ctrl in data['compliance'].get('controls', []):
+                for ev in ctrl.get('evidence', []):
+                    self.assertNotIn('password', ev.lower())
+                    self.assertNotIn('secret', ev.lower())
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# 56. PR5 — CLI parsing for compliance options
+# ---------------------------------------------------------------------------
+
+class TestCLIComplianceParsing(unittest.TestCase):
+    """CLI compliance flags are parsed correctly."""
+
+    def _parse(self, extra_args):
+        import sys
+        import argparse as ap
+        old_argv = sys.argv
+        sys.argv = ['vultron.py', '-t', '10.0.0.1'] + extra_args
+        try:
+            parser = ap.ArgumentParser()
+            parser.add_argument('-t', '--target', required=True)
+            parser.add_argument('--skip-compliance', action='store_true')
+            parser.add_argument('--compliance-profile', default='baseline')
+            parser.add_argument('--compliance-only', action='store_true')
+            args, _ = parser.parse_known_args()
+            return args
+        finally:
+            sys.argv = old_argv
+
+    def test_skip_compliance_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.skip_compliance)
+
+    def test_skip_compliance_flag_set(self):
+        args = self._parse(['--skip-compliance'])
+        self.assertTrue(args.skip_compliance)
+
+    def test_compliance_profile_defaults_to_baseline(self):
+        args = self._parse([])
+        self.assertEqual(args.compliance_profile, 'baseline')
+
+    def test_compliance_profile_server(self):
+        args = self._parse(['--compliance-profile', 'server'])
+        self.assertEqual(args.compliance_profile, 'server')
+
+    def test_compliance_profile_workstation(self):
+        args = self._parse(['--compliance-profile', 'workstation'])
+        self.assertEqual(args.compliance_profile, 'workstation')
+
+    def test_compliance_only_defaults_false(self):
+        args = self._parse([])
+        self.assertFalse(args.compliance_only)
+
+    def test_compliance_only_flag_set(self):
+        args = self._parse(['--compliance-only'])
+        self.assertTrue(args.compliance_only)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

@@ -9,13 +9,13 @@
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.0-success.svg)]()
+[![Version](https://img.shields.io/badge/version-7.0.0-success.svg)]()
 
 </div>
 
 ---
 
-**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
+**Vulntron** is a defensive vulnerability assessment and reporting tool designed for use in authorized environments. It performs TCP and UDP port discovery, service fingerprinting with version hints and confidence scores, **SSL/TLS deep inspection**, **asset inventory with host profiling**, **baseline compliance & configuration posture checks**, targeted vulnerability checks with evidence, compliance assessment, CVE enrichment via the NVD API, and generates both HTML and JSON reports.
 
 > **⚠️ Authorized use only.** Vulntron must only be run against systems you own or have explicit written permission to scan. See the [Safety, Ethics, and Authorization](#-safety-ethics-and-authorization) section.
 
@@ -30,17 +30,18 @@
 5. [UDP Scanning](#-udp-scanning)
 6. [TLS Deep Inspection](#-tls-deep-inspection)
 7. [Asset Inventory and Host Profiling](#-asset-inventory-and-host-profiling)
-8. [Installation](#-installation)
-9. [Quick Start](#-quick-start)
-10. [CLI Reference](#-cli-reference)
-11. [Understanding Results](#-understanding-results)
-12. [Report Formats](#-report-formats)
-13. [Examples](#-examples)
-14. [Troubleshooting](#-troubleshooting)
-15. [Development](#-development)
-16. [Known Limitations](#-known-limitations)
-17. [Roadmap](#-roadmap)
-18. [License](#-license)
+8. [Compliance & Configuration Baseline](#-compliance--configuration-baseline)
+9. [Installation](#-installation)
+10. [Quick Start](#-quick-start)
+11. [CLI Reference](#-cli-reference)
+12. [Understanding Results](#-understanding-results)
+13. [Report Formats](#-report-formats)
+14. [Examples](#-examples)
+15. [Troubleshooting](#-troubleshooting)
+16. [Development](#-development)
+17. [Known Limitations](#-known-limitations)
+18. [Roadmap](#-roadmap)
+19. [License](#-license)
 
 ---
 
@@ -87,9 +88,26 @@ Vulntron runs active, evidence-based checks against detected services:
 
 Each finding is assigned a status of **CONFIRMED**, **POTENTIAL**, or **INCONCLUSIVE** based on the quality of evidence collected.
 
-### 📋 Compliance Assessment
+### 📋 Compliance & Configuration Baseline
 
-Vulntron optionally evaluates findings against **PCI DSS 3.2.1** requirements and produces a pass/fail score with a list of failing controls.
+Vulntron v7.0 introduces a **baseline compliance posture module** that evaluates the collected scan data against a set of non-invasive configuration controls.  Checks are grouped into named profiles (`baseline`, `server`, `workstation`) and produce per-control pass/fail/unknown/skip results with evidence.
+
+Controls currently implemented:
+
+| Control | Category | Description |
+|---------|----------|-------------|
+| TLS-001 | TLS | Deprecated TLS protocol (TLS 1.0 / 1.1) |
+| TLS-002 | TLS | Certificate expiry within 30 days |
+| TLS-003 | TLS | Expired certificate |
+| TLS-004 | TLS | Self-signed / untrusted certificate chain |
+| TLS-005 | TLS | Weak / deprecated cipher suite |
+| SVC-001 | Services | Telnet (port 23) exposed |
+| SVC-002 | Services | FTP (port 21) exposed |
+| SVC-003 | Services | SNMP default community string accepted |
+| SVC-004 | Services | High-risk legacy service port exposed |
+| AUTH-001 | Auth | Anonymous FTP login accepted |
+| AUTH-002 | Auth | Anonymous-access hint in banner |
+| OS-001 | OS | OS patch posture (placeholder — credentialed only) |
 
 ### 📦 Asset Inventory and Host Profiling
 
@@ -852,8 +870,97 @@ When inventory data is present, the HTML report includes a dedicated **Asset Inv
 
 - **Single-host scope**: Each scan run targets one host and produces one asset record.  Multi-host aggregation across runs is planned for a future phase.
 - **Discovery/posture oriented**: The inventory is designed for authorized discovery and posture assessment, not production asset management.
-- **No compliance engine in this release**: Compliance/patch workflows are planned for later phases.
 - **Stable fingerprint**: The `asset_id` is deterministic — repeated scans of the same host produce the same ID, enabling future diffing.
+
+---
+
+## 🛡 Compliance & Configuration Baseline
+
+> **PR5 feature** — available in Vulntron v7.0.0+.
+
+Vulntron v7.0 adds a **baseline compliance posture module** (`plugins/compliance.py`) that evaluates data collected by the scan phases against a curated set of safe, non-invasive configuration controls.  No additional network traffic is generated — all checks operate on data already gathered.
+
+### Compliance Profiles
+
+Controls are grouped into named profiles selectable via `--compliance-profile`:
+
+| Profile | Intended Use | TLS Controls | Service Controls | Auth Controls | OS Controls |
+|---------|-------------|:---:|:---:|:---:|:---:|
+| `baseline` *(default)* | General assessment | ✅ | ✅ | ✅ | ✅ |
+| `server` | Server-class targets | ✅ | ✅ | ✅ | ✅ |
+| `workstation` | Workstation-class targets | ❌ | ✅ | ✅ | ✅ |
+
+### Control Status Values
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | Control evaluated and requirement is met |
+| `FAIL` | Control evaluated and a problem was found (with evidence) |
+| `UNKNOWN` | Insufficient data to determine compliance (e.g., no TLS data) |
+| `SKIP` | Control explicitly skipped (e.g., credentials required but not provided) |
+
+### Credential-Aware Controls
+
+Controls that require authenticated access declare `requires_credentials: true`.  When credentials are absent or authentication did not succeed, these controls are automatically skipped with a clear reason:
+
+| Control | Requires Credentials | Behaviour Without Creds |
+|---------|---------------------|------------------------|
+| OS-001  | Yes (placeholder) | Marked `SKIP` |
+
+### Quick Start — Compliance
+
+Run with the default `baseline` profile (compliance runs automatically alongside every scan):
+
+```bash
+python3 vultron.py -t 192.168.1.100
+```
+
+**Select a specific profile:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --compliance-profile server
+python3 vultron.py -t 192.168.1.100 --compliance-profile workstation
+```
+
+**Show compliance-only console summary:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --compliance-only
+```
+
+**Disable compliance entirely:**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --skip-compliance
+```
+
+**With credentialed access (enables OS-001):**
+
+```bash
+python3 vultron.py -t 192.168.1.100 --ssh-user scanuser --ssh-key /path/to/id_rsa --compliance-profile server
+```
+
+### Compliance Output
+
+The compliance section is embedded in both the JSON report (under the `compliance` key) and rendered as a card in the HTML report with summary counts and detailed failed-control cards.
+
+Console summary example:
+
+```
+[PHASE 3] COMPLIANCE ASSESSMENT
+[*] Running compliance profile: baseline
+
+[!] Compliance status: FAIL | pass=8 fail=2 skip/unknown=2
+[!]   FAIL [HIGH] SVC-001: Telnet Service Exposed
+[!]   FAIL [MEDIUM] SVC-002: FTP Service Exposed
+```
+
+### Limitations and Authorized Use
+
+- Controls are **non-offensive** and **read-only** — they analyse already-collected data only.
+- No full CIS or NIST framework mapping is included in this release.
+- OS-001 is a placeholder; actual OS patch evaluation will require credentialed OS-level data in a future release.
+- Only use Vulntron on systems you own or are explicitly authorized to assess.
 
 ---
 
@@ -1014,6 +1121,14 @@ python3 vultron.py -t <target> [options]
 | `--no-inventory` | flag | `False` | Disable asset inventory generation (inventory is built by default) |
 | `--inventory-output` | path | — | Save a standalone inventory JSON snapshot to this path (also embedded in main JSON report) |
 
+### Compliance Options (PR5)
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--skip-compliance` | flag | `False` | Skip all compliance checks |
+| `--compliance-profile` | choice | `baseline` | Profile to run: `baseline`, `server`, or `workstation` |
+| `--compliance-only` | flag | `False` | Print a compliance-only console summary after the scan |
+
 ### Credentialed Scanning Options (authorized use only)
 
 | Flag | Type | Default | Description |
@@ -1142,11 +1257,30 @@ The JSON report is written alongside the HTML report. Its top-level structure:
 
 ```json
 {
-  "standard": "PCI DSS 3.2.1",
+  "profile": "baseline",
+  "target": "192.168.1.100",
+  "timestamp": "2026-04-11T10:00:00+00:00",
   "status": "FAIL",
-  "score": 85,
-  "issues": [
-    "Critical unpatched vulnerability detected (CVE-2017-0144)"
+  "issues": ["SVC-001: Telnet Service Exposed"],
+  "summary": {
+    "total": 12,
+    "pass": 9,
+    "fail": 1,
+    "unknown": 2,
+    "skip": 0
+  },
+  "controls": [
+    {
+      "control_id": "SVC-001",
+      "title": "Telnet Service Exposed",
+      "description": "Port 23/TCP (Telnet) is open...",
+      "rationale": "Telnet provides no confidentiality...",
+      "status": "FAIL",
+      "severity": "HIGH",
+      "evidence": ["Port 23/TCP (Telnet) is open and accessible"],
+      "skip_reason": null,
+      "requires_credentials": false
+    }
   ]
 }
 ```
@@ -1158,7 +1292,7 @@ The HTML report is a self-contained file (no external dependencies) with the fol
 1. **Executive summary** — Target, scan time, open port count, and confirmed vulnerability counts by severity.
 2. **Open ports table** — Port, protocol, service name, and banner.
 3. **Vulnerability findings** — One card per finding with status badge, severity, evidence list, CVSS score (where available), CISA KEV indicator, and remediation advice.
-4. **Compliance results** — PCI DSS 3.2.1 pass/fail, score, and issue list.
+4. **Compliance posture** — Profile name, pass/fail/skip/unknown summary counts, and detailed failed-control cards with evidence.
 5. **NVD enrichment summary** — Query date and number of CVEs retrieved.
 
 ---
@@ -1325,7 +1459,7 @@ python3 -c "import ast; ast.parse(open('vultron.py').read())"
 - [x] **PR2: UDP scanner + service fingerprinting expansion** — protocol-aware probes (DNS/NTP/SNMP), state classification, service fingerprinting
 - [x] **PR3: SSL/TLS deep inspection module** — cert analysis, cipher/protocol posture, legacy version detection, hostname mismatch
 - [x] **PR4: Asset inventory + host profiling** — normalised asset records, deterministic fingerprint, host role/risk/exposure inference, JSON persistence
-- [ ] PR5: Compliance engine (CIS/NIST/ISO policy packs)
+- [x] **PR5: Compliance & configuration baseline** — baseline posture controls (TLS, service exposure, auth), profile selection, credential-aware skip/unknown, HTML/JSON report integration
 - [ ] PR6: Patch detection (OS/package mapping via credentialed checks)
 - [ ] PR7: Web application scanner (safe, non-exploit checks)
 - [ ] PR8: Database security audits (read-only checks)
