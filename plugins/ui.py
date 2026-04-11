@@ -252,25 +252,56 @@ def create_app(data_dir: str) -> "FastAPI":
     # Helper to look up a run by id
     # -----------------------------------------------------------------------
 
-    def _get_run_path(run_id: str) -> str:
-        """Return full path for *run_id* or raise 404."""
-        # Sanitise: only alphanumeric, dash, underscore, dot allowed
-        if not re.match(r'^[\w.\-]+$', run_id):
+    def _get_run_path(run_id: str) -> Path:
+        """Return a validated, resolved :class:`~pathlib.Path` for *run_id*.
+
+        Sanitises *run_id* defensively:
+
+        1. Strips any path components with :func:`os.path.basename`.
+        2. Rejects IDs that are not purely alphanumeric / dash / underscore /
+           single dots (i.e., rejects ``..``, absolute paths, etc.).
+        3. Resolves the candidate path and checks it is contained within
+           *_data_dir* using :meth:`~pathlib.Path.relative_to`.
+        4. Verifies the file exists.
+
+        Raises 400 on sanitisation / traversal failure, 404 if not found.
+        """
+        # 1. Strip any path-separator components
+        safe_id = os.path.basename(run_id)
+        # 2. Allow only safe characters; reject ".." and leading dot
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$', safe_id) or '..' in safe_id:
             raise HTTPException(status_code=400, detail="Invalid run_id")
-        # Prevent path traversal
-        candidate = (Path(_data_dir) / (run_id + ".json")).resolve()
-        if not str(candidate).startswith(_data_dir):
+        # 3. Resolve and check containment
+        candidate = (Path(_data_dir) / (safe_id + ".json")).resolve()
+        try:
+            candidate.relative_to(Path(_data_dir).resolve())
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid run_id (path traversal)")
-        if not candidate.exists():
+        # 4. Existence check
+        if not candidate.is_file():
             raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-        return str(candidate)
+        return candidate
 
     def _load_or_404(run_id: str) -> Dict[str, Any]:
-        path = _get_run_path(run_id)
+        """Load and validate a run by *run_id*.
+
+        Uses the pre-validated :class:`~pathlib.Path` from :func:`_get_run_path`
+        to open the file, so no user-provided string reaches a file system call.
+        """
+        safe_path: Path = _get_run_path(run_id)
         try:
-            return load_run(path)
+            with safe_path.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Failed to parse JSON from run file: {exc}",
+            ) from exc
+        try:
+            validate_run(data)
         except RunLoadError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return data
 
     # -----------------------------------------------------------------------
     # API routes
