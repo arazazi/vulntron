@@ -26,6 +26,7 @@ Version: 8.0.0
 
 import sys
 import os
+import html as _html
 import socket
 import argparse
 import json
@@ -1261,22 +1262,34 @@ class ReportGenerator:
             'kev_confirmed':      sum(1 for v in vulns if v.get('cisa_kev') and v.get('status') == 'CONFIRMED'),
         }
 
+    # ------------------------------------------------------------------
+    # P9: HTML report overhaul helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _html_esc(x) -> str:
+        """Return HTML-escaped representation of *x*. None → empty string."""
+        return _html.escape(str(x) if x is not None else '')
+
     def generate_html(self, filename: str):
-        """Generate HTML assessment report"""
+        """Generate HTML assessment report (P9 overhaul)."""
         print(Colors.info(f"Generating professional HTML report: {filename}"))
+
+        _esc = self._html_esc  # shorthand
 
         target = self.results.get('target', 'Unknown')
         timestamp = self.results.get('timestamp', datetime.now().isoformat())
         open_ports = self.results.get('open_ports', [])
         udp_ports = self.results.get('udp_ports', [])
         vulns = self.results.get('vulnerabilities', [])
-        compliance = self.results.get('compliance', {})
-        exposure = self.results.get('exposure', {})
+        compliance = self.results.get('compliance', {}) or {}
+        exposure = self.results.get('exposure', {}) or {}
         scan_mode = self.results.get('scan_mode', 'common')
         scan_protocol = self.results.get('scan_protocol', 'tcp')
         cve_lookback_days = self.results.get('cve_lookback_days', 120)
-        tls_scan = self.results.get('tls_scan', {})
-        inventory = self.results.get('inventory', {})
+        tls_scan = self.results.get('tls_scan', {}) or {}
+        inventory = self.results.get('inventory', {}) or {}
+        web_posture = self.results.get('web_posture', {}) or {}
 
         counts = self._count_by_status_severity(vulns)
         critical = counts['critical_confirmed']
@@ -1293,714 +1306,1326 @@ class ReportGenerator:
         potential_vulns = [v for v in vulns if v.get('status') == 'POTENTIAL']
         inconclusive_vulns = [v for v in vulns if v.get('status') == 'INCONCLUSIVE']
 
+        # Severity sort order helper
+        _SEV_ORDER = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4}
+
+        def _sev_sort(v):
+            return _SEV_ORDER.get((v.get('severity') or 'INFO').upper(), 5)
+
+        # All findings combined, sorted severity-first within each status group
+        all_vulns_sorted = (
+            sorted(confirmed_vulns, key=_sev_sort)
+            + sorted(potential_vulns, key=_sev_sort)
+            + sorted(inconclusive_vulns, key=_sev_sort)
+        )
+
+        # Compliance summary data
+        comp_summary  = compliance.get('summary', {}) or {}
+        comp_status   = compliance.get('status', 'UNKNOWN')
+        comp_pass     = comp_summary.get('pass', 0)
+        comp_fail     = comp_summary.get('fail', 0)
+        comp_skip     = comp_summary.get('skip', 0)
+        comp_unknown  = comp_summary.get('unknown', 0)
+        comp_controls = compliance.get('controls', []) or []
+        comp_profile  = compliance.get('profile', 'baseline')
+
+        # Exposure summary
+        exp_signals  = exposure.get('signals', []) or []
+        exp_summary  = exposure.get('summary', {}) or {}
+        exp_crit     = exp_summary.get('critical', 0)
+        exp_high_cnt = exp_summary.get('high', 0)
+        exp_med      = exp_summary.get('medium', 0)
+        exp_low      = exp_summary.get('low', 0)
+        exp_total    = exposure.get('signal_count', len(exp_signals))
+
+        # Web posture summary
+        web_targets  = web_posture.get('targets', []) or []
+        web_total    = web_posture.get('total_findings', 0)
+        web_summary  = web_posture.get('summary', {}) or {}
+        web_crit     = web_summary.get('critical', 0)
+        web_high_cnt = web_summary.get('high', 0)
+        web_med      = web_summary.get('medium', 0)
+        web_low      = web_summary.get('low', 0)
+        web_info_cnt = web_summary.get('info', 0)
+
+        # Inventory assets
+        inv_assets = inventory.get('assets', []) or []
+
+        # Collect unique host names / IPs for filter dropdown (ordered, unique)
+        _seen_hosts: set = set()
+        host_list: List[str] = []
+        for _a in inv_assets:
+            h = _a.get('ip') or _a.get('hostname') or ''
+            if h and h not in _seen_hosts:
+                _seen_hosts.add(h)
+                host_list.append(h)
+        if not host_list:
+            host_list = [target]
+
+        # ---- helpers for per-finding cards ----
+        def _sev_badge(sev: str) -> str:
+            sev = (sev or 'INFO').upper()
+            _cls = {
+                'CRITICAL': 'badge-critical',
+                'HIGH':     'badge-high',
+                'MEDIUM':   'badge-medium',
+                'LOW':      'badge-low',
+                'INFO':     'badge-info',
+            }.get(sev, 'badge-info')
+            return f'<span class="badge {_cls}">{_esc(sev)}</span>'
+
+        def _status_badge(st: str) -> str:
+            st = (st or '').upper()
+            _styles = {
+                'CONFIRMED':   'background:rgba(63,185,80,0.2);color:#3fb950;border:1px solid rgba(63,185,80,0.3);',
+                'POTENTIAL':   'background:rgba(210,153,34,0.2);color:#d29922;border:1px solid rgba(210,153,34,0.3);',
+                'INCONCLUSIVE':'background:rgba(139,148,158,0.2);color:#8b949e;border:1px solid rgba(139,148,158,0.3);',
+            }.get(st, '')
+            return f'<span class="badge" style="{_styles}">{_esc(st)}</span>'
+
+        def _evidence_list(items) -> str:
+            if not items:
+                return ''
+            # Import redact_string lazily to apply a safety layer for any
+            # inline secret-like assignments that may have slipped into evidence.
+            try:
+                from plugins.secrets import redact_string as _redact
+            except ImportError:
+                # If secrets module is unavailable, replace every evidence item
+                # with a placeholder so no potentially sensitive data leaks.
+                def _redact(x: str) -> str:  # type: ignore[misc]
+                    return '[evidence unavailable — secrets module not loaded]'
+            li_items = ''.join(
+                f'<li style="font-size:12px;color:var(--text-secondary);">{_esc(_redact(str(e)))}</li>'
+                for e in (items or [])
+            )
+            return f'<ul style="padding-left:16px;margin:6px 0;">{li_items}</ul>'
+
+        def _refs_list(refs) -> str:
+            if not refs:
+                return ''
+            li_items = ''.join(
+                f'<li style="font-size:12px;"><a href="{_esc(r)}" target="_blank" rel="noopener noreferrer" '
+                f'style="color:var(--accent-blue);">{_esc(r)}</a></li>'
+                for r in (refs or [])
+            )
+            return (
+                '<div style="margin-top:6px;"><span style="font-size:12px;color:var(--text-secondary);">References:</span>'
+                f'<ul style="padding-left:16px;">{li_items}</ul></div>'
+            )
+
+        # Maximum number of cloud/metadata tags to show per host card
+        _MAX_CLOUD_TAGS = 10
+
+        # Helper: sort port/service dict items by numeric port value
+        def _port_sort_key(item):
+            port_str = str(item[0])
+            return int(port_str) if port_str.isdigit() else 0
+
+        # Counter for unique HTML element IDs (avoids relying on Python id())
+        _card_counter = [0]
+
+        def _finding_card(v: Dict, category: str = 'vuln') -> str:
+            _card_counter[0] += 1
+            sev     = (v.get('severity') or 'INFO').lower()
+            st      = (v.get('status') or 'INCONCLUSIVE').upper()
+            conf    = v.get('confidence', 0.5)
+            raw_host = v.get('target') or target
+            host_id = _esc(raw_host)
+            kev_badge = '<span class="badge badge-kev">KEV</span> ' if v.get('cisa_kev') else ''
+            heur_badge = (
+                '<span style="font-size:10px;padding:1px 5px;border-radius:3px;'
+                'background:#30363d;color:#8b949e;margin-left:6px;">heuristic</span>'
+                if v.get('heuristic') else ''
+            )
+            cve_id = _esc(v.get('cve') or v.get('signal_id') or v.get('finding_id') or 'N/A')
+            title  = _esc(v.get('title') or v.get('name') or 'Unnamed finding')
+            desc   = _esc(v.get('description') or '')
+            port_info = (
+                f'🔌 Port {_esc(v.get("port", "N/A"))}/{_esc(v.get("protocol", "tcp")).upper()} | '
+                if v.get('port') else ''
+            )
+            svc = _esc(v.get('affected_service') or v.get('service') or '')
+            svc_info = f'🛡 {svc} | ' if svc else ''
+            cvss = _esc(v.get('cvss', ''))
+            cvss_info = f'🎯 CVSS {cvss} | ' if cvss else ''
+            exploit_info = ''
+            if category == 'vuln':
+                exploit_info = (
+                    f'⚡ {"Exploit Available" if v.get("exploit_available") else "No known exploit"} | '
+                )
+            refs_html = _refs_list(v.get('cve_refs') or v.get('references') or [])
+            rem = v.get('remediation', '')
+            rem_html = (
+                f'<div style="font-size:12px;margin-top:6px;color:var(--accent-green);">Remediation: {_esc(rem)}</div>'
+                if rem else ''
+            )
+            card_id = f'finding-card-{_card_counter[0]}'
+            show_host = (raw_host != target)
+            return (
+                f'<div class="finding-item" '
+                f'data-severity="{_esc(sev)}" '
+                f'data-status="{_esc(st.lower())}" '
+                f'data-category="{_esc(category)}" '
+                f'data-host="{host_id}" '
+                f'data-confidence="{_esc(str(round(conf, 2)))}">'
+                f'<div class="finding-header" onclick="toggleDetail(\'{card_id}\')">'
+                f'  <div class="finding-meta">'
+                f'    <span class="vuln-cve">{cve_id}</span>'
+                f'    {kev_badge}{_sev_badge(sev)}{_status_badge(st)}{heur_badge}'
+                f'  </div>'
+                f'  <div style="font-size:11px;color:var(--text-secondary);display:flex;gap:12px;align-items:center;">'
+                f'    <span>📊 {int(conf * 100)}% confidence</span>'
+                f'    {f"<span>Host: {host_id}</span>" if show_host else ""}'
+                f'    <span class="detail-toggle" id="toggle-{card_id}">▼ Details</span>'
+                f'  </div>'
+                f'</div>'
+                f'<div style="font-weight:500;margin:6px 0;">{title}</div>'
+                f'<div id="{card_id}" class="finding-detail" style="display:none;">'
+                f'  <div style="color:var(--text-secondary);font-size:13px;margin-bottom:6px;">{desc}</div>'
+                f'  {_evidence_list(v.get("evidence", []))}'
+                f'  {refs_html}'
+                f'  {rem_html}'
+                f'  <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">'
+                f'    {cvss_info}{port_info}{svc_info}{exploit_info}'
+                f'  </div>'
+                f'</div>'
+                f'</div>'
+            )
+
+        # ===================================================================
+        # Build HTML
+        # ===================================================================
+
+        # Counts for nav badges
+        _findings_count = len(all_vulns_sorted)
+        _assets_count   = len(inv_assets) or 1  # at least the primary target
+        _comp_count     = len(comp_controls)
+        _exp_count      = len(exp_signals)
+        _web_count      = len(web_targets)
+
         html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vultron Security Platform - {target}</title>
+    <title>Vultron Security Platform — {_esc(target)}</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         :root {{
             --bg-primary: #0f1419;
             --bg-secondary: #1a1f28;
+            --bg-tertiary: #252b36;
             --bg-card: #1e2430;
             --text-primary: #e6edf3;
             --text-secondary: #8b949e;
+            --text-tertiary: #6e7681;
             --accent-blue: #58a6ff;
             --accent-green: #3fb950;
             --accent-orange: #f85149;
             --accent-yellow: #d29922;
             --border: #30363d;
+            --border-hover: #484f58;
         }}
         body {{
             font-family: 'Inter', -apple-system, sans-serif;
             background: var(--bg-primary);
             color: var(--text-primary);
             line-height: 1.5;
+            overflow-x: hidden;
         }}
-        .container {{ max-width: 1600px; margin: 0 auto; padding: 24px; }}
+        /* Warning banner */
+        .warning-banner {{
+            background: #7d5a00;
+            border-bottom: 2px solid var(--accent-yellow);
+            color: #ffd36b;
+            text-align: center;
+            padding: 8px 24px;
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            position: sticky;
+            top: 0;
+            z-index: 200;
+        }}
+        /* Top bar */
         .top-bar {{
             background: var(--bg-secondary);
             border-bottom: 1px solid var(--border);
-            padding: 16px 24px;
+            padding: 12px 24px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 24px;
+            position: sticky;
+            top: 37px;
+            z-index: 100;
         }}
-        .brand {{ display: flex; align-items: center; gap: 12px; }}
+        .brand {{ display: flex; align-items: center; gap: 10px; }}
         .brand-logo {{
-            width: 32px; height: 32px;
+            width: 28px; height: 28px;
             background: linear-gradient(135deg, var(--accent-blue), var(--accent-green));
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 700;
+            border-radius: 5px;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 14px;
         }}
-        .brand-name {{ font-size: 18px; font-weight: 600; }}
-        .scan-info {{ display: flex; gap: 24px; font-size: 14px; color: var(--text-secondary); }}
+        .brand-name {{ font-size: 16px; font-weight: 600; }}
+        .scan-info {{ display: flex; gap: 20px; font-size: 13px; color: var(--text-secondary); align-items: center; }}
         .status-dot {{
-            width: 8px; height: 8px;
-            background: var(--accent-green);
-            border-radius: 50%;
-            animation: pulse 2s infinite;
+            display: inline-block; width: 7px; height: 7px;
+            background: var(--accent-green); border-radius: 50%;
+            margin-right: 5px; animation: pulse 2s infinite;
         }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
+        /* App layout */
+        .app-layout {{
+            display: flex;
+            min-height: calc(100vh - 90px);
+        }}
+        /* Sidebar */
+        .sidebar {{
+            width: 220px;
+            min-width: 220px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            padding: 20px 0;
+            position: sticky;
+            top: 90px;
+            height: calc(100vh - 90px);
+            overflow-y: auto;
+        }}
+        .nav-label {{
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            color: var(--text-tertiary);
+            padding: 0 16px 8px;
+            letter-spacing: 0.8px;
+        }}
+        .nav-link {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 16px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            border-left: 3px solid transparent;
+            transition: all 0.15s;
+            cursor: pointer;
+        }}
+        .nav-link:hover {{ background: var(--bg-tertiary); color: var(--text-primary); }}
+        .nav-link.active {{
+            color: var(--accent-blue);
+            border-left-color: var(--accent-blue);
+            background: rgba(88, 166, 255, 0.08);
+        }}
+        .nav-badge {{
+            margin-left: auto;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 10px;
+            min-width: 20px;
+            text-align: center;
+        }}
+        .nav-badge.critical {{ background: rgba(248,81,73,0.2); color: var(--accent-orange); }}
+        /* Main content */
+        .main-content {{
+            flex: 1;
+            min-width: 0;
+            padding: 24px;
+            overflow-y: auto;
+        }}
+        /* Section */
+        .report-section {{
+            margin-bottom: 40px;
+        }}
+        .section-title {{
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 16px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        /* Stats grid */
         .stats-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 14px;
+            margin-bottom: 20px;
         }}
         .stat-card {{
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 20px;
+            padding: 16px 20px;
         }}
         .stat-label {{
-            font-size: 13px;
+            font-size: 11px;
             color: var(--text-secondary);
-            font-weight: 500;
+            font-weight: 600;
             text-transform: uppercase;
-            margin-bottom: 12px;
+            margin-bottom: 8px;
+            letter-spacing: 0.5px;
         }}
         .stat-value {{
-            font-size: 36px;
+            font-size: 32px;
             font-weight: 700;
             line-height: 1;
             margin-bottom: 4px;
         }}
         .stat-value.critical {{ color: var(--accent-orange); }}
-        .stat-value.warning {{ color: var(--accent-yellow); }}
-        .stat-value.info {{ color: var(--accent-blue); }}
+        .stat-value.warning  {{ color: var(--accent-yellow); }}
+        .stat-value.info     {{ color: var(--accent-blue); }}
+        .stat-value.success  {{ color: var(--accent-green); }}
+        /* Card */
         .card {{
             background: var(--bg-card);
             border: 1px solid var(--border);
             border-radius: 8px;
             overflow: hidden;
-            margin-bottom: 24px;
+            margin-bottom: 16px;
         }}
-        .card-header {{ padding: 16px 20px; border-bottom: 1px solid var(--border); }}
-        .card-title {{ font-size: 15px; font-weight: 600; }}
-        .card-body {{ padding: 20px; }}
-        .vuln-item {{
+        .card-header {{ padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }}
+        .card-title {{ font-size: 14px; font-weight: 600; }}
+        .card-body {{ padding: 18px; }}
+        /* Filter bar */
+        .filter-bar {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+        }}
+        .filter-bar label {{ font-size: 12px; color: var(--text-secondary); }}
+        .filter-bar select, .filter-bar input {{
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 5px;
+            color: var(--text-primary);
+            padding: 5px 10px;
+            font-size: 12px;
+            font-family: inherit;
+            min-width: 120px;
+        }}
+        .filter-bar select:focus, .filter-bar input:focus {{
+            outline: none;
+            border-color: var(--accent-blue);
+        }}
+        .filter-count {{
+            margin-left: auto;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }}
+        /* Finding item */
+        .finding-item {{
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 14px 16px;
+            margin-bottom: 10px;
+        }}
+        .finding-item[data-status="confirmed"] {{ border-left: 3px solid rgba(63,185,80,0.6); }}
+        .finding-item[data-status="potential"]  {{ border-left: 3px solid rgba(210,153,34,0.6); }}
+        .finding-item[data-status="inconclusive"] {{ border-left: 3px solid rgba(139,148,158,0.4); }}
+        .finding-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 4px;
+            cursor: pointer;
+        }}
+        .finding-header:hover {{ opacity: 0.85; }}
+        .finding-meta {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+        .finding-detail {{ margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }}
+        .detail-toggle {{
+            color: var(--accent-blue);
+            cursor: pointer;
+            font-size: 11px;
+            user-select: none;
+        }}
+        /* Badges */
+        .badge {{
+            font-size: 10px;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-weight: 600;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }}
+        .badge-critical {{ background: rgba(248,81,73,0.2); color: var(--accent-orange); border: 1px solid rgba(248,81,73,0.3); }}
+        .badge-high     {{ background: rgba(210,153,34,0.2); color: var(--accent-yellow); border: 1px solid rgba(210,153,34,0.3); }}
+        .badge-medium   {{ background: rgba(88,166,255,0.2); color: var(--accent-blue); border: 1px solid rgba(88,166,255,0.3); }}
+        .badge-low      {{ background: rgba(63,185,80,0.15); color: var(--accent-green); border: 1px solid rgba(63,185,80,0.3); }}
+        .badge-info     {{ background: rgba(139,148,158,0.15); color: #8b949e; border: 1px solid rgba(139,148,158,0.3); }}
+        .badge-kev      {{ background: linear-gradient(135deg,#f85149,#d73a49); color: white; border: none; }}
+        /* Vuln / control ID */
+        .vuln-cve {{ font-family: monospace; font-weight: 600; color: var(--accent-blue); font-size: 13px; }}
+        /* Table */
+        table {{ width: 100%; border-collapse: collapse; }}
+        th {{
+            text-align: left;
+            padding: 10px 14px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            border-bottom: 1px solid var(--border);
+            letter-spacing: 0.4px;
+        }}
+        td {{ padding: 12px 14px; font-size: 13px; border-bottom: 1px solid var(--border); vertical-align: top; }}
+        tr:hover {{ background: rgba(88,166,255,0.04); }}
+        /* Host search */
+        .host-search {{
+            width: 100%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            padding: 9px 14px;
+            font-size: 13px;
+            font-family: inherit;
+            margin-bottom: 14px;
+        }}
+        .host-search:focus {{ outline: none; border-color: var(--accent-blue); }}
+        /* Host card */
+        .host-card {{
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 6px;
             padding: 16px;
             margin-bottom: 12px;
         }}
-        .vuln-header {{ display: flex; justify-content: space-between; margin-bottom: 8px; }}
-        .vuln-cve {{ font-family: monospace; font-weight: 600; color: var(--accent-blue); }}
-        .badge {{
-            font-size: 11px;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-weight: 600;
-            text-transform: uppercase;
+        .host-card-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
         }}
-        .badge-critical {{
-            background: rgba(248, 81, 73, 0.2);
-            color: var(--accent-orange);
-            border: 1px solid rgba(248, 81, 73, 0.3);
-        }}
-        .badge-high {{
-            background: rgba(210, 153, 34, 0.2);
-            color: var(--accent-yellow);
-            border: 1px solid rgba(210, 153, 34, 0.3);
-        }}
-        .badge-medium {{
-            background: rgba(88, 166, 255, 0.2);
-            color: var(--accent-blue);
-            border: 1px solid rgba(88, 166, 255, 0.3);
-        }}
-        .badge-kev {{ background: linear-gradient(135deg, #f85149, #d73a49); color: white; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th {{
-            text-align: left;
+        /* Control item */
+        .control-item {{
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
             padding: 12px 16px;
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            border-bottom: 1px solid var(--border);
+            margin-bottom: 8px;
         }}
-        td {{ padding: 14px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }}
-        tr:hover {{ background: rgba(88, 166, 255, 0.05); }}
+        .control-item.fail {{ border-left: 3px solid rgba(248,81,73,0.7); }}
+        .control-item.pass {{ border-left: 3px solid rgba(63,185,80,0.6); }}
+        .control-item.skip {{ border-left: 3px solid rgba(139,148,158,0.4); }}
+        .control-item.unknown {{ border-left: 3px solid rgba(210,153,34,0.4); }}
+        /* Summary row */
+        .summary-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 16px;
+        }}
+        .summary-pill {{
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 6px 14px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }}
+        /* Footer */
         .footer {{
             text-align: center;
-            padding: 24px;
+            padding: 20px;
             color: var(--text-secondary);
             border-top: 1px solid var(--border);
-            margin-top: 24px;
+            margin-top: 20px;
+            font-size: 13px;
         }}
+        /* Scrollbar */
+        ::-webkit-scrollbar {{ width: 6px; }}
+        ::-webkit-scrollbar-track {{ background: var(--bg-primary); }}
+        ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
+        ::-webkit-scrollbar-thumb:hover {{ background: var(--border-hover); }}
     </style>
 </head>
 <body>
+    <!-- ⚠ Warning Banner -->
+    <div class="warning-banner">
+        ⚠ AUTHORIZED USE ONLY — This report contains sensitive security findings.
+        Restrict access to authorized personnel. Do not distribute without permission.
+    </div>
+
+    <!-- Top Bar -->
     <div class="top-bar">
         <div class="brand">
             <div class="brand-logo">V</div>
             <span class="brand-name">Vultron Security Platform</span>
         </div>
         <div class="scan-info">
-            <span><span class="status-dot"></span> Scan Complete</span>
-            <span>Target: {target}</span>
-            <span>{timestamp[:19]}</span>
+            <span><span class="status-dot"></span>Scan Complete</span>
+            <span>Target: <strong>{_esc(target)}</strong></span>
+            <span>{_esc(timestamp[:19])}</span>
+            <span>Mode: {_esc(scan_mode)} / {_esc(scan_protocol)}</span>
             <span>CVE Lookback: {cve_lookback_days}d</span>
         </div>
     </div>
 
-    <div class="container">
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Critical (confirmed)</div>
-                <div class="stat-value critical">{critical}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Immediate action required</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">High (confirmed)</div>
-                <div class="stat-value warning">{high}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Patch within 7 days</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Medium (confirmed)</div>
-                <div class="stat-value info">{medium}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Patch within 30 days</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Potential</div>
-                <div class="stat-value warning">{potential}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Needs verification</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Inconclusive</div>
-                <div class="stat-value info">{inconclusive}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Manual review required</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">CISA KEV (confirmed)</div>
-                <div class="stat-value critical">{kev}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Actively exploited</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Open TCP Ports</div>
-                <div class="stat-value info">{len(open_ports)}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Scan mode: {scan_mode}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">UDP Ports</div>
-                <div class="stat-value info">{len(udp_ports)}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">open / open|filtered</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Risk Score</div>
-                <div class="stat-value critical">{risk_score:.1f}</div>
-                <div style="font-size: 13px; color: var(--text-secondary);">Out of 10 (confirmed only)</div>
-            </div>
-        </div>
+    <div class="app-layout">
+        <!-- Sidebar Navigation -->
+        <nav class="sidebar" id="sidebar">
+            <div class="nav-label">Navigation</div>
+            <a class="nav-link active" href="#sec-dashboard" onclick="setActive(this)">
+                📊 Dashboard
+            </a>
+            <a class="nav-link" href="#sec-findings" onclick="setActive(this)">
+                🚨 Findings
+                <span class="nav-badge{' critical' if critical or high else ''}">{_findings_count}</span>
+            </a>
+            <a class="nav-link" href="#sec-assets" onclick="setActive(this)">
+                🖥 Assets / Hosts
+                <span class="nav-badge">{_assets_count}</span>
+            </a>
+            <a class="nav-link" href="#sec-compliance" onclick="setActive(this)">
+                🛡 Compliance
+                <span class="nav-badge">{_comp_count}</span>
+            </a>
+            <a class="nav-link" href="#sec-exposure" onclick="setActive(this)">
+                📡 Exposure &amp; Patch Risk
+                <span class="nav-badge">{_exp_count}</span>
+            </a>
+            <a class="nav-link" href="#sec-web" onclick="setActive(this)">
+                🌐 Web Posture
+                <span class="nav-badge">{_web_count}</span>
+            </a>
+        </nav>
+
+        <!-- Main Content -->
+        <div class="main-content" id="main-content">
 '''
 
-        # --- Confirmed findings section ---
-        html += '''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">🚨 Confirmed Findings</h3>
-            </div>
-            <div class="card-body">
-'''
-        if confirmed_vulns:
-            for vuln in confirmed_vulns:
-                sev = vuln.get('severity', 'MEDIUM').lower()
-                kev_badge = '<span class="badge badge-kev">KEV</span>' if vuln.get('cisa_kev') else ''
-                evidence_html = ''.join(
-                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                    for e in vuln.get('evidence', [])
-                )
-                html += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
-                        <div>
-                            {kev_badge}
-                            <span class="badge badge-{sev}">{vuln.get('severity', 'UNKNOWN')}</span>
-                            <span class="badge" style="background:rgba(63,185,80,0.2);color:#3fb950;border:1px solid rgba(63,185,80,0.3);">CONFIRMED</span>
+        # ===== SECTION: Dashboard =====
+        _comp_status_col = (
+            'var(--accent-orange)' if comp_status == 'FAIL'
+            else 'var(--accent-green)' if comp_status == 'PASS'
+            else 'var(--text-secondary)'
+        )
+        html += f'''
+            <!-- ===== Dashboard ===== -->
+            <div class="report-section" id="sec-dashboard">
+                <h2 class="section-title">📊 Dashboard</h2>
+
+                <!-- Primary finding counters -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Critical (confirmed)</div>
+                        <div class="stat-value critical">{critical}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Immediate action required</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">High (confirmed)</div>
+                        <div class="stat-value warning">{high}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Patch within 7 days</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Medium (confirmed)</div>
+                        <div class="stat-value info">{medium}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Patch within 30 days</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Potential</div>
+                        <div class="stat-value warning">{potential}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Needs verification</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Inconclusive</div>
+                        <div class="stat-value info">{inconclusive}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Manual review required</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">CISA KEV (confirmed)</div>
+                        <div class="stat-value critical">{kev}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Actively exploited</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Assets</div>
+                        <div class="stat-value info">{len(inv_assets) or 1}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Discovered hosts</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Open TCP Ports</div>
+                        <div class="stat-value info">{len(open_ports)}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Scan mode: {_esc(scan_mode)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Risk Score</div>
+                        <div class="stat-value critical">{risk_score:.1f}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);">Out of 10 (confirmed only)</div>
+                    </div>
+                </div>
+
+                <!-- Module summaries row -->
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;">
+                    <!-- Compliance mini-card -->
+                    <div class="stat-card">
+                        <div class="stat-label">Compliance — {_esc(comp_profile)}</div>
+                        <div class="stat-value" style="font-size:22px;color:{_comp_status_col};">{_esc(comp_status)}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                            ✅ {comp_pass} pass &nbsp;❌ {comp_fail} fail &nbsp;⏭ {comp_skip+comp_unknown} skip/unk
                         </div>
                     </div>
-                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
-                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
-                    <div style="font-size:12px;color:var(--text-secondary);">
-                        🎯 CVSS {vuln.get('cvss','N/A')} | 🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} |
-                        ⚡ {'Exploit Available' if vuln.get('exploit_available') else 'No known exploit'} |
-                        🛡 {vuln.get('affected_service','N/A')} |
-                        📊 Confidence: {int(vuln.get('confidence', 0.9) * 100)}%
-                    </div>
-                </div>
-'''
-        else:
-            html += '<div style="color:var(--text-secondary);">No confirmed findings</div>'
-
-        html += '''
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">⚠️ Potential Findings (verification required)</h3>
-            </div>
-            <div class="card-body">
-'''
-        if potential_vulns:
-            for vuln in potential_vulns:
-                sev = vuln.get('severity', 'HIGH').lower()
-                evidence_html = ''.join(
-                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                    for e in vuln.get('evidence', [])
-                )
-                html += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
-                        <div>
-                            <span class="badge badge-{sev}">{vuln.get('severity', 'UNKNOWN')}</span>
-                            <span class="badge" style="background:rgba(210,153,34,0.2);color:#d29922;border:1px solid rgba(210,153,34,0.3);">POTENTIAL</span>
+                    <!-- Exposure mini-card -->
+                    <div class="stat-card">
+                        <div class="stat-label">Exposure &amp; Patch Risk</div>
+                        <div class="stat-value" style="font-size:22px;color:{'var(--accent-orange)' if exp_crit or exp_high_cnt else 'var(--accent-yellow)'};">{exp_total}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                            signals &nbsp;·&nbsp; critical={exp_crit} &nbsp;high={exp_high_cnt} &nbsp;med={exp_med}
                         </div>
                     </div>
-                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
-                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
-                    <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} | 🛡 {vuln.get('affected_service','N/A')} |
-                        📊 Confidence: {int(vuln.get('confidence', 0.5) * 100)}%
-                    </div>
+                    {f"""<!-- Web posture mini-card -->
+                    <div class="stat-card">
+                        <div class="stat-label">Web Application Posture</div>
+                        <div class="stat-value" style="font-size:22px;color:{'var(--accent-orange)' if web_crit or web_high_cnt else 'var(--accent-yellow)'};">{web_total}</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                            findings &nbsp;&middot;&nbsp; targets: {len(web_targets)} &nbsp;&middot;&nbsp; crit={web_crit} hi={web_high_cnt}
+                        </div>
+                    </div>""" if web_targets else ""}
                 </div>
+            </div>
 '''
+
+        # ===== SECTION: Findings =====
+        # Build unique host options for filter
+        _host_opts = ''.join(
+            f'<option value="{_esc(h)}">{_esc(h)}</option>' for h in host_list
+        )
+        html += f'''
+            <!-- ===== Findings ===== -->
+            <div class="report-section" id="sec-findings">
+                <h2 class="section-title">🚨 Findings
+                    <span style="font-size:13px;font-weight:400;color:var(--text-secondary);">
+                        ({_findings_count} total)
+                    </span>
+                </h2>
+
+                <!-- Filter bar -->
+                <div class="filter-bar" id="findings-filter-bar">
+                    <label>Severity:</label>
+                    <select id="f-severity" onchange="applyFilters()">
+                        <option value="">All</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                        <option value="info">Info</option>
+                    </select>
+                    <label>Status:</label>
+                    <select id="f-status" onchange="applyFilters()">
+                        <option value="">All</option>
+                        <option value="confirmed">Confirmed</option>
+                        <option value="potential">Potential</option>
+                        <option value="inconclusive">Inconclusive</option>
+                    </select>
+                    <label>Category:</label>
+                    <select id="f-category" onchange="applyFilters()">
+                        <option value="">All</option>
+                        <option value="vuln">Vulnerability</option>
+                        <option value="tls">TLS</option>
+                        <option value="compliance">Compliance</option>
+                        <option value="exposure">Exposure</option>
+                        <option value="web">Web</option>
+                    </select>
+                    <label>Host:</label>
+                    <select id="f-host" onchange="applyFilters()">
+                        <option value="">All hosts</option>
+                        {_host_opts}
+                    </select>
+                    <label>Min Confidence:</label>
+                    <select id="f-confidence" onchange="applyFilters()">
+                        <option value="0">Any</option>
+                        <option value="0.8">High (&ge;80%)</option>
+                        <option value="0.5">Medium (&ge;50%)</option>
+                        <option value="0.2">Low (&ge;20%)</option>
+                    </select>
+                    <button onclick="resetFilters()"
+                        style="margin-left:auto;background:var(--bg-tertiary);border:1px solid var(--border);
+                               color:var(--text-secondary);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:12px;">
+                        Reset
+                    </button>
+                    <span class="filter-count" id="filter-count"></span>
+                </div>
+
+                <div id="findings-list">
+'''
+        # Render all findings as finding-item cards
+        if all_vulns_sorted:
+            for _v in all_vulns_sorted:
+                _cat = _v.get('category', 'vuln') or 'vuln'
+                html += '                    ' + _finding_card(_v, category=_cat) + '\n'
         else:
-            html += '<div style="color:var(--text-secondary);">No potential findings</div>'
-
+            html += '''
+                    <div style="color:var(--text-secondary);padding:20px;text-align:center;">
+                        No findings recorded for this scan.
+                    </div>
+'''
         html += '''
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">❓ Inconclusive Checks (manual review required)</h3>
-            </div>
-            <div class="card-body">
-'''
-        if inconclusive_vulns:
-            for vuln in inconclusive_vulns:
-                evidence_html = ''.join(
-                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                    for e in vuln.get('evidence', [])
-                )
-                html += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span class="vuln-cve">{vuln.get('cve', 'N/A')}</span>
-                        <span class="badge" style="background:rgba(139,148,158,0.2);color:#8b949e;border:1px solid rgba(139,148,158,0.3);">INCONCLUSIVE</span>
-                    </div>
-                    <div style="font-weight:500;margin-bottom:8px;">{vuln.get('title', vuln['name'])}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:8px;">{vuln.get('description','')}</div>
-                    <ul style="padding-left:16px;margin-bottom:8px;">{evidence_html}</ul>
-                    <div style="font-size:12px;color:var(--text-secondary);">
-                        🔌 Port {vuln.get('port','N/A')}/{vuln.get('protocol','tcp').upper()} | 🛡 {vuln.get('affected_service','N/A')} |
-                        📊 Confidence: {int(vuln.get('confidence', 0.2) * 100)}%
-                    </div>
                 </div>
-'''
-        else:
-            html += '<div style="color:var(--text-secondary);">No inconclusive checks</div>'
-
-        html += '''
             </div>
-        </div>
 '''
 
-        # --- TCP Open ports table ---
-        if open_ports:
-            html += '''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">🔓 Open TCP Ports &amp; Services</h3>
-            </div>
-            <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Port</th>
-                            <th>Service</th>
-                            <th>State</th>
-                            <th>Protocol</th>
-                            <th>Version</th>
-                            <th>Banner</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+        # ===== SECTION: Assets / Hosts =====
+        html += f'''
+            <!-- ===== Assets ===== -->
+            <div class="report-section" id="sec-assets">
+                <h2 class="section-title">🖥 Assets / Hosts
+                    <span style="font-size:13px;font-weight:400;color:var(--text-secondary);">
+                        ({len(inv_assets) or 1} host(s))
+                    </span>
+                </h2>
+                <input type="text" class="host-search" id="host-search"
+                    placeholder="🔍 Search by IP, hostname or role…" oninput="filterHosts()">
+                <div id="host-list">
 '''
-            for port in open_ports:
-                fp = port.get('fingerprint', {})
-                version_hint = fp.get('version', '') or ''
-                html += f'''
-                        <tr>
-                            <td><strong>{port['port']}</strong></td>
-                            <td>{port['service']}</td>
-                            <td>{port.get('state', 'open')}</td>
-                            <td>{port['protocol']}</td>
-                            <td style="font-size:12px;opacity:0.8;">{version_hint}</td>
-                            <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
-                        </tr>
-'''
-            html += '''
-                    </tbody>
-                </table>
-            </div>
-        </div>
-'''
-
-        # --- UDP ports table ---
-        if udp_ports:
-            html += '''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">📡 UDP Ports &amp; Services</h3>
-            </div>
-            <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Port</th>
-                            <th>Service</th>
-                            <th>State</th>
-                            <th>Protocol</th>
-                            <th>Banner</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-'''
-            for port in udp_ports:
-                state = port.get('state', 'open|filtered')
-                state_color = '#3fb950' if state == 'open' else '#d29922'
-                html += f'''
-                        <tr>
-                            <td><strong>{port['port']}</strong></td>
-                            <td>{port['service']}</td>
-                            <td style="color:{state_color};">{state}</td>
-                            <td>udp</td>
-                            <td style="font-family: monospace; font-size: 11px; opacity: 0.7;">{port.get('banner', '')[:50]}</td>
-                        </tr>
-'''
-            html += '''
-                    </tbody>
-                </table>
-            </div>
-        </div>
-'''
-
-        # --- TLS scan section ---
-        if tls_scan:
-            inspected = {port: info for port, info in tls_scan.items() if not info.get('error')}
-            if inspected:
-                html += '''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">🔐 TLS / SSL Inspection Results</h3>
-            </div>
-            <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Port</th>
-                            <th>Protocol</th>
-                            <th>Cipher Suite</th>
-                            <th>Bits</th>
-                            <th>Forward Secrecy</th>
-                            <th>ALPN</th>
-                            <th>Cert CN</th>
-                            <th>Cert Expires</th>
-                            <th>Trusted</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-'''
-                for port_str, info in sorted(inspected.items(), key=lambda x: int(x[0])):
-                    cert = info.get('cert_info') or {}
-                    not_after = cert.get('not_after', '') or ''
-                    expires_display = not_after[:10] if not_after else 'n/a'
-                    fs_icon = '✅' if info.get('has_forward_secrecy') else '❌'
-                    trusted_icon = '✅' if cert.get('chain_trusted') else '⚠️'
-                    html += f'''
-                        <tr>
-                            <td><strong>{port_str}</strong></td>
-                            <td>{info.get('protocol_display', 'unknown')}</td>
-                            <td style="font-family:monospace;font-size:11px;">{info.get('cipher_name', 'n/a')}</td>
-                            <td>{info.get('cipher_bits', 'n/a')}</td>
-                            <td style="text-align:center;">{fs_icon}</td>
-                            <td>{info.get('alpn') or 'n/a'}</td>
-                            <td style="font-size:12px;">{cert.get('subject_cn') or 'n/a'}</td>
-                            <td style="font-size:12px;">{expires_display}</td>
-                            <td style="text-align:center;">{trusted_icon}</td>
-                        </tr>
-'''
-                html += '''
-                    </tbody>
-                </table>
-            </div>
-        </div>
-'''
-
-        # --- Compliance section ---
-        if compliance:
-            _comp_summary = compliance.get('summary', {})
-            _comp_status  = compliance.get('status', 'UNKNOWN')
-            _comp_profile = compliance.get('profile', 'baseline')
-            _comp_controls = compliance.get('controls', [])
-            _fail_count  = _comp_summary.get('fail', len(compliance.get('issues', [])))
-            _pass_count  = _comp_summary.get('pass', 0)
-            _skip_count  = _comp_summary.get('skip', 0)
-            _unk_count   = _comp_summary.get('unknown', 0)
-            _stat_colour = 'var(--accent-orange)' if _comp_status == 'FAIL' else 'var(--accent-green)'
-            _failed_controls = [c for c in _comp_controls if c.get('status') == 'FAIL']
-            _failed_rows = ''
-            for _fc in _failed_controls:
-                _sev = (_fc.get('severity') or 'MEDIUM').lower()
-                _ev_items = ''.join(
-                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                    for e in (_fc.get('evidence') or [])
-                )
-                _failed_rows += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_fc.get('control_id','')}</span>
-                        <span class="badge badge-{_sev}">{_fc.get('severity','MEDIUM')}</span>
-                    </div>
-                    <div style="font-weight:500;margin-bottom:6px;">{_fc.get('title','')}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:6px;">{_fc.get('description','')}</div>
-                    <ul style="padding-left:16px;">{_ev_items}</ul>
-                </div>'''
-            html += f'''
-        <div class="card">
-            <div class="card-header">
-                <h3 class="card-title">🛡 Compliance Posture — Profile: {_comp_profile}</h3>
-            </div>
-            <div class="card-body">
-                <div style="display:flex;gap:24px;margin-bottom:20px;flex-wrap:wrap;">
-                    <div class="stat-card" style="flex:1;min-width:120px;">
-                        <div class="stat-label">Overall Status</div>
-                        <div class="stat-value" style="color:{_stat_colour};font-size:28px;">{_comp_status}</div>
-                    </div>
-                    <div class="stat-card" style="flex:1;min-width:100px;">
-                        <div class="stat-label">Pass</div>
-                        <div class="stat-value" style="color:var(--accent-green);font-size:28px;">{_pass_count}</div>
-                    </div>
-                    <div class="stat-card" style="flex:1;min-width:100px;">
-                        <div class="stat-label">Fail</div>
-                        <div class="stat-value" style="color:var(--accent-orange);font-size:28px;">{_fail_count}</div>
-                    </div>
-                    <div class="stat-card" style="flex:1;min-width:100px;">
-                        <div class="stat-label">Skip / Unknown</div>
-                        <div class="stat-value" style="color:var(--text-secondary);font-size:28px;">{_skip_count + _unk_count}</div>
-                    </div>
-                </div>
-'''
-            if _failed_controls:
-                html += '''
-                <div style="margin-top:12px;">
-                    <div style="font-weight:600;margin-bottom:10px;">Failed Controls</div>
-'''
-                html += _failed_rows
-                html += '</div>'
-            else:
-                html += '<div style="color:var(--accent-green);">All evaluated compliance controls passed.</div>'
-            html += '''
-            </div>
-        </div>
-'''
-
-        # Asset inventory section (only rendered when inventory data is present)
-        inv_assets = inventory.get('assets', [])
+        # Per-host cards
         if inv_assets:
-            _inv_rows = ''
             for _a in inv_assets:
-                _tcp_count = len(_a.get('tcp_services', {}))
-                _udp_count = len(_a.get('udp_services', {}))
-                _role = _a.get('role', 'unknown')
-                _risk = _a.get('risk_level', 'none')
-                _risk_badge = {
-                    'critical': 'critical', 'high': 'critical',
-                    'medium': 'medium', 'low': 'medium', 'none': 'info',
-                }.get(_risk, 'info')
-                _exposure = _a.get('exposure_summary', '')
-                _ip = _a.get('ip') or _a.get('hostname') or target
-                _inv_rows += f'''
-                <tr>
-                    <td><strong>{_ip}</strong></td>
-                    <td>{_a.get('hostname') or '—'}</td>
-                    <td>{_role}</td>
-                    <td><span class="badge badge-{_risk_badge}">{_risk.upper()}</span></td>
-                    <td>{_tcp_count}</td>
-                    <td>{_udp_count}</td>
-                    <td style="font-size:12px">{_exposure}</td>
-                </tr>'''
+                _ip       = _esc(_a.get('ip') or _a.get('hostname') or target)
+                _hostname = _esc(_a.get('hostname') or '—')
+                _role     = _esc(_a.get('role') or 'unknown')
+                _risk     = (_a.get('risk_level') or 'none').lower()
+                _risk_cls = {
+                    'critical': 'badge-critical', 'high': 'badge-high',
+                    'medium': 'badge-medium',     'low': 'badge-low',
+                }.get(_risk, 'badge-info')
+                _exposure_summary = _esc(_a.get('exposure_summary') or '')
+                _tcp_svcs = _a.get('tcp_services') or {}
+                _udp_svcs = _a.get('udp_services') or {}
+                _os_hints = _a.get('os_hints') or []
+                _os_text  = _esc(', '.join(h.get('value', '') for h in _os_hints if h.get('value')))
+                _tags     = _a.get('tags') or {}
+                _cloud_rows = ''
+                if _tags:
+                    for _tk, _tv in sorted((_tags or {}).items())[:_MAX_CLOUD_TAGS]:
+                        _cloud_rows += (
+                            f'<tr><td style="font-size:11px;color:var(--text-secondary);">{_esc(_tk)}</td>'
+                            f'<td style="font-size:11px;">{_esc(str(_tv))}</td></tr>'
+                        )
+                _tcp_rows = ''
+                for _p, _svc in sorted(_tcp_svcs.items(), key=_port_sort_key)[:20]:
+                    _svc_name = _esc(_svc.get('service') or _svc.get('name') or '')
+                    _version  = _esc(_svc.get('version') or '')
+                    _tcp_rows += (
+                        f'<tr><td><strong>{_esc(str(_p))}</strong>/tcp</td>'
+                        f'<td>{_svc_name}</td><td style="font-size:11px;opacity:0.8;">{_version}</td></tr>'
+                    )
+                _udp_rows = ''
+                for _p, _svc in sorted(_udp_svcs.items(), key=_port_sort_key)[:10]:
+                    _svc_name = _esc(_svc.get('service') or _svc.get('name') or '')
+                    _udp_rows += (
+                        f'<tr><td><strong>{_esc(str(_p))}</strong>/udp</td>'
+                        f'<td>{_svc_name}</td><td></td></tr>'
+                    )
+                # Count findings for this host using explicit None-safe matching
+                _asset_identifiers = {
+                    x for x in (_a.get('ip'), _a.get('hostname'), target)
+                    if x is not None
+                }
+                _host_finding_cnt = sum(
+                    1 for v in all_vulns_sorted
+                    if v.get('target') in _asset_identifiers
+                )
+                html += f'''
+                <div class="host-card" data-host-id="{_ip}">
+                    <div class="host-card-header">
+                        <div>
+                            <span style="font-size:15px;font-weight:700;color:var(--accent-blue);">{_ip}</span>
+                            {f'<span style="font-size:13px;color:var(--text-secondary);margin-left:8px;">{_hostname}</span>' if _hostname != "—" else ""}
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <span class="badge {_risk_cls}">{_esc(_risk.upper())}</span>
+                            <span style="font-size:12px;color:var(--text-secondary);">Role: {_role}</span>
+                        </div>
+                    </div>
+                    <div style="display:flex;flex-wrap:wrap;gap:16px;">
+                        <!-- Services / ports -->
+                        <div style="flex:2;min-width:220px;">
+                            <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;">Services</div>
+                            <table>
+                                <thead><tr><th>Port</th><th>Service</th><th>Version</th></tr></thead>
+                                <tbody>
+                                    {_tcp_rows if _tcp_rows else '<tr><td colspan="3" style="color:var(--text-secondary);">No TCP services</td></tr>'}
+                                    {_udp_rows}
+                                </tbody>
+                            </table>
+                        </div>
+                        <!-- Right column: findings count + metadata -->
+                        <div style="flex:1;min-width:160px;">
+                            <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;">Details</div>
+                            <div style="font-size:13px;margin-bottom:6px;">
+                                🚨 <strong>{_host_finding_cnt}</strong> finding(s)
+                            </div>
+                            {f'<div style="font-size:12px;margin-bottom:4px;">OS hint: {_os_text}</div>' if _os_text else ''}
+                            {f'<div style="font-size:12px;color:var(--text-secondary);">{_exposure_summary}</div>' if _exposure_summary else ''}
+                            {f'<div style="margin-top:8px;"><div style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:4px;">Cloud / Tags</div><table>{"".join("<tr>" + _cloud_rows + "</tr>") if _cloud_rows else ""}</table></div>' if _cloud_rows else ''}
+                        </div>
+                    </div>
+                </div>
+'''
+        else:
+            # No inventory — show primary target basic info
+            _port_rows = ''.join(
+                f'<tr><td><strong>{_esc(str(p["port"]))}</strong>/tcp</td>'
+                f'<td>{_esc(p.get("service",""))}</td>'
+                f'<td style="font-size:11px;">{_esc(p.get("fingerprint", {}).get("version", "") or "")}</td></tr>'
+                for p in open_ports[:20]
+            ) or '<tr><td colspan="3" style="color:var(--text-secondary);">No open ports detected</td></tr>'
             html += f'''
-        <div class="section">
-            <div class="section-header">Asset Inventory</div>
-            <div style="padding: 20px;">
-                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
-                    {len(inv_assets)} asset(s) discovered · snapshot {inventory.get('snapshot_id', '')}
-                </p>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>IP / Host</th>
-                            <th>Hostname</th>
-                            <th>Role</th>
-                            <th>Risk</th>
-                            <th>TCP Ports</th>
-                            <th>UDP Ports</th>
-                            <th>Exposure</th>
-                        </tr>
-                    </thead>
-                    <tbody>{_inv_rows}
-                    </tbody>
-                </table>
+                <div class="host-card" data-host-id="{_esc(target)}">
+                    <div class="host-card-header">
+                        <span style="font-size:15px;font-weight:700;color:var(--accent-blue);">{_esc(target)}</span>
+                        <span style="font-size:12px;color:var(--text-secondary);">Primary scan target</span>
+                    </div>
+                    <table>
+                        <thead><tr><th>Port</th><th>Service</th><th>Version</th></tr></thead>
+                        <tbody>{_port_rows}</tbody>
+                    </table>
+                </div>
+'''
+        html += '''
+                </div>
             </div>
-        </div>
 '''
 
-        # Exposure & Patch Risk section
-        exp_signals = exposure.get('signals', [])
-        if exp_signals:
-            _exp_summary = exposure.get('summary', {})
-            _exp_total   = exposure.get('signal_count', len(exp_signals))
-            _exp_crit    = _exp_summary.get('critical', 0)
-            _exp_high    = _exp_summary.get('high', 0)
-            _exp_med     = _exp_summary.get('medium', 0)
-            _exp_low     = _exp_summary.get('low', 0)
-            _exp_status_colour = (
-                'var(--accent-orange)' if _exp_crit or _exp_high else 'var(--accent-yellow)'
+        # ===== SECTION: Compliance =====
+        html += f'''
+            <!-- ===== Compliance ===== -->
+            <div class="report-section" id="sec-compliance">
+                <h2 class="section-title">🛡 Compliance — Profile: {_esc(comp_profile)}</h2>
+'''
+        if compliance:
+            _stat_col = (
+                'var(--accent-orange)' if comp_status == 'FAIL'
+                else 'var(--accent-green)' if comp_status == 'PASS'
+                else 'var(--text-secondary)'
             )
-            _exp_rows = ''
-            for _sig in exp_signals:
-                _sev = (_sig.get('severity') or 'MEDIUM').lower()
-                _conf_label = _sig.get('confidence_label', 'MEDIUM')
+            html += f'''
+                <div class="stats-grid" style="margin-bottom:16px;">
+                    <div class="stat-card">
+                        <div class="stat-label">Overall Status</div>
+                        <div class="stat-value" style="font-size:24px;color:{_stat_col};">{_esc(comp_status)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Pass</div>
+                        <div class="stat-value success" style="font-size:24px;">{comp_pass}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Fail</div>
+                        <div class="stat-value critical" style="font-size:24px;">{comp_fail}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Skip</div>
+                        <div class="stat-value" style="font-size:24px;color:var(--text-secondary);">{comp_skip}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Unknown</div>
+                        <div class="stat-value" style="font-size:24px;color:var(--text-secondary);">{comp_unknown}</div>
+                    </div>
+                </div>
+'''
+            # Render all controls (failed first)
+            _ctrl_sorted = sorted(
+                comp_controls,
+                key=lambda c: {'FAIL': 0, 'UNKNOWN': 1, 'SKIP': 2, 'PASS': 3}.get(
+                    (c.get('status') or 'UNKNOWN').upper(), 4
+                )
+            )
+            for _c in _ctrl_sorted:
+                _cst   = (_c.get('status') or 'UNKNOWN').upper()
+                _cls   = {'FAIL': 'fail', 'PASS': 'pass', 'SKIP': 'skip'}.get(_cst, 'unknown')
+                _csev  = (_c.get('severity') or 'MEDIUM').lower()
+                _ev    = _evidence_list(_c.get('evidence') or [])
+                _ctid  = _esc(_c.get('control_id') or '')
+                _cttl  = _esc(_c.get('title') or '')
+                _cdesc = _esc(_c.get('description') or '')
+                _badge_st = {
+                    'FAIL':    '<span class="badge badge-critical">FAIL</span>',
+                    'PASS':    '<span class="badge badge-low">PASS</span>',
+                    'SKIP':    '<span class="badge badge-info">SKIP</span>',
+                    'UNKNOWN': '<span class="badge badge-medium">UNKNOWN</span>',
+                }.get(_cst, f'<span class="badge badge-info">{_esc(_cst)}</span>')
+                html += f'''
+                <div class="control-item {_cls}">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                        <span class="vuln-cve">{_ctid}</span>
+                        <div style="display:flex;gap:6px;">
+                            {_sev_badge(_csev)}
+                            {_badge_st}
+                        </div>
+                    </div>
+                    <div style="font-weight:500;margin-bottom:4px;">{_cttl}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;">{_cdesc}</div>
+                    {_ev}
+                </div>
+'''
+            if not comp_controls:
+                html += '<div style="color:var(--accent-green);">All evaluated compliance controls passed.</div>'
+        else:
+            html += '<div style="color:var(--text-secondary);padding:16px;">No compliance data available for this scan.</div>'
+
+        html += '''
+            </div>
+'''
+
+        # ===== SECTION: Exposure & Patch Risk =====
+        html += f'''
+            <!-- ===== Exposure & Patch Risk ===== -->
+            <div class="report-section" id="sec-exposure">
+                <h2 class="section-title">📡 Exposure &amp; Patch Risk</h2>
+'''
+        if exp_signals:
+            _exp_colour = 'var(--accent-orange)' if exp_crit or exp_high_cnt else 'var(--accent-yellow)'
+            html += f'''
+                <div class="summary-row">
+                    <div class="summary-pill">{exp_total} signal(s)</div>
+                    <div class="summary-pill" style="color:var(--accent-orange);">Critical: {exp_crit}</div>
+                    <div class="summary-pill" style="color:var(--accent-yellow);">High: {exp_high_cnt}</div>
+                    <div class="summary-pill">Medium: {exp_med}</div>
+                    <div class="summary-pill">Low: {exp_low}</div>
+                </div>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:16px;font-style:italic;">
+                    Signals marked <em>heuristic</em> are derived from version string pattern matching
+                    and may not reflect the actual patch state. Verify before acting.
+                </p>
+'''
+            for _sig in sorted(exp_signals, key=lambda s: _SEV_ORDER.get((s.get('severity') or 'INFO').upper(), 5)):
+                _sev_s = (_sig.get('severity') or 'MEDIUM').lower()
+                _conf_label = _esc(_sig.get('confidence_label') or 'MEDIUM')
                 _heur_badge = (
                     '<span style="font-size:10px;padding:1px 5px;border-radius:3px;'
                     'background:#30363d;color:#8b949e;margin-left:6px;">heuristic</span>'
                     if _sig.get('heuristic') else ''
                 )
-                _ev_items = ''.join(
-                    f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                    for e in (_sig.get('evidence') or [])
-                )
-                _exp_rows += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_sig.get('signal_id','')}</span>
-                        <span class="badge badge-{_sev}">{_sig.get('severity','MEDIUM')}</span>
-                        <span style="font-size:11px;color:var(--text-secondary);margin-left:8px;">confidence: {_conf_label}</span>
-                        {_heur_badge}
+                _ev = _evidence_list(_sig.get('evidence') or [])
+                _sid   = _esc(_sig.get('signal_id') or '')
+                _stl   = _esc(_sig.get('title') or '')
+                _sdesc = _esc(_sig.get('description') or '')
+                html += f'''
+                <div class="finding-item" data-severity="{_sev_s}" data-category="exposure">
+                    <div class="finding-header">
+                        <div class="finding-meta">
+                            <span class="vuln-cve">{_sid}</span>
+                            {_sev_badge(_sev_s)}{_heur_badge}
+                            <span style="font-size:11px;color:var(--text-secondary);">confidence: {_conf_label}</span>
+                        </div>
                     </div>
-                    <div style="font-weight:500;margin-bottom:6px;">{_sig.get('title','')}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:6px;">{_sig.get('description','')}</div>
-                    <ul style="padding-left:16px;">{_ev_items}</ul>
-                </div>'''
-            html += f'''
-        <div class="section">
-            <div class="section-header">Exposure &amp; Patch Risk</div>
-            <div style="padding: 20px;">
-                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
-                    {_exp_total} exposure signal(s) detected ·
-                    <span style="color:{_exp_status_colour};">critical={_exp_crit}</span> ·
-                    high={_exp_high} · medium={_exp_med} · low={_exp_low}
-                </p>
-                <p style="margin-bottom:16px; color: var(--text-secondary); font-size:12px; font-style:italic;">
-                    Signals marked <em>heuristic</em> are derived from version string pattern
-                    matching and may not reflect the actual patch state.  Verify before acting.
-                </p>
-                {_exp_rows}
+                    <div style="font-weight:500;margin-bottom:4px;">{_stl}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;">{_sdesc}</div>
+                    {_ev}
+                </div>
+'''
+        else:
+            html += '<div style="color:var(--text-secondary);padding:16px;">No exposure signals detected for this scan.</div>'
+
+        html += '''
             </div>
-        </div>
 '''
 
-        # Web Posture section
-        web_posture = self.results.get('web_posture', {})
-        _web_targets = web_posture.get('targets', [])
-        if _web_targets:
-            _web_total    = web_posture.get('total_findings', 0)
-            _web_summary  = web_posture.get('summary', {})
-            _web_crit     = _web_summary.get('critical', 0)
-            _web_high     = _web_summary.get('high', 0)
-            _web_med      = _web_summary.get('medium', 0)
-            _web_low      = _web_summary.get('low', 0)
-            _web_info     = _web_summary.get('info', 0)
-            _web_colour   = (
-                'var(--accent-orange)' if _web_crit or _web_high else 'var(--accent-yellow)'
-            )
-            _web_rows = ''
-            for _wt in _web_targets:
-                _target_url = _wt.get('url', '')
+        # ===== SECTION: Web Posture =====
+        if web_targets:
+            html += f'''
+            <!-- ===== Web Application Posture ===== -->
+            <div class="report-section" id="sec-web">
+                <h2 class="section-title">🌐 Web Application Posture</h2>
+                <div class="summary-row">
+                    <div class="summary-pill">{web_total} finding(s) across {len(web_targets)} target(s)</div>
+                    <div class="summary-pill" style="color:var(--accent-orange);">Critical: {web_crit}</div>
+                    <div class="summary-pill" style="color:var(--accent-yellow);">High: {web_high_cnt}</div>
+                    <div class="summary-pill">Medium: {web_med}</div>
+                    <div class="summary-pill">Low: {web_low}</div>
+                    <div class="summary-pill">Info: {web_info_cnt}</div>
+                </div>
+                <p style="font-size:12px;color:var(--text-secondary);margin-bottom:16px;font-style:italic;">
+                    All checks are safe, non-exploit, and non-destructive.
+                    Evidence is redacted — no authentication material is stored.
+                </p>
+'''
+            for _wt in web_targets:
+                _wurl = _esc(_wt.get('url', ''))
                 if _wt.get('error'):
-                    _web_rows += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span style="font-family:monospace;color:var(--text-secondary);">{_target_url}</span>
-                        <span class="badge badge-low">ERROR</span>
+                    html += f'''
+                <div class="finding-item" data-category="web" data-severity="info">
+                    <div class="finding-header">
+                        <span class="vuln-cve">{_wurl}</span>
+                        <span class="badge badge-info">ERROR</span>
                     </div>
-                    <div style="color:var(--text-secondary);font-size:13px;">{_wt.get('error','')}</div>
-                </div>'''
+                    <div style="color:var(--text-secondary);font-size:13px;">{_esc(_wt.get("error", ""))}</div>
+                </div>
+'''
                     continue
                 for _wf in _wt.get('findings', []):
-                    _sev = (_wf.get('severity') or 'INFO').lower()
-                    _conf_label = _wf.get('confidence_label', 'MEDIUM')
-                    _ev_items = ''.join(
-                        f'<li style="font-size:12px;color:var(--text-secondary);">{e}</li>'
-                        for e in (_wf.get('evidence') or [])
+                    _wsev  = (_wf.get('severity') or 'INFO').lower()
+                    _wconf = _esc(_wf.get('confidence_label') or 'MEDIUM')
+                    _ev    = _evidence_list(_wf.get('evidence') or [])
+                    _rem   = _wf.get('remediation', '')
+                    _rem_h = (
+                        f'<div style="font-size:12px;margin-top:6px;color:var(--accent-green);">Remediation: {_esc(_rem)}</div>'
+                        if _rem else ''
                     )
-                    _rem = _wf.get('remediation', '')
-                    _web_rows += f'''
-                <div class="vuln-item">
-                    <div class="vuln-header">
-                        <span style="font-family:monospace;font-weight:600;color:var(--accent-blue);">{_wf.get('finding_id','')}</span>
-                        <span class="badge badge-{_sev}">{_wf.get('severity','INFO')}</span>
-                        <span style="font-size:11px;color:var(--text-secondary);margin-left:8px;">confidence: {_conf_label}</span>
+                    _wfid  = _esc(_wf.get('finding_id') or '')
+                    _wftl  = _esc(_wf.get('title') or '')
+                    _wfdesc= _esc(_wf.get('description') or '')
+                    html += f'''
+                <div class="finding-item" data-category="web" data-severity="{_esc(_wsev)}">
+                    <div class="finding-header">
+                        <div class="finding-meta">
+                            <span class="vuln-cve">{_wfid}</span>
+                            {_sev_badge(_wsev)}
+                            <span style="font-size:11px;color:var(--text-secondary);">confidence: {_wconf}</span>
+                        </div>
+                        <span style="font-size:11px;color:var(--text-secondary);">Target: {_wurl}</span>
                     </div>
-                    <div style="font-weight:500;margin-bottom:4px;">{_wf.get('title','')}</div>
-                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:4px;">{_wf.get('description','')}</div>
-                    <ul style="padding-left:16px;">{_ev_items}</ul>
-                    {f'<div style="font-size:12px;margin-top:4px;color:var(--accent-green);">Remediation: {_rem}</div>' if _rem else ''}
-                    <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">Target: {_target_url}</div>
-                </div>'''
-            html += f'''
-        <div class="section">
-            <div class="section-header">Web Application Posture</div>
-            <div style="padding: 20px;">
-                <p style="margin-bottom:12px; color: var(--text-secondary); font-size:13px;">
-                    {_web_total} web finding(s) across {len(_web_targets)} target(s) ·
-                    <span style="color:{_web_colour};">critical={_web_crit}</span> ·
-                    high={_web_high} · medium={_web_med} · low={_web_low} · info={_web_info}
-                </p>
-                <p style="margin-bottom:16px; color: var(--text-secondary); font-size:12px; font-style:italic;">
-                    All checks are safe, non-exploit, and non-destructive.  Evidence is
-                    redacted — no authentication material is stored.
-                </p>
-                {_web_rows}
+                    <div style="font-weight:500;margin-bottom:4px;">{_wftl}</div>
+                    <div style="color:var(--text-secondary);font-size:13px;margin-bottom:4px;">{_wfdesc}</div>
+                    {_ev}
+                    {_rem_h}
+                </div>
+'''
+            html += '''
             </div>
-        </div>
 '''
 
+        # ===== TCP Ports table (within Assets section header or standalone card) =====
+        if open_ports or udp_ports or tls_scan:
+            html += '''
+            <!-- ===== Ports / Services Detail ===== -->
+            <div class="report-section" id="sec-ports">
+                <h2 class="section-title">🔌 Ports &amp; Services Detail</h2>
+'''
+            if open_ports:
+                html += '''
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">🔓 Open TCP Ports</span>
+                    </div>
+                    <div class="card-body">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Port</th><th>Service</th><th>State</th>
+                                    <th>Protocol</th><th>Version</th><th>Banner</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+'''
+                for _p in open_ports:
+                    _fp = _p.get('fingerprint') or {}
+                    _ver = _esc(_fp.get('version') or '')
+                    html += (
+                        f'<tr>'
+                        f'<td><strong>{_esc(str(_p["port"]))}</strong></td>'
+                        f'<td>{_esc(_p.get("service",""))}</td>'
+                        f'<td>{_esc(_p.get("state","open"))}</td>'
+                        f'<td>{_esc(_p.get("protocol","tcp"))}</td>'
+                        f'<td style="font-size:11px;opacity:0.8;">{_ver}</td>'
+                        f'<td style="font-family:monospace;font-size:11px;opacity:0.7;">'
+                        f'{_esc((_p.get("banner","") or "")[:60])}</td>'
+                        f'</tr>\n'
+                    )
+                html += '''
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+'''
+            if udp_ports:
+                html += '''
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">📡 UDP Ports</span>
+                    </div>
+                    <div class="card-body">
+                        <table>
+                            <thead>
+                                <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>
+                            </thead>
+                            <tbody>
+'''
+                for _p in udp_ports:
+                    _state = _esc(_p.get('state') or 'open|filtered')
+                    _sc = '#3fb950' if _p.get('state') == 'open' else '#d29922'
+                    html += (
+                        f'<tr>'
+                        f'<td><strong>{_esc(str(_p["port"]))}</strong></td>'
+                        f'<td>{_esc(_p.get("service",""))}</td>'
+                        f'<td style="color:{_sc};">{_state}</td>'
+                        f'<td style="font-family:monospace;font-size:11px;opacity:0.7;">'
+                        f'{_esc((_p.get("banner","") or "")[:50])}</td>'
+                        f'</tr>\n'
+                    )
+                html += '''
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+'''
+            # TLS table
+            if tls_scan:
+                _inspected = {k: v for k, v in tls_scan.items() if not v.get('error')}
+                if _inspected:
+                    html += '''
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">🔐 TLS / SSL Inspection</span>
+                    </div>
+                    <div class="card-body">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Port</th><th>Protocol</th><th>Cipher</th><th>Bits</th>
+                                    <th>FS</th><th>ALPN</th><th>Cert CN</th>
+                                    <th>Cert Expires</th><th>Trusted</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+'''
+                    for _port_str, _info in sorted(_inspected.items(), key=_port_sort_key):
+                        _cert   = _info.get('cert_info') or {}
+                        _notaft = (_cert.get('not_after') or '')
+                        _exp_d  = _notaft[:10] if _notaft else 'n/a'
+                        _fs_i   = '✅' if _info.get('has_forward_secrecy') else '❌'
+                        _tr_i   = '✅' if _cert.get('chain_trusted') else '⚠️'
+                        html += (
+                            f'<tr>'
+                            f'<td><strong>{_esc(_port_str)}</strong></td>'
+                            f'<td>{_esc(_info.get("protocol_display","unknown"))}</td>'
+                            f'<td style="font-family:monospace;font-size:11px;">{_esc(_info.get("cipher_name","n/a"))}</td>'
+                            f'<td>{_esc(str(_info.get("cipher_bits","n/a")))}</td>'
+                            f'<td style="text-align:center;">{_fs_i}</td>'
+                            f'<td>{_esc(_info.get("alpn") or "n/a")}</td>'
+                            f'<td style="font-size:12px;">{_esc(_cert.get("subject_cn") or "n/a")}</td>'
+                            f'<td style="font-size:12px;">{_esc(_exp_d)}</td>'
+                            f'<td style="text-align:center;">{_tr_i}</td>'
+                            f'</tr>\n'
+                        )
+                    html += '''
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+'''
+            html += '''
+            </div>
+'''
+
+        # ===== Footer =====
         html += f'''
-        <div class="footer">
-            <div style="font-size: 14px; margin-bottom: 8px;">Vultron v8.0 - Security Assessment</div>
-            <div>Author: Azazi</div>
-            <div style="margin-top: 12px; font-size: 13px; opacity: 0.7;">Report Generated: {timestamp[:19]}</div>
+            <div class="footer">
+                <div>Vultron v{_esc(VERSION)} — Security Assessment Report</div>
+                <div>Author: Azazi</div>
+                <div style="margin-top:8px;opacity:0.7;">
+                    Report Generated: {_esc(timestamp[:19])} &nbsp;|&nbsp;
+                    This report may contain sensitive data — handle accordingly.
+                </div>
+            </div>
         </div>
     </div>
+
+    <!-- ===== Client-side JS ===== -->
+    <script>
+    // ----- Navigation -----
+    function setActive(el) {{
+        document.querySelectorAll('.nav-link').forEach(function(l) {{ l.classList.remove('active'); }});
+        el.classList.add('active');
+    }}
+
+    // Scroll-spy to update active nav link
+    (function() {{
+        var sections = document.querySelectorAll('.report-section[id]');
+        var navLinks = document.querySelectorAll('.sidebar .nav-link');
+        var mainEl   = document.getElementById('main-content');
+        if (!mainEl) return;
+        mainEl.addEventListener('scroll', function() {{
+            var scrollTop = mainEl.scrollTop + 80;
+            var active    = null;
+            sections.forEach(function(s) {{
+                if (s.offsetTop <= scrollTop) active = s.id;
+            }});
+            if (active) {{
+                navLinks.forEach(function(l) {{
+                    l.classList.toggle('active', l.getAttribute('href') === '#' + active);
+                }});
+            }}
+        }}, {{ passive: true }});
+    }})();
+
+    // ----- Finding filters -----
+    function applyFilters() {{
+        var sev   = document.getElementById('f-severity').value.toLowerCase();
+        var st    = document.getElementById('f-status').value.toLowerCase();
+        var cat   = document.getElementById('f-category').value.toLowerCase();
+        var host  = document.getElementById('f-host').value;
+        var minC  = parseFloat(document.getElementById('f-confidence').value) || 0;
+
+        var items = document.querySelectorAll('#findings-list .finding-item');
+        var shown = 0;
+        items.forEach(function(item) {{
+            var ok = true;
+            if (sev  && item.dataset.severity  !== sev)  ok = false;
+            if (st   && item.dataset.status    !== st)   ok = false;
+            if (cat  && item.dataset.category  !== cat)  ok = false;
+            if (host && item.dataset.host      !== host) ok = false;
+            if (minC > 0 && parseFloat(item.dataset.confidence || 0) < minC) ok = false;
+            item.style.display = ok ? '' : 'none';
+            if (ok) shown++;
+        }});
+        var countEl = document.getElementById('filter-count');
+        if (countEl) countEl.textContent = shown + ' / ' + items.length + ' shown';
+    }}
+
+    function resetFilters() {{
+        ['f-severity','f-status','f-category','f-host','f-confidence'].forEach(function(id) {{
+            var el = document.getElementById(id);
+            if (el) el.value = '';
+        }});
+        document.getElementById('f-confidence').value = '0';
+        applyFilters();
+    }}
+
+    // Init filter count on load
+    window.addEventListener('DOMContentLoaded', function() {{
+        applyFilters();
+    }});
+
+    // ----- Host search -----
+    function filterHosts() {{
+        var q     = (document.getElementById('host-search').value || '').toLowerCase();
+        var cards = document.querySelectorAll('#host-list .host-card');
+        cards.forEach(function(c) {{
+            var text = (c.textContent || '').toLowerCase();
+            c.style.display = (!q || text.indexOf(q) !== -1) ? '' : 'none';
+        }});
+    }}
+
+    // ----- Finding detail toggle -----
+    function toggleDetail(id) {{
+        var el     = document.getElementById(id);
+        var toggle = document.getElementById('toggle-' + id);
+        if (!el) return;
+        if (el.style.display === 'none' || el.style.display === '') {{
+            el.style.display = 'block';
+            if (toggle) toggle.textContent = '▲ Close';
+        }} else {{
+            el.style.display = 'none';
+            if (toggle) toggle.textContent = '▼ Details';
+        }}
+    }}
+    </script>
 </body>
 </html>'''
 
