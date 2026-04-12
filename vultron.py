@@ -1351,14 +1351,16 @@ class ReportGenerator:
         # Inventory assets
         inv_assets = inventory.get('assets', []) or []
 
-        # Collect unique host names / IPs for filter dropdown
-        host_set: List[str] = []
+        # Collect unique host names / IPs for filter dropdown (ordered, unique)
+        _seen_hosts: set = set()
+        host_list: List[str] = []
         for _a in inv_assets:
             h = _a.get('ip') or _a.get('hostname') or ''
-            if h and h not in host_set:
-                host_set.append(h)
-        if not host_set:
-            host_set = [target]
+            if h and h not in _seen_hosts:
+                _seen_hosts.add(h)
+                host_list.append(h)
+        if not host_list:
+            host_list = [target]
 
         # ---- helpers for per-finding cards ----
         def _sev_badge(sev: str) -> str:
@@ -1389,8 +1391,10 @@ class ReportGenerator:
             try:
                 from plugins.secrets import redact_string as _redact
             except ImportError:
-                def _redact(x):
-                    return x
+                # If secrets module is unavailable, replace every evidence item
+                # with a placeholder so no potentially sensitive data leaks.
+                def _redact(x: str) -> str:  # type: ignore[misc]
+                    return '[evidence unavailable — secrets module not loaded]'
             li_items = ''.join(
                 f'<li style="font-size:12px;color:var(--text-secondary);">{_esc(_redact(str(e)))}</li>'
                 for e in (items or [])
@@ -1410,11 +1414,24 @@ class ReportGenerator:
                 f'<ul style="padding-left:16px;">{li_items}</ul></div>'
             )
 
+        # Maximum number of cloud/metadata tags to show per host card
+        _MAX_CLOUD_TAGS = 10
+
+        # Helper: sort port/service dict items by numeric port value
+        def _port_sort_key(item):
+            port_str = str(item[0])
+            return int(port_str) if port_str.isdigit() else 0
+
+        # Counter for unique HTML element IDs (avoids relying on Python id())
+        _card_counter = [0]
+
         def _finding_card(v: Dict, category: str = 'vuln') -> str:
+            _card_counter[0] += 1
             sev     = (v.get('severity') or 'INFO').lower()
             st      = (v.get('status') or 'INCONCLUSIVE').upper()
             conf    = v.get('confidence', 0.5)
-            host_id = _esc(v.get('target') or target)
+            raw_host = v.get('target') or target
+            host_id = _esc(raw_host)
             kev_badge = '<span class="badge badge-kev">KEV</span> ' if v.get('cisa_kev') else ''
             heur_badge = (
                 '<span style="font-size:10px;padding:1px 5px;border-radius:3px;'
@@ -1443,7 +1460,8 @@ class ReportGenerator:
                 f'<div style="font-size:12px;margin-top:6px;color:var(--accent-green);">Remediation: {_esc(rem)}</div>'
                 if rem else ''
             )
-            card_id = f'finding-{_esc(cve_id)}-{_esc(str(id(v)))}'
+            card_id = f'finding-card-{_card_counter[0]}'
+            show_host = (raw_host != target)
             return (
                 f'<div class="finding-item" '
                 f'data-severity="{_esc(sev)}" '
@@ -1458,7 +1476,7 @@ class ReportGenerator:
                 f'  </div>'
                 f'  <div style="font-size:11px;color:var(--text-secondary);display:flex;gap:12px;align-items:center;">'
                 f'    <span>📊 {int(conf * 100)}% confidence</span>'
-                f'    {f"<span>Host: {host_id}</span>" if host_id != _esc(target) else ""}'
+                f'    {f"<span>Host: {host_id}</span>" if show_host else ""}'
                 f'    <span class="detail-toggle" id="toggle-{card_id}">▼ Details</span>'
                 f'  </div>'
                 f'</div>'
@@ -1985,7 +2003,7 @@ class ReportGenerator:
         # ===== SECTION: Findings =====
         # Build unique host options for filter
         _host_opts = ''.join(
-            f'<option value="{_esc(h)}">{_esc(h)}</option>' for h in host_set
+            f'<option value="{_esc(h)}">{_esc(h)}</option>' for h in host_list
         )
         html += f'''
             <!-- ===== Findings ===== -->
@@ -2093,13 +2111,13 @@ class ReportGenerator:
                 _tags     = _a.get('tags') or {}
                 _cloud_rows = ''
                 if _tags:
-                    for _tk, _tv in sorted((_tags or {}).items())[:10]:
+                    for _tk, _tv in sorted((_tags or {}).items())[:_MAX_CLOUD_TAGS]:
                         _cloud_rows += (
                             f'<tr><td style="font-size:11px;color:var(--text-secondary);">{_esc(_tk)}</td>'
                             f'<td style="font-size:11px;">{_esc(str(_tv))}</td></tr>'
                         )
                 _tcp_rows = ''
-                for _p, _svc in sorted(_tcp_svcs.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)[:20]:
+                for _p, _svc in sorted(_tcp_svcs.items(), key=_port_sort_key)[:20]:
                     _svc_name = _esc(_svc.get('service') or _svc.get('name') or '')
                     _version  = _esc(_svc.get('version') or '')
                     _tcp_rows += (
@@ -2107,16 +2125,20 @@ class ReportGenerator:
                         f'<td>{_svc_name}</td><td style="font-size:11px;opacity:0.8;">{_version}</td></tr>'
                     )
                 _udp_rows = ''
-                for _p, _svc in sorted(_udp_svcs.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)[:10]:
+                for _p, _svc in sorted(_udp_svcs.items(), key=_port_sort_key)[:10]:
                     _svc_name = _esc(_svc.get('service') or _svc.get('name') or '')
                     _udp_rows += (
                         f'<tr><td><strong>{_esc(str(_p))}</strong>/udp</td>'
                         f'<td>{_svc_name}</td><td></td></tr>'
                     )
-                # Count findings for this host
+                # Count findings for this host using explicit None-safe matching
+                _asset_identifiers = {
+                    x for x in (_a.get('ip'), _a.get('hostname'), target)
+                    if x is not None
+                }
                 _host_finding_cnt = sum(
                     1 for v in all_vulns_sorted
-                    if (v.get('target') or target) in (_a.get('ip', ''), _a.get('hostname', ''), target)
+                    if v.get('target') in _asset_identifiers
                 )
                 html += f'''
                 <div class="host-card" data-host-id="{_ip}">
@@ -2472,7 +2494,7 @@ class ReportGenerator:
                             </thead>
                             <tbody>
 '''
-                    for _port_str, _info in sorted(_inspected.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0):
+                    for _port_str, _info in sorted(_inspected.items(), key=_port_sort_key):
                         _cert   = _info.get('cert_info') or {}
                         _notaft = (_cert.get('not_after') or '')
                         _exp_d  = _notaft[:10] if _notaft else 'n/a'
