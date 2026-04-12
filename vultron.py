@@ -2479,7 +2479,51 @@ class HybridScanner:
         print(Colors.success(f"\nReports: {report_files}\n"))
 
 
+def _ui_main(argv=None):
+    """Entry point for the `vulntron ui` subcommand (P10)."""
+    import argparse as _ap
+    p = _ap.ArgumentParser(
+        prog='vultron ui',
+        description='Vulntron UI – local read-only Nessus-like web dashboard (P10)',
+    )
+    p.add_argument(
+        '--data-dir', required=True, metavar='DIR',
+        help='Directory containing Vulntron JSON scan output files',
+    )
+    p.add_argument(
+        '--host', default='127.0.0.1', metavar='HOST',
+        help='Bind address for the UI server (default: 127.0.0.1)',
+    )
+    p.add_argument(
+        '--port', type=int, default=8000, metavar='PORT',
+        help='TCP port for the UI server (default: 8000)',
+    )
+    p.add_argument(
+        '--open-browser', action='store_true',
+        help='Open the default web browser after the server starts',
+    )
+    args = p.parse_args(argv)
+
+    try:
+        from plugins.ui import run_server
+    except ImportError as exc:
+        print(f"[ERROR] Could not import Vulntron UI module: {exc}")
+        sys.exit(1)
+
+    run_server(
+        data_dir=args.data_dir,
+        host=args.host,
+        port=args.port,
+        open_browser=args.open_browser,
+    )
+
+
 def main():
+    # ── P10: 'ui' subcommand ─────────────────────────────────────────────────
+    if len(sys.argv) > 1 and sys.argv[1] == 'ui':
+        _ui_main(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(
         description='Vultron v8.0 - Defensive Vulnerability Assessment Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,

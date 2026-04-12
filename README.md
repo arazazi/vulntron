@@ -33,7 +33,8 @@
 8. [Compliance & Configuration Baseline](#-compliance--configuration-baseline)
 9. [Exposure & Patch Risk Detection](#-exposure--patch-risk-detection)
 10. [Web Application Posture Scanner (P8)](#-web-application-posture-scanner-p8)
-11. [Installation](#-installation)
+11. [Local Web UI Dashboard (P10)](#-local-web-ui-dashboard-p10)
+12. [Installation](#-installation)
 12. [Quick Start](#-quick-start)
 13. [CLI Reference](#-cli-reference)
 14. [Understanding Results](#-understanding-results)
@@ -1459,6 +1460,99 @@ Summary counters (e.g., "Critical: 1") count only **CONFIRMED** findings at that
 ### Why Timeouts Are Not Vulnerabilities
 
 A `--scan-mode full` scan or a low `--timeout` value may produce many INCONCLUSIVE findings on filtered or slow ports. This is expected behaviour; it does not mean those services are vulnerable. Increase `--timeout` and `--retries` and re-run the targeted check if you need a definitive answer.
+
+---
+
+## 🖥️ Local Web UI Dashboard (P10)
+
+> **P10 feature** — available in Vulntron v8.0.0+.
+
+Vulntron ships with a local, read-only **Nessus-like web dashboard** for browsing scan results without leaving your terminal workflow.
+
+### Overview
+
+| Feature | Details |
+|---|---|
+| Backend | FastAPI (Python) |
+| Frontend | Embedded HTML/Vanilla JS (no build step) |
+| Binding | `127.0.0.1` only by default (local-only) |
+| Data source | Vulntron JSON report files (`*.json`) in a directory |
+| Safety | Read-only; no scanning or exploitation; secrets redacted |
+
+### Quick Start
+
+**1. Generate JSON report output from a scan:**
+
+```bash
+python vultron.py -t 192.168.1.100
+# Produces: vultron_hybrid_192.168.1.100_<timestamp>.json
+```
+
+**2. Launch the UI:**
+
+```bash
+python vultron.py ui --data-dir ./   # current dir
+python vultron.py ui --data-dir /path/to/runs --port 8080
+python vultron.py ui --data-dir ./runs --open-browser
+```
+
+**3. Open in your browser:**
+
+```
+http://127.0.0.1:8000
+```
+
+### CLI Options
+
+```
+python vultron.py ui [options]
+
+Required:
+  --data-dir DIR      Directory containing Vulntron JSON scan output files
+
+Optional:
+  --host HOST         Bind address (default: 127.0.0.1)
+  --port PORT         TCP port (default: 8000)
+  --open-browser      Open the default web browser after server starts
+```
+
+### Dashboard Features
+
+| View | Description |
+|---|---|
+| **Dashboard** | Summary cards: total findings, severity counts, compliance status, exposure signals, web posture findings, scan metadata |
+| **Hosts** | Searchable host list with per-host severity badges and compliance status |
+| **Host Detail** | Per-host tabbed view: Ports & Services, Vulnerabilities, Compliance, Exposure, Web Posture |
+| **Findings** | All findings with filters: severity, status, category, confidence, text search |
+| **Finding Detail** | Full finding: description, severity/confidence, evidence (redacted), CVE links |
+| **Compliance** | Baseline compliance controls with PASS/FAIL/UNKNOWN status |
+| **Exposure** | Exposure signals and patch-risk indicators |
+| **Web Posture** | Web application posture findings per target URL |
+
+### Multiple Runs
+
+Point `--data-dir` at a directory containing multiple JSON report files. The UI run selector (top-left dropdown) lists all discovered runs sorted newest-first. Select any run to browse it.
+
+### Safety & Privacy
+
+- The server binds to `127.0.0.1` by default — it is **not** accessible from other machines.
+- All displayed evidence is passed through Vulntron's existing secret-redaction logic (`plugins.secrets.deep_redact_dict`), so credential-like values are masked.
+- A prominent **AUTHORIZED USE ONLY** warning banner is displayed at the top of every page.
+- The UI is **strictly read-only** — it loads and displays existing JSON files. No scanning, no exploitation.
+
+### Dependencies
+
+Install UI dependencies (already included in `requirements.txt`):
+
+```bash
+pip install fastapi>=0.110.0 uvicorn>=0.29.0
+```
+
+Or install everything at once:
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 

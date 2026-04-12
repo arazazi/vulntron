@@ -10,6 +10,11 @@ requests>=2.31.0
 # System and process utilities (optional, fallback to wmic if not available)
 psutil>=5.9.0
 
+# P10 – Local Nessus-like Web UI
+fastapi>=0.110.0
+uvicorn>=0.29.0
+httpx>=0.27.0  # required by fastapi TestClient (testing only)
+
 # Standard library packages (included with Python 3.12+)
 # - platform
 # - subprocess
