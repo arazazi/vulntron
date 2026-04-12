@@ -6924,3 +6924,407 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+# ---------------------------------------------------------------------------
+# P9: HTML Report Overhaul Tests
+# ---------------------------------------------------------------------------
+
+class TestP9HTMLReportStructure(unittest.TestCase):
+    """P9: New HTML report has required structural elements."""
+
+    def _make_results(self, findings=None, compliance=None, exposure=None,
+                      web_posture=None, inventory=None):
+        from datetime import datetime
+        return {
+            "target": "10.0.0.1",
+            "timestamp": datetime.now().isoformat(),
+            "scanner_version": "8.0.0",
+            "scan_mode": "common",
+            "scan_protocol": "tcp",
+            "cve_lookback_days": 120,
+            "open_ports": [],
+            "udp_ports": [],
+            "vulnerabilities": findings or [],
+            "compliance": compliance or {},
+            "exposure": exposure or {},
+            "web_posture": web_posture or {},
+            "inventory": inventory or {},
+            "tls_scan": {},
+        }
+
+    def _generate_html(self, results):
+        import tempfile
+        import os
+        from vultron import ReportGenerator
+        with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+            path = f.name
+        try:
+            ReportGenerator(results).generate_html(path)
+            with open(path, encoding='utf-8') as fh:
+                return fh.read()
+        finally:
+            os.unlink(path)
+
+    def test_warning_banner_present(self):
+        """HTML report must contain an AUTHORIZED USE ONLY warning banner."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('AUTHORIZED USE ONLY', html)
+
+    def test_warning_banner_is_prominent(self):
+        """Warning banner class must be present and early in the HTML."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('warning-banner', html)
+        # Banner should appear before main content
+        warn_pos = html.find('warning-banner')
+        nav_pos  = html.find('sidebar')
+        self.assertLess(warn_pos, nav_pos, "Warning banner should precede sidebar nav")
+
+    def test_sidebar_navigation_present(self):
+        """HTML report must include a sidebar navigation section."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('sidebar', html)
+        self.assertIn('sec-dashboard', html)
+        self.assertIn('sec-findings', html)
+        self.assertIn('sec-assets', html)
+        self.assertIn('sec-compliance', html)
+        self.assertIn('sec-exposure', html)
+
+    def test_dashboard_section_present(self):
+        """Dashboard section with summary stats must be rendered."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('sec-dashboard', html)
+        self.assertIn('Dashboard', html)
+
+    def test_dashboard_shows_total_assets(self):
+        """Dashboard must display total assets stat card."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('Total Assets', html)
+
+    def test_dashboard_shows_risk_score(self):
+        """Dashboard must include Risk Score card."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('Risk Score', html)
+
+    def test_dashboard_shows_compliance_summary(self):
+        """Dashboard shows compliance mini-card when compliance data present."""
+        comp = {
+            'status': 'FAIL',
+            'profile': 'baseline',
+            'summary': {'pass': 5, 'fail': 2, 'skip': 1, 'unknown': 0},
+            'controls': [],
+        }
+        html = self._generate_html(self._make_results(compliance=comp))
+        self.assertIn('Compliance', html)
+        self.assertIn('FAIL', html)
+
+    def test_dashboard_shows_exposure_summary(self):
+        """Dashboard shows exposure mini-card when exposure data is present."""
+        exp = {
+            'signals': [{'signal_id': 'EXP-001', 'title': 'Test signal',
+                         'severity': 'HIGH', 'description': 'test',
+                         'confidence_label': 'HIGH', 'evidence': [],
+                         'heuristic': False}],
+            'summary': {'critical': 0, 'high': 1, 'medium': 0, 'low': 0},
+            'signal_count': 1,
+        }
+        html = self._generate_html(self._make_results(exposure=exp))
+        self.assertIn('Exposure', html)
+
+    def test_findings_section_has_filter_bar(self):
+        """Findings section must include a filter bar with severity/status dropdowns."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('filter-bar', html)
+        self.assertIn('f-severity', html)
+        self.assertIn('f-status', html)
+        self.assertIn('f-category', html)
+        self.assertIn('f-host', html)
+        self.assertIn('f-confidence', html)
+
+    def test_findings_filtered_by_js(self):
+        """HTML report includes JS applyFilters function for client-side filtering."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('applyFilters', html)
+        self.assertIn('resetFilters', html)
+
+    def test_finding_card_has_data_attributes(self):
+        """Finding cards include data-severity, data-status, data-category attrs."""
+        finding = {
+            'id': 'T-P9', 'cve': 'CVE-2024-9999', 'name': 'P9TestFinding',
+            'title': 'P9 Test Finding', 'severity': 'HIGH', 'status': 'CONFIRMED',
+            'port': 443, 'affected_service': 'HTTPS', 'description': 'P9 test.',
+            'evidence': ['proof of concept'], 'cisa_kev': False,
+            'exploit_available': False, 'cvss': 7.5,
+            'confidence': 0.9, 'cve_refs': [], 'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertIn('data-severity="high"', html)
+        self.assertIn('data-status="confirmed"', html)
+        self.assertIn('data-confidence="0.9"', html)
+
+    def test_finding_detail_toggle_present(self):
+        """Finding cards must include expandable detail panels."""
+        finding = {
+            'id': 'T-P9B', 'cve': 'N/A', 'name': 'P9Detail',
+            'title': 'Detail Toggle Test', 'severity': 'MEDIUM', 'status': 'POTENTIAL',
+            'port': 80, 'affected_service': 'HTTP', 'description': 'Test desc.',
+            'evidence': ['evidence item'], 'cisa_kev': False,
+            'exploit_available': False, 'cvss': 5.0,
+            'confidence': 0.5, 'cve_refs': [], 'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertIn('toggleDetail', html)
+        self.assertIn('finding-detail', html)
+
+    def test_assets_section_present(self):
+        """HTML report renders an Assets/Hosts section."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('sec-assets', html)
+        self.assertIn('Assets', html)
+
+    def test_host_search_present(self):
+        """Assets section includes a search input for filtering hosts."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('host-search', html)
+        self.assertIn('filterHosts', html)
+
+    def test_assets_shows_inventory_host(self):
+        """When inventory data present, host card is rendered with IP."""
+        inv = {
+            'snapshot_id': 'snap-001',
+            'assets': [{
+                'ip': '10.0.0.1', 'hostname': 'testhost.local',
+                'role': 'server', 'risk_level': 'high',
+                'tcp_services': {'443': {'service': 'https', 'version': ''}},
+                'udp_services': {},
+                'os_hints': [],
+                'tags': {'env': 'prod'},
+                'exposure_summary': 'TLS issues detected',
+            }],
+        }
+        html = self._generate_html(self._make_results(inventory=inv))
+        self.assertIn('10.0.0.1', html)
+        self.assertIn('testhost.local', html)
+        self.assertIn('server', html)
+
+    def test_assets_cloud_tags_rendered(self):
+        """Cloud/tag metadata is rendered in the host card when present."""
+        inv = {
+            'snapshot_id': 'snap-002',
+            'assets': [{
+                'ip': '172.16.0.5', 'hostname': None,
+                'role': 'database', 'risk_level': 'critical',
+                'tcp_services': {}, 'udp_services': {},
+                'os_hints': [],
+                'tags': {'cloud': 'aws', 'region': 'us-east-1'},
+                'exposure_summary': '',
+            }],
+        }
+        html = self._generate_html(self._make_results(inventory=inv))
+        self.assertIn('aws', html)
+        self.assertIn('us-east-1', html)
+
+    def test_compliance_section_all_controls_rendered(self):
+        """Compliance section renders all controls, not just failed ones."""
+        comp = {
+            'status': 'FAIL',
+            'profile': 'baseline',
+            'summary': {'pass': 1, 'fail': 1, 'skip': 0, 'unknown': 0},
+            'controls': [
+                {
+                    'control_id': 'TLS-001', 'title': 'TLS Version Check',
+                    'severity': 'HIGH', 'status': 'FAIL',
+                    'description': 'TLS 1.0 detected.', 'evidence': ['TLS 1.0 on port 443'],
+                },
+                {
+                    'control_id': 'SVC-001', 'title': 'No Telnet',
+                    'severity': 'HIGH', 'status': 'PASS',
+                    'description': 'Telnet is not running.', 'evidence': [],
+                },
+            ],
+        }
+        html = self._generate_html(self._make_results(compliance=comp))
+        self.assertIn('TLS-001', html)
+        self.assertIn('SVC-001', html)
+        self.assertIn('TLS Version Check', html)
+        self.assertIn('No Telnet', html)
+
+    def test_compliance_failed_controls_shown_first(self):
+        """Compliance section renders FAIL controls before PASS controls."""
+        comp = {
+            'status': 'FAIL', 'profile': 'baseline',
+            'summary': {'pass': 1, 'fail': 1, 'skip': 0, 'unknown': 0},
+            'controls': [
+                {'control_id': 'PASS-001', 'title': 'Passing control', 'severity': 'LOW',
+                 'status': 'PASS', 'description': '', 'evidence': []},
+                {'control_id': 'FAIL-001', 'title': 'Failing control', 'severity': 'HIGH',
+                 'status': 'FAIL', 'description': '', 'evidence': ['found issue']},
+            ],
+        }
+        html = self._generate_html(self._make_results(compliance=comp))
+        self.assertLess(html.find('FAIL-001'), html.find('PASS-001'),
+                        "FAIL controls should appear before PASS controls")
+
+    def test_exposure_section_rendered(self):
+        """Exposure & Patch Risk section is rendered when signals present."""
+        exp = {
+            'signals': [{
+                'signal_id': 'RISKY-SVC-001', 'title': 'Risky Service',
+                'severity': 'HIGH', 'description': 'Port 23 open.',
+                'confidence_label': 'HIGH', 'evidence': ['Port 23/tcp open'],
+                'heuristic': False,
+            }],
+            'summary': {'critical': 0, 'high': 1, 'medium': 0, 'low': 0},
+            'signal_count': 1,
+        }
+        html = self._generate_html(self._make_results(exposure=exp))
+        self.assertIn('RISKY-SVC-001', html)
+        self.assertIn('Risky Service', html)
+        self.assertIn('Exposure', html)
+
+    def test_exposure_heuristic_badge_rendered(self):
+        """Heuristic signals get a heuristic badge in the HTML."""
+        exp = {
+            'signals': [{
+                'signal_id': 'EOL-001', 'title': 'EOL Software',
+                'severity': 'MEDIUM', 'description': 'Version is EOL.',
+                'confidence_label': 'MEDIUM', 'evidence': ['Apache/2.2.x detected'],
+                'heuristic': True,
+            }],
+            'summary': {'critical': 0, 'high': 0, 'medium': 1, 'low': 0},
+            'signal_count': 1,
+        }
+        html = self._generate_html(self._make_results(exposure=exp))
+        self.assertIn('heuristic', html)
+
+    def test_html_escaping_in_title(self):
+        """HTML-special chars in finding title must be escaped."""
+        finding = {
+            'id': 'T-XSS', 'cve': 'N/A', 'name': 'XSSTest',
+            'title': '<script>alert("xss")</script>',
+            'severity': 'HIGH', 'status': 'CONFIRMED',
+            'port': 80, 'affected_service': 'HTTP',
+            'description': 'XSS test.', 'evidence': [],
+            'cisa_kev': False, 'exploit_available': False, 'cvss': 0,
+            'confidence': 0.9, 'cve_refs': [], 'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertNotIn('<script>alert("xss")</script>', html)
+        self.assertIn('&lt;script&gt;', html)
+
+    def test_html_escaping_in_evidence(self):
+        """HTML-special chars in evidence must be escaped."""
+        finding = {
+            'id': 'T-EV', 'cve': 'N/A', 'name': 'EvidenceTest',
+            'title': 'Evidence Escaping Test',
+            'severity': 'MEDIUM', 'status': 'CONFIRMED',
+            'port': 80, 'affected_service': 'HTTP',
+            'description': 'Test.',
+            'evidence': ['<b>raw html</b> & "quoted"'],
+            'cisa_kev': False, 'exploit_available': False, 'cvss': 5.0,
+            'confidence': 0.7, 'cve_refs': [], 'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertNotIn('<b>raw html</b>', html)
+        self.assertIn('&lt;b&gt;', html)
+
+    def test_missing_sections_graceful(self):
+        """HTML generator tolerates completely missing optional sections."""
+        minimal = {
+            'target': '192.168.0.1',
+            'timestamp': '2024-01-01T00:00:00',
+            'scan_mode': 'common',
+            'vulnerabilities': [],
+        }
+        html = self._generate_html(minimal)
+        self.assertIn('Dashboard', html)
+        self.assertIn('AUTHORIZED USE ONLY', html)
+
+    def test_scroll_spy_js_present(self):
+        """HTML report includes scroll-spy JS for navigation."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('setActive', html)
+
+    def test_finding_kev_badge(self):
+        """Confirmed KEV findings render the KEV badge."""
+        finding = {
+            'id': 'T-KEV', 'cve': 'CVE-2021-44228', 'name': 'Log4Shell',
+            'title': 'Log4j RCE', 'severity': 'CRITICAL', 'status': 'CONFIRMED',
+            'port': 443, 'affected_service': 'HTTPS', 'description': 'Log4j.',
+            'evidence': ['JNDI lookup successful'],
+            'cisa_kev': True, 'exploit_available': True, 'cvss': 10.0,
+            'confidence': 0.9, 'cve_refs': ['CVE-2021-44228'],
+            'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertIn('KEV', html)
+        self.assertIn('badge-kev', html)
+
+    def test_confirmed_potential_inconclusive_all_rendered(self):
+        """Findings section renders confirmed, potential, and inconclusive items."""
+        findings = [
+            {'id': 'C1', 'cve': 'N/A', 'name': 'ConfFinding', 'title': 'Confirmed Finding',
+             'severity': 'HIGH', 'status': 'CONFIRMED', 'port': 22, 'affected_service': 'SSH',
+             'description': '', 'evidence': [], 'cisa_kev': False, 'exploit_available': False,
+             'cvss': 7.0, 'confidence': 0.9, 'cve_refs': [], 'target': '10.0.0.1'},
+            {'id': 'P1', 'cve': 'N/A', 'name': 'PotFinding', 'title': 'Potential Finding',
+             'severity': 'MEDIUM', 'status': 'POTENTIAL', 'port': 80, 'affected_service': 'HTTP',
+             'description': '', 'evidence': [], 'cisa_kev': False, 'exploit_available': False,
+             'cvss': 5.0, 'confidence': 0.5, 'cve_refs': [], 'target': '10.0.0.1'},
+            {'id': 'I1', 'cve': 'N/A', 'name': 'IncFinding', 'title': 'Inconclusive Finding',
+             'severity': 'LOW', 'status': 'INCONCLUSIVE', 'port': 8080, 'affected_service': 'HTTP',
+             'description': '', 'evidence': [], 'cisa_kev': False, 'exploit_available': False,
+             'cvss': 2.0, 'confidence': 0.2, 'cve_refs': [], 'target': '10.0.0.1'},
+        ]
+        html = self._generate_html(self._make_results(findings=findings))
+        self.assertIn('Confirmed Finding', html)
+        self.assertIn('Potential Finding', html)
+        self.assertIn('Inconclusive Finding', html)
+
+    def test_references_rendered_in_finding_detail(self):
+        """CVE reference links appear in finding detail panels."""
+        finding = {
+            'id': 'T-REF', 'cve': 'CVE-2023-1234', 'name': 'RefTest',
+            'title': 'Reference Test', 'severity': 'HIGH', 'status': 'CONFIRMED',
+            'port': 443, 'affected_service': 'HTTPS', 'description': 'Test.',
+            'evidence': ['proof'],
+            'cisa_kev': False, 'exploit_available': False, 'cvss': 7.0,
+            'confidence': 0.9,
+            'cve_refs': ['https://nvd.nist.gov/vuln/detail/CVE-2023-1234'],
+            'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        self.assertIn('nvd.nist.gov', html)
+
+    def test_no_secrets_in_report(self):
+        """Evidence items with inline secrets are redacted in the HTML."""
+        finding = {
+            'id': 'T-SEC', 'cve': 'N/A', 'name': 'SecretTest',
+            'title': 'Secret Redaction Test', 'severity': 'HIGH', 'status': 'CONFIRMED',
+            'port': 22, 'affected_service': 'SSH', 'description': 'Test.',
+            'evidence': ['password=S3cretPa$$word123 found in config'],
+            'cisa_kev': False, 'exploit_available': False, 'cvss': 7.0,
+            'confidence': 0.9, 'cve_refs': [], 'target': '10.0.0.1',
+        }
+        html = self._generate_html(self._make_results(findings=[finding]))
+        # Raw secret value must not appear in the rendered HTML
+        self.assertNotIn('S3cretPa$$word123', html)
+        # Redacted placeholder should appear instead
+        self.assertIn('REDACTED', html)
+
+    def test_ports_detail_section_with_open_ports(self):
+        """Open TCP ports table is rendered when port data is present."""
+        results = self._make_results()
+        results['open_ports'] = [
+            {'port': 22, 'service': 'ssh', 'state': 'open', 'protocol': 'tcp',
+             'banner': 'SSH-2.0-OpenSSH_8.4', 'fingerprint': {'version': 'OpenSSH 8.4'}},
+            {'port': 443, 'service': 'https', 'state': 'open', 'protocol': 'tcp',
+             'banner': '', 'fingerprint': {}},
+        ]
+        html = self._generate_html(results)
+        self.assertIn('sec-ports', html)
+        self.assertIn('OpenSSH', html)
+
+    def test_footer_contains_version(self):
+        """HTML report footer contains Vultron version info."""
+        html = self._generate_html(self._make_results())
+        self.assertIn('Vultron', html)
+        self.assertIn('Azazi', html)

@@ -137,7 +137,7 @@ The inventory is embedded in the JSON report and can optionally be saved as a st
 
 ### 📄 HTML + JSON Reporting
 
-- **HTML report**: A self-contained, color-coded dashboard with an executive summary, per-finding details, port table, compliance results, an **asset inventory section** (v6.0+), and an **Exposure & Patch Risk section** (v8.0+).
+- **HTML report**: A self-contained, color-coded dashboard (P9 overhaul) with a navigation sidebar, interactive filtering, host-centric drilldowns, and all scan data organized into named sections. See [HTML Report (P9)](#html-report-p9) for full details.
 - **JSON report**: A machine-readable file covering all phases, suitable for ingestion by SIEMs, ticketing systems, or further automation.  Includes the `inventory` key with the full normalised asset snapshot and the `exposure` key with structured exposure signals.
 
 Report filenames follow the pattern:
@@ -1668,15 +1668,92 @@ The JSON report is written alongside the HTML report. Its top-level structure:
 }
 ```
 
-### HTML Report
+### HTML Report (P9)
 
-The HTML report is a self-contained file (no external dependencies) with the following sections:
+The HTML report (introduced in P9) is a fully **self-contained static file** with no external runtime dependencies.  It is generated automatically at the end of every scan alongside the JSON output.
 
-1. **Executive summary** — Target, scan time, open port count, and confirmed vulnerability counts by severity.
-2. **Open ports table** — Port, protocol, service name, and banner.
-3. **Vulnerability findings** — One card per finding with status badge, severity, evidence list, CVSS score (where available), CISA KEV indicator, and remediation advice.
-4. **Compliance posture** — Profile name, pass/fail/skip/unknown summary counts, and detailed failed-control cards with evidence.
-5. **NVD enrichment summary** — Query date and number of CVEs retrieved.
+#### Report Layout
+
+The report uses a **two-panel layout** — a sticky left sidebar for navigation and a scrollable main content area:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  ⚠ AUTHORIZED USE ONLY — sensitive security data — restrict access │
+├─────────────────┬────────────────────────────────────────────────┤
+│  Vultron v8     │  Target: 10.0.0.1  |  2026-04-01T14:00:00     │
+├─────────────────┼────────────────────────────────────────────────┤
+│  📊 Dashboard   │                                                │
+│  🚨 Findings  4 │   Dashboard  /  Findings  /  Assets  /  …     │
+│  🖥 Assets    1 │                                                │
+│  🛡 Compliance  │   [section content]                            │
+│  📡 Exposure    │                                                │
+│  🌐 Web Posture │                                                │
+└─────────────────┴────────────────────────────────────────────────┘
+```
+
+#### Warning Banner
+
+A **sticky amber warning banner** at the very top of the page reads:
+
+> ⚠ AUTHORIZED USE ONLY — This report contains sensitive security findings.
+> Restrict access to authorized personnel. Do not distribute without permission.
+
+#### Sections
+
+| Section | Contents |
+|---------|----------|
+| **Dashboard** | Summary stat cards: critical / high / medium / potential / inconclusive / KEV / total assets / open TCP ports / risk score; compliance mini-card, exposure mini-card, web posture mini-card |
+| **Findings** | All findings (confirmed → potential → inconclusive, sorted by severity within each group) with client-side filter bar |
+| **Assets / Hosts** | Per-host cards with services table, OS hints, cloud/tag metadata, and finding count; live search box |
+| **Compliance** | Summary counters, all controls sorted FAIL-first with pass/fail/skip/unknown badges |
+| **Exposure & Patch Risk** | Exposure signals with severity badge and heuristic label |
+| **Web Application Posture** | Web findings per target with remediation hints |
+| **Ports & Services Detail** | Open TCP ports table, UDP ports table, TLS inspection table |
+
+#### Client-Side Filtering
+
+The **Findings** section has a persistent filter bar that filters results in the browser (no server required):
+
+| Filter | Values |
+|--------|--------|
+| Severity | All / Critical / High / Medium / Low / Info |
+| Status | All / Confirmed / Potential / Inconclusive |
+| Category | All / Vulnerability / TLS / Compliance / Exposure / Web |
+| Host | All hosts / individual host |
+| Min Confidence | Any / High (≥80%) / Medium (≥50%) / Low (≥20%) |
+
+Click **Reset** to clear all filters.  The count badge (`N / total shown`) updates in real time.
+
+#### Finding Detail Panels
+
+Each finding card has a **▼ Details** toggle that expands to show:
+- Full description
+- Evidence items (automatically redacted — inline secret-like patterns replaced with `***REDACTED***`)
+- CVE/reference links
+- Remediation advice
+- CVSS score, port/protocol, exploit availability
+
+#### Host Drilldown
+
+The **Assets** section displays one card per discovered host (from the asset inventory module), showing:
+- IP address and resolved hostname
+- Role and risk level badge
+- Open TCP/UDP services table with version information
+- OS hints
+- Cloud/tag metadata (e.g. AWS region, environment)
+- Count of associated findings
+
+Use the live search box to filter by IP, hostname, or role.
+
+#### Backwards Compatibility
+
+The HTML generator tolerates **missing sections** gracefully — if a scan was run without `--compliance`, `--no-inventory`, or without the web scanner, those sections are simply omitted from the report.  The JSON schema is stable and unchanged.
+
+#### Privacy & Redaction
+
+- Evidence strings are passed through `plugins.secrets.redact_string()` before being written to the HTML, masking inline `password=`, `key=`, `token=` etc. patterns.
+- No credentials or raw authentication material are ever stored in the report (enforced by the scan pipeline).
+- The warning banner reminds users to restrict report distribution.
 
 ---
 
