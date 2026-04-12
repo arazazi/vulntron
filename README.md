@@ -34,7 +34,8 @@
 9. [Exposure & Patch Risk Detection](#-exposure--patch-risk-detection)
 10. [Web Application Posture Scanner (P8)](#-web-application-posture-scanner-p8)
 11. [Local Web UI Dashboard (P10)](#-local-web-ui-dashboard-p10)
-12. [Installation](#-installation)
+12. [Windows Usage (.bat Scripts)](#-windows-usage-bat-helper-scripts)
+13. [Installation](#-installation)
 12. [Quick Start](#-quick-start)
 13. [CLI Reference](#-cli-reference)
 14. [Understanding Results](#-understanding-results)
@@ -1553,6 +1554,114 @@ Or install everything at once:
 ```bash
 pip install -r requirements.txt
 ```
+
+---
+
+## 🪟 Windows Usage (`.bat` Helper Scripts)
+
+Vulntron ships with ready-to-use Windows batch scripts that cover every common workflow.  All scripts are self-contained: they auto-detect whether a `vulntron` command is on PATH, fall back to a repo `venv`, fall back to `python -m vulntron`, and finally call `vultron.py` directly.
+
+### Prerequisites
+
+1. Install **Python 3.11+** from <https://www.python.org/downloads/> (check "Add Python to PATH")
+2. Run **`setup.bat`** once to install all dependencies:
+
+```
+setup.bat
+```
+
+### Available Scripts
+
+| Script | Purpose |
+|---|---|
+| `setup.bat` | Install all Python dependencies from `requirements.txt` |
+| `vultron-quick-scan.bat` | Fast scan — common ports, last 120 days of CVEs |
+| `vultron-local.bat` | Full local host assessment (`127.0.0.1`) |
+| `vultron-network.bat` | Network vulnerability scan with interactive depth/mode selection |
+| `vultron-comprehensive-scan.bat` | Full 65535-port scan, complete CVE history, audit-grade |
+
+All scripts support `-h` / `--help` for usage information.
+
+### How to Run a Quick Scan
+
+```
+vultron-quick-scan.bat 192.168.1.100
+```
+
+Or just double-click `vultron-quick-scan.bat` and enter the target when prompted.
+
+### How to Run a Network Scan
+
+```
+vultron-network.bat 192.168.1.100
+```
+
+The script will interactively ask for:
+- **Scan depth** (quick / standard / full / custom port range)
+- Whether to **enable web scanning** (opt-in, read-only — see below)
+
+### How to Enable Web Scanning (P8)
+
+Web scanning is **opt-in** and performs only read-only, non-destructive checks on HTTP/HTTPS services found during the port scan.  When the network scan script prompts:
+
+```
+[?] Enable web application scanning? (y/N):
+```
+
+Type `y` and press Enter.  To enable it non-interactively via the CLI:
+
+```
+python vultron.py -t 192.168.1.100 --web-scan
+```
+
+> **Important:** Only scan hosts you are explicitly authorized to test.  Web scanning sends real HTTP requests to the target.
+
+### How to Generate HTML and JSON Reports
+
+Reports are generated automatically at the end of every scan and saved to a timestamped folder under `runs\`:
+
+```
+runs\
+  20260412_142031\
+    vultron_hybrid_192.168.1.100_20260412142031.html
+    vultron_hybrid_192.168.1.100_20260412142031.json
+```
+
+Each script will ask whether you want to open the HTML report immediately in your default browser.
+
+To generate reports manually from the CLI:
+
+```
+python vultron.py -t 192.168.1.100
+REM Produces: vultron_hybrid_192.168.1.100_<timestamp>.html  and  .json
+```
+
+### How to Launch the Local UI Dashboard (P10)
+
+After one or more scans, launch the Vulntron web UI to browse all results interactively:
+
+```
+python vultron.py ui --data-dir runs --open-browser
+```
+
+Or use the script prompts — every scan script will ask whether to start the UI after the scan completes.
+
+The UI binds to `127.0.0.1:8000` by default (local machine only) and is **strictly read-only**.
+
+```
+python vultron.py ui --data-dir runs --host 127.0.0.1 --port 8000 --open-browser
+```
+
+### Manual Test Steps (Windows)
+
+Because the `.bat` files are Windows-only, the Python test suite does not cover them directly.  To validate a script:
+
+1. Open an **Administrator command prompt** (required for some socket operations).
+2. Run `setup.bat` and confirm it completes without errors.
+3. Run `vultron-quick-scan.bat 127.0.0.1` — verify a JSON and HTML file appear in `runs\`.
+4. Run `vultron-network.bat 127.0.0.1` — select "Standard" depth, decline web scan — verify reports.
+5. Run `vultron-comprehensive-scan.bat 127.0.0.1` — verify reports and opt-in to UI launch.
+6. Confirm the UI opens at `http://127.0.0.1:8000` and lists the scan run.
 
 ---
 
